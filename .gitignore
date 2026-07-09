@@ -1,0 +1,16 @@
+__pycache__/
+*.pyc
+*.egg-info/
+local_test_output/
+catalog_cache/
+.pytest_cache/
+.claude/
+dophot.dat
+
+# Internal planning doc and real telescope-server paths -- not for public repo
+rewrite.md
+grb_detection2.txt
+
+# Real FITS/ECSV regression fixture -- kept local, not pushed (large binary data)
+tests/210619B/
+tests/baseline/

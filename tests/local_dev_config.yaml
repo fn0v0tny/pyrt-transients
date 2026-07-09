@@ -1,0 +1,14 @@
+# Local-dev / baseline-harness config (rewrite.md Phase 0).
+#
+# atlas@localhost is not reachable outside the production host, so the local
+# fixture run and check_baseline.py use catalogs=[gaia, usno] only. A passing
+# run against this config is "no obvious regression on gaia/usno", NOT
+# confirmation that the ATLAS-specific code path is unaffected — see
+# rewrite.md's Environment note.
+global:
+  base_data_dir: ./local_test_output/data
+  base_public_dir: ./local_test_output/public_html
+  generate_frontend: false
+
+detection:
+  catalogs: [gaia, usno]

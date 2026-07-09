@@ -1,0 +1,71 @@
+[build-system]
+requires = ["setuptools>=65.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "pyrt-transient"
+version = "0.2.0"
+description = "Transient detection addon for the pyrt astronomical photometry pipeline"
+authors = [
+    {name = "Filip Novotny"}
+]
+readme = "README.md"
+license = {text = "MIT"}
+requires-python = ">=3.10"
+keywords = ["astronomy", "transient", "photometry", "detection", "GRB"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: MIT License",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering :: Astronomy",
+]
+
+# pyrt must be installed separately (pip install pyrt)
+dependencies = [
+    "pyrt",
+    "stdpipe>=0.3.0",
+    "numpy>=1.20.0",
+    "astropy>=5.0",
+    "astroquery>=0.4.6",
+    "scikit-learn>=1.0.0",
+    "scipy>=1.7.0",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+# Website / cutout generation
+frontend = [
+    "Pillow>=9.0.0",
+    "matplotlib>=3.5.0",
+]
+# Forced photometry via PS1 TAP and ATLAS
+photometry = [
+    "pyvo>=1.4",
+]
+# Everything
+all = [
+    "pyrt-transient[frontend,photometry]",
+]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-cov>=3.0.0",
+]
+
+[project.scripts]
+# Run the detection pipeline directly from the command line
+pyrt-transient-pipeline = "pyrt_transient.pipeline_magic:main"
+pyrt-transient-daemon   = "pyrt_transient.transient_daemon:main"
+
+[project.urls]
+Repository = "https://github.com/mates14/pyrt-transients"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["pyrt_transient*"]
+
+[tool.setuptools.package-data]
+"pyrt_transient" = [
+    "template/**/*",
+    "template_sn/**/*",
+]
