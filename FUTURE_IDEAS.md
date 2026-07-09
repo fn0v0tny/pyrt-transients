@@ -4,44 +4,29 @@ Things intentionally deferred, evaluated-but-not-adopted, or discovered
 along the way and not yet acted on. Grouped by theme rather than by when
 they came up.
 
-## Dead code to remove
+## Candidate enrichment: forced photometry and observing strategy
 
-- **`OptimizedTransientAnalyzer` / `OptimizedMultiDetectionAnalyzer`**
-  (`transient_analyser.py`) — fully superseded by
-  `detection/blind_multicatalog/` + `BlindMulticatalogStrategy`. Confirmed
-  via grep: nothing in the live pipeline calls them anymore, only their own
-  definitions and the package-level re-export in `__init__.py` reference
-  them. Kept for now as a backward-compatible import path, not because
-  anything needs them.
-- **`forced_photometry.py`** — confirmed not called anywhere in the real
-  candidate pipeline (`pipeline_magic.py` never invokes it). See "Forced
-  photometry integration" below for what finishing this properly would look
-  like, as opposed to just deleting it.
-- **`_add_strategy_fields`'s `strategy_v2` import** — `from strategy_v2
-  import determine_grb_strategy` has never resolved; `strategy_v2` doesn't
-  exist anywhere in this package, only as a stray file in an old pre-split
-  scratch directory outside it. Every `strategy_*` column in real output is
-  always `None` as a result. This has never actually worked.
-- **`frontend_generator.py`'s forced-photometry merge** (~line 663) — `from
-  forced_photometry import _get_cid` is missing the `pyrt_transient.`
-  prefix, silently caught by a bare `except Exception: lc_key =
-  candidate_id`, so the "merge forced photometry lightcurves" frontend
-  feature always falls back and never uses its intended key.
+Two features worth adding as optional, config-gated post-processing steps
+on `BlindMulticatalogStrategy.run()`'s output — not hardcoded into the
+strategy itself, since enrichment should be something any detection
+strategy's output can pass through:
 
-None of these are urgent — they're inert, not broken (nothing depends on
-their currently-broken behavior) — but they're real feature work waiting to
-be picked up, not just a cleanup pass:
-1. Port `strategy_v2.py` properly into an `enrichment/` module, deciding
-   explicitly what to do when `grb_t0` isn't configured (make the
-   trigger-time-vs-first-observation fallback an explicit, visible flag
-   rather than a silent substitution).
-2. Fix `forced_photometry.py`'s `_get_cid`/`_make_id` to use
-   `Candidate.transient_id`/`Candidate.assign_id()` instead of yet another ID
-   scheme, and wire `filter_ps1_known_sources` into
-   `BlindMulticatalogStrategy.run()`'s output as an optional, config-gated
-   post-processing step — not hardcoded into the strategy itself, since
-   enrichment should be something any strategy's output can pass through.
-3. Fix `frontend_generator.py`'s broken import once (2) lands.
+1. **Forced photometry from ATLAS and PanSTARRS** — pull historical
+   lightcurves for each candidate position from PS1 DR2 and ATLAS forced
+   photometry to help confirm or reject it (e.g. drop candidates with a
+   long PS1 detection history unless newly brighter). Should use
+   `Candidate.transient_id`/`Candidate.assign_id()` as its lookup key so
+   it shares one ID scheme with the rest of the pipeline.
+   `frontend_generator.py`'s `_load_forced_lightcurves()` already reads a
+   `lightcurves.json` if one is present in the observation directory, so
+   the frontend picks this up automatically once something writes that
+   file.
+2. **Telescope strategy suggester** — annotate each candidate with a
+   recommended follow-up observing strategy (exposure time, filter,
+   EMCCD on/off) based on its previous-epoch magnitude and time since
+   the GRB trigger. Should make the trigger-time-vs-first-observation
+   fallback (when `grb_t0` isn't configured) an explicit, visible flag on
+   the output rather than a silent substitution.
 
 ## GRB replay driver (proper version)
 

@@ -28,9 +28,6 @@ pip install pyrt-transient
 
 # With optional frontend (cutout images + HTML candidate browser)
 pip install pyrt-transient[frontend]
-
-# With optional forced photometry (PS1 TAP + ATLAS lightcurves)
-pip install pyrt-transient[photometry]
 ```
 
 ---
@@ -120,7 +117,7 @@ store.save_results(candidates, lightcurves)
 print(f"{len(candidates)} candidates found")
 ```
 
-`BlindMulticatalogStrategy` is the production detection strategy (what `pipeline_magic.py` actually calls). `OptimizedTransientAnalyzer`/`OptimizedMultiDetectionAnalyzer` are still exported for backward compatibility but are no longer called anywhere in the pipeline — see `FUTURE_IDEAS.md`.
+`BlindMulticatalogStrategy` is the production detection strategy — it's what `pipeline_magic.py` actually calls.
 
 ---
 
@@ -151,28 +148,6 @@ base_data_dir: /data/transient_work
 base_public_dir: /var/www/transients
 generate_frontend: true
 ```
-
----
-
-## Forced photometry
-
-Retrieves historical lightcurves from PS1 DR2 and ATLAS to confirm or reject candidates. Implemented in `forced_photometry.py` but **not currently wired into the production pipeline** (`pipeline_magic.py` never calls it) — see `FUTURE_IDEAS.md`.
-
-```python
-from pyrt_transient.forced_photometry import (
-    query_panstarrs_lightcurves,
-    query_atlas_lightcurves,
-    merge_lightcurves,
-    filter_ps1_known_sources,
-)
-
-ps1_lcs = query_panstarrs_lightcurves(candidates)
-atlas_lcs = query_atlas_lightcurves(candidates, obs_jd=..., api_token="...")
-candidates = filter_ps1_known_sources(candidates, ps1_lcs)  # drop known PS1 sources unless newly brighter
-lcs = merge_lightcurves(ps1_lcs, atlas_lcs, candidates)
-```
-
-> ATLAS forced photometry requires a token from https://fallingstar-data.com/forcedphot
 
 ---
 
@@ -215,9 +190,6 @@ pyrt_transient/
 ├── catalog.py                CatTransients -- Catalog subclass, all detection methods
 ├── extraction_manager.py      Image + ECSV file management (.field_center)
 ├── transients.py              CLI utilities
-├── transient_analyser.py      Legacy: OptimizedTransientAnalyzer/OptimizedMultiDetectionAnalyzer
-│                               (superseded by detection/blind_multicatalog/, kept for compatibility)
-├── forced_photometry.py       PS1 TAP + ATLAS forced photometry [optional: pyvo] -- not wired in yet
 ├── frontend_generator.py      HTML candidate browser + cutout images [optional: Pillow]
 ├── fotfit.py, termfit.py       Bundled photometric/term fitters (from pyrt)
 ├── template/, template_sn/    Frontend HTML/JS templates

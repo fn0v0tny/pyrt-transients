@@ -655,16 +655,9 @@ class FrontendGenerator:
             if lightcurve_info:
                 candidate_dict["lightcurve"] = lightcurve_info
 
-            # Merge forced photometry lightcurves (PS1 + ATLAS)
-            # lightcurves.json is keyed by _get_cid() — use it directly so the
-            # position fallback format always matches, regardless of which columns exist.
-            row = cand_data['candidate']
-            try:
-                from forced_photometry import _get_cid as _fp_get_cid
-                lc_key = _fp_get_cid(row)
-            except Exception:
-                lc_key = candidate_id
-            flc = forced_lcs.get(lc_key) or forced_lcs.get(candidate_id)
+            # Merge forced photometry lightcurves (PS1 + ATLAS), if a
+            # lightcurves.json happens to be present in data_dir.
+            flc = forced_lcs.get(candidate_id)
             if flc is not None:
                 candidate_dict["forced_lc"] = flc
 

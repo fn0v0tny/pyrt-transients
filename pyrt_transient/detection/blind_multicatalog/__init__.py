@@ -46,11 +46,11 @@ class BlindMulticatalogStrategy(DetectionStrategy):
         detection/base.py's module docstring for why this isn't
         List[Candidate] yet.
 
-        add_strategy_fields_fn: not wired to anything by default --
-        _add_strategy_fields (transient_analyser.py) still needs
-        self.transient_analyzer.data_dir/self.logger and hasn't been moved
-        into a standalone module yet. Pass it explicitly if a caller has
-        one; strategy fields are simply skipped otherwise (same as
+        add_strategy_fields_fn: not wired to anything by default -- no
+        working implementation exists yet (see FUTURE_IDEAS.md, "Dead code
+        to remove" -- the old attempt's `strategy_v2` import never
+        resolved). Pass one explicitly if a caller has it; strategy fields
+        are simply skipped otherwise (same as
         lightcurve.update_candidate_with_lightcurve_stats's default).
         """
         config = config or self.config

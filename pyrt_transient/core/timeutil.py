@@ -1,4 +1,4 @@
-"""Time-conversion helpers, copied from transient_analyser.py's OptimizedMultiDetectionAnalyzer."""
+"""Time-conversion helpers."""
 
 from astropy.time import Time
 

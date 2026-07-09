@@ -39,14 +39,6 @@ frontend = [
     "Pillow>=9.0.0",
     "matplotlib>=3.5.0",
 ]
-# Forced photometry via PS1 TAP and ATLAS
-photometry = [
-    "pyvo>=1.4",
-]
-# Everything
-all = [
-    "pyrt-transient[frontend,photometry]",
-]
 dev = [
     "pytest>=7.0.0",
     "pytest-cov>=3.0.0",
@@ -58,7 +50,7 @@ pyrt-transient-pipeline = "pyrt_transient.pipeline_magic:main"
 pyrt-transient-daemon   = "pyrt_transient.transient_daemon:main"
 
 [project.urls]
-Repository = "https://github.com/mates14/pyrt-transients"
+Repository = "https://github.com/fn0v0tny/pyrt-transients"
 
 [tool.setuptools.packages.find]
 where = ["."]

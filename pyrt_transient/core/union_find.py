@@ -1,4 +1,4 @@
-"""Union-Find (Disjoint Set) data structure, copied verbatim from transient_analyser.py."""
+"""Union-Find (Disjoint Set) data structure."""
 
 from collections import defaultdict
 from typing import Dict, List

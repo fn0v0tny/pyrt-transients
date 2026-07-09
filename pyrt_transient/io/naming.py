@@ -1,6 +1,4 @@
-"""Filename-derivation helper, moved from
-OptimizedMultiDetectionAnalyzer._get_base_filename (transient_analyser.py).
-"""
+"""Filename-derivation helper."""
 
 import os
 import re

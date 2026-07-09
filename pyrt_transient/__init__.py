@@ -20,22 +20,11 @@ Core (always available):
     PipelineConfig            Full pipeline configuration (wraps DetectionConfig etc.)
     DetectionConfig
 
-Legacy (superseded by BlindMulticatalogStrategy, kept for backward
-compatibility -- not called by the production pipeline anymore):
-    OptimizedTransientAnalyzer        Single-image transient analyser
-    OptimizedMultiDetectionAnalyzer   Multi-epoch detection analyser
-
 Optional — pipeline entry point (requires pyrt_transient.pipeline_magic):
     Run directly:  python -m pyrt_transient.pipeline_magic <ecsv> ...
 
 Optional — frontend (requires Pillow + matplotlib):
     FrontendGenerator        Generate the HTML candidate browser
-
-Optional — forced photometry (requires pyvo):
-    query_panstarrs_lightcurves
-    query_atlas_lightcurves
-    merge_lightcurves
-    filter_ps1_known_sources
 """
 
 from pyrt_transient.catalog import (
@@ -59,11 +48,6 @@ from pyrt_transient.detection.blind_multicatalog import BlindMulticatalogStrateg
 
 from pyrt_transient.io.observation_store import ObservationStore
 
-from pyrt_transient.transient_analyser import (
-    OptimizedTransientAnalyzer,
-    OptimizedMultiDetectionAnalyzer,
-)
-
 __version__ = "0.2.0"
 
 __all__ = [
@@ -85,9 +69,6 @@ __all__ = [
     # config
     "PipelineConfig",
     "DetectionConfig",
-    # legacy analyser (superseded, kept for backward compatibility)
-    "OptimizedTransientAnalyzer",
-    "OptimizedMultiDetectionAnalyzer",
     # version
     "__version__",
 ]
@@ -96,21 +77,5 @@ __all__ = [
 try:
     from pyrt_transient.frontend_generator import FrontendGenerator
     __all__.append("FrontendGenerator")
-except ImportError:
-    pass
-
-try:
-    from pyrt_transient.forced_photometry import (
-        query_panstarrs_lightcurves,
-        query_atlas_lightcurves,
-        merge_lightcurves,
-        filter_ps1_known_sources,
-    )
-    __all__ += [
-        "query_panstarrs_lightcurves",
-        "query_atlas_lightcurves",
-        "merge_lightcurves",
-        "filter_ps1_known_sources",
-    ]
 except ImportError:
     pass
