@@ -63,13 +63,63 @@ accumulate under one `ObservationStore`, this silently fragments a single
 real observation into several 1-2-epoch stubs that never accumulate enough
 evidence — not a crash, just quietly worse detection recall.
 
-Worth investigating: whether this is specific to re-deriving astrometry
-fresh (vs. the original real-time pipeline, which apparently stays on one
-ID all night — possibly because it's driven by a stable per-night session
-identifier upstream that a from-scratch replay doesn't have access to), and
-if so, whether the replay driver above needs its own explicit
-GRB-to-observation-ID mapping instead of trusting fresh field-metadata
-derivation epoch-by-epoch.
+Root cause confirmed: the real telescope's own `OBSID` metadata field changes
+per filter/observing-block within a single night, not per GRB (e.g. one
+GRB's z-band epochs carried `OBSID=71883.00`, then its i-band epochs carried
+`OBSID=71885.01`) — and that block-scoped ID can coincidentally collide with
+a *different* GRB's assigned slot. `extract_observation_id()` was never
+wrong to read it; the real data just doesn't identify "this GRB's campaign"
+the way a replay across many separate epochs needs it to.
+
+**Fixed for the replay** by forcing each GRB's own name (e.g. `"GRB210610A"`)
+into every epoch's ECSV `OBSID` field before running detection, guaranteeing
+one unambiguous ID per GRB with zero collision risk across the whole batch.
+This is a replay-side workaround, not a `pyrt_transient` code change — a real
+`replay_driver.py` (above) should build this in as a first-class step
+(inject/override the observation_id explicitly per GRB) rather than trusting
+per-epoch metadata derivation.
+
+## Significance-gate and blending false negatives (found via GCN cross-check)
+
+Cross-checking the 18-GRB replay against real GCN circular photometry (T0,
+reported magnitude, time since trigger) turned up three genuinely real,
+well-positioned, GCN-confirmed afterglows that never became reported
+candidates, for three different concrete reasons — worth tuning/investigating
+rather than accepting as expected misses:
+
+1. **A strict significance gate excludes real, positionally-correct
+   detections.** `catalog.py:_process_detections_for_candidates` has
+   `bad_snr = det_errs >= (1.091 / siglim)` — with the default `siglim=5.0`,
+   anything with `MAGERR_CALIB >= 0.218 mag` (roughly S/N < 5) is excluded
+   before it can even be considered a candidate. Two GRBs (151027B, and
+   210312B in most epochs) had a detection sitting within a few arcsec of
+   the catalogued position, with a calibrated magnitude matching GCN's
+   independently-reported brightness closely — but `MAGERR_CALIB` was above
+   this threshold in nearly every epoch, so the real source never reached
+   the candidate stage at all. Worth revisiting whether `siglim=5.0` is too
+   strict a default, or whether marginal (3-5σ) detections should be kept
+   with a lower quality-score weight instead of hard-excluded outright.
+2. **Blending can suppress the magnitude-change check.** GRB200410A's
+   detections pass the SNR gate fine (`MAGERR_CALIB` 0.10-0.22 mag,
+   consistently) but never become candidates either — every epoch shows two
+   very close (~1″) detections with `FLAGS` bits indicating a blend. Likely
+   explanation: the pipeline sees a persistent, unchanged-brightness point
+   source at a known catalog position (the blended pair read as "this star,
+   same as always") and correctly-by-its-own-logic never flags it as new or
+   changed, since the added GRB flux is folded into the blend rather than
+   standing out. Worth considering a specific check for "blended flag +
+   still brighter than expected" rather than treating any blended detection
+   as automatically uninteresting.
+3. **A recurring `ERRX2_IMAGE = ERRY2_IMAGE = 0.0` anomaly.** Several
+   otherwise-real detections (151027B, 210312B in most epochs, 240414A in
+   all epochs) have centroid position errors that are exactly zero — real
+   SExtractor centroid uncertainties are essentially never exactly 0. This
+   doesn't appear to be the direct cause of any of the three misses above
+   (traced through `core/radii.py`'s handling: it gets clamped to the
+   minimum allowed radius, not an outright failure), but it's a systematic
+   data-quality signature worth investigating in `pyrt`'s own aperture-
+   photometry step, since it may also be quietly inflating `MAGERR_CALIB`
+   for the same detections that then fail the significance gate above.
 
 ## Deferred stdpipe adoption
 
