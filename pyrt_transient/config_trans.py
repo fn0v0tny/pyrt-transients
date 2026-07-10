@@ -16,11 +16,63 @@ class DetectionConfig:
     """Configuration for transient detection parameters."""
     idlimit_px: float = 3.0
     position_match_radius_arcsec: float = 2.0
-    min_n_detections: int = 5
+    # Lowered from 5: paired with new_source_siglim (below) and
+    # compute_lightcurve_score_factor's n_detections confidence term, a real
+    # source now earns its quality_score through repeated, consistent
+    # detection rather than needing to individually pass a stricter
+    # per-epoch bar just to be *considered*. 3 still requires genuine
+    # repeat confirmation, not a single/double fluke.
+    min_n_detections: int = 3
     min_catalogs_fraction: float = 1.0
     min_quality: float = 0.2
     radius_check: float = 20.0
     filter_pattern: str = "r"
+
+    # Significance threshold (in units of magnitude S/N) below which a
+    # detection is excluded before candidate consideration. siglim=5.0 means
+    # MAGERR_CALIB >= 1.091/5.0 =~ 0.218 mag is excluded outright.
+    #
+    # new_source_siglim applies only to detections with no reference-catalog
+    # match at all ("new" candidates -- the case a real, previously
+    # uncatalogued GRB afterglow falls into). It defaults to siglim (i.e. no
+    # behavior change) but can be set lower: cross-checking a real 18-GRB
+    # replay against GCN circulars found several genuine, positionally- and
+    # photometrically-confirmed afterglows excluded here because a single
+    # epoch's S/N fell just under 5, despite appearing consistently across
+    # many epochs. min_n_detections (the cross-epoch clustering requirement,
+    # not this gate) is what actually protects against admitting noise --
+    # a real source repeats at the same position; noise doesn't. Matched
+    # (known-catalog) detections keep the stricter `siglim` bar regardless,
+    # since flagging a catalogued star as "changed" on marginal significance
+    # risks false positives from ordinary photometric scatter.
+    # catalog_match.py drops any candidate fainter than
+    # maglim_filter_multiplier * this epoch's own MAGLIM (the image's own
+    # characterized single-exposure limiting magnitude) -- a second,
+    # independent admission gate from siglim/new_source_siglim below, based
+    # on absolute brightness relative to this specific exposure's depth
+    # rather than measurement S/N. Left at the original 1.1 deliberately:
+    # unlike the significance gate, this one is not just conservative --
+    # a source meaningfully fainter than a single exposure's own MAGLIM is
+    # not physically recoverable from that exposure alone, no matter how
+    # the significance/consistency thresholds are tuned. Reaching fainter
+    # than MAGLIM needs actual image stacking/co-addition before detection
+    # (not built yet -- see FUTURE_IDEAS.md), not a looser cutoff on noise.
+    # (The in-code log message says "1.5x MAGLIM" while this has always
+    # been 1.1 -- a stale message, not evidence 1.1 was a regression.)
+    maglim_filter_multiplier: float = 1.1
+
+    siglim: float = 5.0
+    # Aggressively low by traditional standards (S/N > 1.5) -- deliberate.
+    # Admission this permissive is only safe because of two things downstream:
+    # compute_lightcurve_score_factor's n_detections term (a source repeating
+    # consistently across many epochs earns real confidence; isolated noise
+    # doesn't repeat at the same position) and the final min_quality gate in
+    # combine_with_lightcurves (applied to the fully-accumulated score, not
+    # this early per-epoch one). Verified against GCN-confirmed real GRBs:
+    # several genuine afterglows only clear ~7/18-20 epochs at this bar, not
+    # enough at siglim=3.0 (1 epoch) or siglim=2.0 (3 epochs, no margin)
+    # against min_n_detections=3.
+    new_source_siglim: Optional[float] = 1.5
 
     # Reference catalogs to query per detection table. "atlas@localhost" is a
     # local-only service unavailable outside the production host; local dev

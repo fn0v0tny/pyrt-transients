@@ -1012,6 +1012,7 @@ class CatTransients(_PyrtCatalog):
         siglim: float = 5.0,
         frame: float = 10.0,
         adaptive_radii: Optional[np.ndarray] = None,
+        new_source_siglim: Optional[float] = None,
     ) -> astropy.table.Table:
         if len(detections) == 0:
             return astropy.table.Table()
@@ -1076,7 +1077,8 @@ class CatTransients(_PyrtCatalog):
             matches_list = tree.query_radius(det_xy, r=idlimit)
 
         return self._process_detections_for_candidates(
-            detections, matches_list, mag_change_threshold, siglim, frame
+            detections, matches_list, mag_change_threshold, siglim, frame,
+            new_source_siglim=new_source_siglim,
         )
 
     def get_transient_candidates(
@@ -1108,7 +1110,18 @@ class CatTransients(_PyrtCatalog):
         mag_change_threshold: float,
         siglim: float,
         frame: float,
+        new_source_siglim: Optional[float] = None,
     ) -> astropy.table.Table:
+        """new_source_siglim, when lower than siglim, admits fainter/noisier
+        detections as "new" candidates (no reference-catalog match at all)
+        without loosening the bar for flagging a *matched* catalog source as
+        changed. Defaults to siglim (no behavior change) -- see
+        DetectionConfig.new_source_siglim's docstring for why these two are
+        deliberately not the same knob.
+        """
+        if new_source_siglim is None:
+            new_source_siglim = siglim
+
         det_x    = detections["X_IMAGE"].data
         det_y    = detections["Y_IMAGE"].data
         det_mags = detections["MAG_CALIB"].data
@@ -1123,10 +1136,10 @@ class CatTransients(_PyrtCatalog):
                 "IMGAXIS2", detections.meta.get("IMAGEH", np.max(det_y) + 100)
             )
         )
-        edge    = ((det_x < frame) | (det_y < frame) |
-                   (det_x > img_w - frame) | (det_y > img_h - frame))
-        bad_snr = det_errs >= (1.091 / siglim)
-        exclude = edge | bad_snr
+        edge = ((det_x < frame) | (det_y < frame) |
+                (det_x > img_w - frame) | (det_y > img_h - frame))
+        bad_snr_matched = det_errs >= (1.091 / siglim)
+        bad_snr_new     = det_errs >= (1.091 / new_source_siglim)
 
         candidates: List[int] = []
         types:      List[str] = []
@@ -1134,12 +1147,16 @@ class CatTransients(_PyrtCatalog):
         response = detections.meta.get("RESPONSE", "P0=25.0")
 
         for i, matches in enumerate(matches_list):
-            if exclude[i]:
+            if edge[i]:
                 continue
             if len(matches) == 0:
+                if bad_snr_new[i]:
+                    continue
                 candidates.append(i)
                 types.append("new")
                 diffs.append(0.0)
+                continue
+            if bad_snr_matched[i]:
                 continue
             is_cand, ctype, mdiff = self._check_magnitude_changes_cached(
                 matches, det_mags[i], det_errs[i], response,
@@ -1206,9 +1223,11 @@ class CatTransients(_PyrtCatalog):
                     significant.append(
                         (diff, "brightening" if diff < 0 else "fading")
                     )
-                elif abs(diff) <= siglim * sigma:
-                    return False, "none", float(diff)
-                # else: intermediate — continue checking other matches
+                # else (not significantly different, or intermediate): keep
+                # checking the remaining matches before deciding -- with more
+                # than one catalog match nearby (e.g. a blended pair), an
+                # early "not significant" on the first one checked must not
+                # pre-empt a genuinely significant match still to come.
 
             except Exception:
                 continue

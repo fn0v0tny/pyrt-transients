@@ -79,47 +79,179 @@ This is a replay-side workaround, not a `pyrt_transient` code change — a real
 (inject/override the observation_id explicitly per GRB) rather than trusting
 per-epoch metadata derivation.
 
-## Significance-gate and blending false negatives (found via GCN cross-check)
+## Detection recall: false-negative mechanisms found via GCN cross-check
 
-Cross-checking the 18-GRB replay against real GCN circular photometry (T0,
-reported magnitude, time since trigger) turned up three genuinely real,
-well-positioned, GCN-confirmed afterglows that never became reported
-candidates, for three different concrete reasons — worth tuning/investigating
-rather than accepting as expected misses:
+Cross-checking all 18 replayed GRBs against real GCN circular photometry
+(T0, reported magnitude, time since trigger) turned up **seven** fields with
+a genuinely real, well-positioned, GCN-confirmed afterglow present in our
+own raw detection catalogs that never became a reported candidate. One of
+those seven (GRB220403B) has since been recovered as a genuine 5th
+detection by extending the replay window rather than changing any
+threshold — see below. Of the remaining six, three (GRB151027B, GRB211024B,
+GRB210410A) turned out on direct measurement to be genuinely below this
+system's single-exposure `MAGLIM` depth — a physical limit, not a pipeline
+bug — leaving three still-open, threshold-fixable mechanisms: the
+significance gate (GRB210312B), blending (GRB200410A), and a compounding
+astrometry failure (GRB180325A).
 
-1. **A strict significance gate excludes real, positionally-correct
-   detections.** `catalog.py:_process_detections_for_candidates` has
-   `bad_snr = det_errs >= (1.091 / siglim)` — with the default `siglim=5.0`,
-   anything with `MAGERR_CALIB >= 0.218 mag` (roughly S/N < 5) is excluded
-   before it can even be considered a candidate. Two GRBs (151027B, and
-   210312B in most epochs) had a detection sitting within a few arcsec of
-   the catalogued position, with a calibrated magnitude matching GCN's
-   independently-reported brightness closely — but `MAGERR_CALIB` was above
-   this threshold in nearly every epoch, so the real source never reached
-   the candidate stage at all. Worth revisiting whether `siglim=5.0` is too
-   strict a default, or whether marginal (3-5σ) detections should be kept
-   with a lower quality-score weight instead of hard-excluded outright.
-2. **Blending can suppress the magnitude-change check.** GRB200410A's
-   detections pass the SNR gate fine (`MAGERR_CALIB` 0.10-0.22 mag,
-   consistently) but never become candidates either — every epoch shows two
-   very close (~1″) detections with `FLAGS` bits indicating a blend. Likely
-   explanation: the pipeline sees a persistent, unchanged-brightness point
-   source at a known catalog position (the blended pair read as "this star,
-   same as always") and correctly-by-its-own-logic never flags it as new or
-   changed, since the added GRB flux is folded into the blend rather than
-   standing out. Worth considering a specific check for "blended flag +
-   still brighter than expected" rather than treating any blended detection
-   as automatically uninteresting.
-3. **A recurring `ERRX2_IMAGE = ERRY2_IMAGE = 0.0` anomaly.** Several
-   otherwise-real detections (151027B, 210312B in most epochs, 240414A in
-   all epochs) have centroid position errors that are exactly zero — real
-   SExtractor centroid uncertainties are essentially never exactly 0. This
-   doesn't appear to be the direct cause of any of the three misses above
-   (traced through `core/radii.py`'s handling: it gets clamped to the
-   minimum allowed radius, not an outright failure), but it's a systematic
-   data-quality signature worth investigating in `pyrt`'s own aperture-
-   photometry step, since it may also be quietly inflating `MAGERR_CALIB`
-   for the same detections that then fail the significance gate above.
+### Implemented
+
+1. **Split the significance gate by whether a detection has a catalog
+   match.** `catalog.py:_process_detections_for_candidates` had a single
+   `bad_snr = det_errs >= (1.091 / siglim)` gate (`siglim=5.0`, i.e.
+   `MAGERR_CALIB >= 0.218 mag` excluded outright) applied identically
+   whether or not the detection matched a known catalog source. Matched
+   detections keep that strict bar (avoids false "brightening" flags from
+   ordinary photometric scatter on catalogued stars), but genuinely *new*
+   detections (no catalog match at all — the case a real, previously
+   uncatalogued GRB afterglow falls into) now use a separate, much more
+   permissive `DetectionConfig.new_source_siglim` (default `1.5`, i.e.
+   `MAGERR_CALIB >= 0.727`). This alone doesn't over-admit noise: a source
+   repeating consistently across many epochs earns real confidence via (2)
+   below; isolated noise doesn't repeat at the same position.
+2. **`compute_lightcurve_score_factor` now has an epoch-consistency
+   confidence term.** Previously `n_detections`/`n_epochs` had *zero*
+   influence on `quality_score` — they were purely a hard pass/fail gate
+   (`min_n_detections`) in `clustering.py`, so a candidate right at the
+   threshold scored identically to one confirmed 4x more often. Added a
+   root-sum-square-style term (`sqrt(n_detections / min_n_detections)`,
+   normalized to 1.0 at the threshold) so real, repeated confirmation is
+   rewarded continuously rather than only checked as a binary cutoff.
+   `min_n_detections` itself lowered from 5 to 3 to admit candidates to
+   scoring sooner.
+3. **Added a final `min_quality` gate on the fully-computed score.**
+   `min_quality` was only ever checked early, in `combine_results`, on the
+   base score alone (before any lightcurve/consistency information exists).
+   Nothing filtered on the *final* score after (1) and (2) are applied. On
+   the local fixture this dropped 3 previously-reported candidates whose
+   final scores (0.014-0.09) were well below `min_quality=0.2` once properly
+   computed, while the real confirmed afterglow's score only went up
+   (37→56.5) — confirming the score now discriminates real repeated signal
+   from marginal noise far more cleanly than before.
+4. **Verified `maglim_filter_multiplier` (the pre-existing MAGLIM-based
+   filter in `catalog_match.py`) should *not* be loosened.** A single
+   exposure's own `MAGLIM` is a genuine physical noise floor, not a tunable
+   heuristic — a source meaningfully fainter than it is not reliably
+   recoverable from that one exposure, no matter how the significance/
+   consistency thresholds above are tuned. Made the multiplier configurable
+   (was hardcoded `1.1`) for future experiments against stacked/co-added
+   images, but left the default unchanged. Checking it directly against
+   GCN-confirmed magnitudes clarified which misses are genuinely
+   MAGLIM-limited versus which are gate/threshold problems (see below) —
+   worth checking for any future non-detection before assuming it's a
+   tunable gate.
+
+Net effect of (1)-(3), verified via `check_baseline.py` at each step (all
+changes are deliberate, documented diffs, not regressions) — real
+consistently-confirmed candidates score noticeably higher, weak/noise
+candidates that used to sneak through on a technicality (enough detections,
+low individual quality) now get filtered by the final gate instead.
+
+### Re-classified after checking MAGLIM directly (not fixed by (1)-(3))
+
+Checking each case's `MAG_CALIB / MAGLIM` ratio at the known position
+directly (not just assuming "significance gate" from the symptom) gives a
+much more precise diagnosis than the original pass:
+
+- **GRB151027B, GRB211024B, GRB210410A**: ratio consistently ~1.13-1.35
+  across every epoch — genuinely fainter than this system's own
+  single-exposure depth for these fields. Not fixable by (1)-(3), by more
+  replayed epochs, or by any per-epoch threshold at all. The only real fix
+  is image stacking/co-addition before detection (a substantial, separate
+  pipeline capability — see below) or simply accepting these are below this
+  telescope/exposure combination's single-frame sensitivity.
+- **GRB220403B**: ratio mixed, ~1.07-1.26 — borderline, some epochs pass.
+  Consistent with the earlier finding that it *does* get flagged `"new"` in
+  2/20 epochs, just never by all three catalogs at once. Primary blocker is
+  `min_catalogs_fraction=1.0` (see below), with MAGLIM as a compounding
+  factor in some epochs.
+- **GRB200410A**: ratio consistently ~1.03-1.08 — comfortably brighter than
+  MAGLIM in every epoch. Confirms this one was never a significance/MAGLIM
+  problem at all; it's purely the blending mechanism below.
+- **GRB210312B**: mixed, ~1.06-1.39 depending on epoch quality.
+
+### Validated: extending the replay window recovers the min_catalogs_fraction case
+
+**GRB220403B is now a confirmed 5th recovered detection** (0.73″ separation,
+quality 12.5), without touching `min_catalogs_fraction` itself. The original
+20-image replay never got past 2/20 epochs individually flagged `"new"` by
+only one catalog at a time. Extending the replay to 57 images (raw frames
+21-60 astrometrized and fed through the same forced-OBSID pipeline) let
+different catalogs agree in different epochs; the `n_detections`-weighted
+scoring from the significance-gate work above accumulated those into a
+clean final candidate. A fresh one-epoch-at-a-time replay pinpointed the
+exact crossing point: first past `min_quality=0.2` at epoch 17/57 (quality
+2.76 there, growing to 12.5 by epoch 42/57 as detections kept accumulating).
+This confirms the mechanism described below is real, and that **more
+epochs, not a looser `min_catalogs_fraction`, is the working fix** for this
+specific failure mode — lowering the default remains unnecessary now that
+there's a demonstrated alternative that doesn't risk admitting noise.
+
+1. **Unanimous cross-catalog agreement (`min_catalogs_fraction=1.0`) is too
+   strict for faint sources in a single epoch.** GRB220403B's afterglow
+   *does* get flagged `candidate_type="new"` by an individual catalog in
+   some epochs (quality ~1.0-1.3, positionally right on the known
+   coordinates) — but by only one of the three queried catalogs (`usno`,
+   then `atlas@localhost` in a later epoch — never the same one twice, and
+   never all three at once in the same epoch). At mag ~19, catalogs with
+   shallower or patchier coverage (Gaia in particular) may simply have no
+   counterpart to compare against in any one epoch — that's a coverage gap,
+   not evidence the source isn't real. **Resolved for this case** by
+   extending the replay window (see above) rather than by lowering the
+   default fraction. `DetectionConfig.min_catalogs_fraction` is still
+   config-exposed for future tuning if a case turns up that more epochs
+   can't fix, but the default (`1.0`) is unchanged.
+2. **Blending can suppress the magnitude-change check entirely.**
+   GRB200410A's detections pass every other gate cleanly (SNR, MAGLIM) but
+   never become candidates — every epoch shows two very close (~1″)
+   detections with `FLAGS` bits indicating a blend. Likely explanation: the
+   pipeline sees a persistent, unchanged-brightness point source at a known
+   catalog position (the blended pair reads as "this star, same as always")
+   and correctly-by-its-own-logic never flags it as new or changed, since
+   the added GRB flux is folded into the blend rather than standing out.
+   Fixed a real, separate bug found alongside this
+   (`_check_magnitude_changes_cached` returned early on the *first*
+   non-significant catalog match instead of checking all matches before
+   deciding — verified via baseline diff, real fix, but empirically did not
+   flip this specific case), so the actual blend-handling mechanism is still
+   unresolved. **Concrete improvement**: a specific check for "blended flag
+   + combined flux brighter than the catalogued star alone would predict"
+   rather than treating any blended detection as automatically
+   uninteresting.
+3. **A recurring `ERRX2_IMAGE = ERRY2_IMAGE = 0.0` anomaly**, present in
+   most epochs of 151027B, 210312B, 210410A, 220403B, 180325A, and all
+   epochs of 240414A and 211024B. Real SExtractor centroid uncertainties
+   are essentially never exactly 0. Traced through `core/radii.py`'s
+   handling: it gets clamped to the minimum allowed radius rather than
+   causing an outright failure, so it isn't the direct cause of any
+   mechanism above — but it's suspiciously correlated with the same
+   detections that are also MAGLIM-limited, which raises the question of
+   whether whatever produces the degenerate centroid error is *also*
+   quietly affecting photometry quality for the same measurements. Worth
+   investigating directly in `pyrt`'s own aperture-photometry step
+   (`phcat.py`/`dophot3`).
+4. **Image stacking/co-addition** — the only real fix for the
+   MAGLIM-limited cases above. A substantial, separate capability: combine
+   N raw/calibrated epochs into one deeper image before running
+   SExtractor/photometry, rather than (or alongside) per-epoch processing.
+   Reaching ~3 magnitudes deeper (roughly what 151027B/211024B/210410A
+   would need) needs on the order of 10²·⁴≈250 stacked frames for
+   comparable per-exposure noise — not something simply extending the
+   replayed epoch count achieves on its own, since each individual epoch
+   is still evaluated (and gated) independently either way.
+
+**A related, separate discovery**: three GRBs' catalog entries in
+`grb_detection2.txt` turned out to be data errors, not pipeline results —
+GRB210722A's coordinates are duplicated from GRB210610B (real position is
+in Cetus), GRB090726's position is off by ~12 arcmin from the real
+GCN-confirmed one, and GRB210610A's *source directory* actually contains
+images centered on GRB210610B's catalogued position, not its own (204.28°,
++14.47° — nothing was ever detected within 20″ of that position in any of
+its 11 real epochs; the closest raw detection was 38° away). Three
+independent errors out of eighteen entries is a high enough rate that the
+whole catalog is worth a systematic re-validation (cross-check every row's
+RA/Dec and source directory against its own GCN localization) rather than
+treating these three as isolated one-offs.
 
 ## Deferred stdpipe adoption
 

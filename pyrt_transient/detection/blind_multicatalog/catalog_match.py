@@ -118,7 +118,8 @@ def find_transients_multicatalog(
                     detections=det_for_analysis,
                     idlimit=idlimit,
                     mag_change_threshold=mag_change_threshold,
-                    siglim=5.0,
+                    siglim=config.detection.siglim if config else 5.0,
+                    new_source_siglim=config.detection.new_source_siglim if config else None,
                     frame=10.0
                 )
                 logger.info(f"✅ Used optimized detection for {cat_name}")
@@ -134,7 +135,10 @@ def find_transients_multicatalog(
             if len(candidates) > 0:
                 logger.info(f"Found {len(candidates)} candidates from {cat_name}")
 
-                # Apply MAGLIM-based filtering: drop rows where MAG_CALIB > 1.1 * MAGLIM
+                # Apply MAGLIM-based filtering: drop rows fainter than this
+                # exposure's own single-image depth (not physically
+                # recoverable without stacking -- see DetectionConfig.
+                # maglim_filter_multiplier's docstring).
                 try:
                     # Respect user's request: do not use MAG_ISO-substituted MAG_CALIB for this rule
                     if candidates.meta.get('mag_calib_is_fallback', False):
@@ -145,12 +149,13 @@ def find_transients_multicatalog(
                             if key in candidates.meta:
                                 maglim = float(candidates.meta[key])
                                 break
+                        maglim_mult = config.detection.maglim_filter_multiplier if config else 1.1
                         if maglim is not None and 'MAG_CALIB' in candidates.colnames:
-                            keep_mask = np.array(candidates['MAG_CALIB'], dtype=float) <= (1.1 * maglim)
+                            keep_mask = np.array(candidates['MAG_CALIB'], dtype=float) <= (maglim_mult * maglim)
                             removed = int(np.sum(~keep_mask))
                             if removed > 0:
                                 candidates = candidates[keep_mask]
-                                logger.info(f"MAGLIM filter removed {removed} candidates (>1.5x MAGLIM), {len(candidates)} remain")
+                                logger.info(f"MAGLIM filter removed {removed} candidates (>{maglim_mult}x MAGLIM), {len(candidates)} remain")
                 except Exception as e:
                     logger.debug(f"MAGLIM-based filtering skipped due to error: {e}")
 

@@ -755,6 +755,28 @@ def combine_with_lightcurves(
                 surviving_ids = set(str(t) for t in result_table['transient_id'])
                 lightcurves = {k: v for k, v in lightcurves.items() if k in surviving_ids}
 
+        # Final quality gate, on the fully-computed score (base_score *
+        # lightcurve_score_factor, including the n_detections consistency
+        # term) -- not the early, base-score-only min_quality check in
+        # combine_results. That earlier check runs before any lightcurve
+        # exists and can't know how consistently a source repeats; this one
+        # can. Relaxing admission (new_source_siglim, min_n_detections) only
+        # works safely alongside this: it lets marginal-but-real candidates
+        # reach full scoring, then filters on the real, accumulated
+        # confidence rather than a hard per-epoch or per-count cutoff.
+        if config:
+            min_quality_final = config.detection.min_quality
+            quality_keep = result_table['quality_score'] >= min_quality_final
+            n_dropped = int(np.sum(~quality_keep))
+            if n_dropped > 0:
+                logging.info(
+                    f"Final quality gate removed {n_dropped} candidate(s) below "
+                    f"min_quality={min_quality_final}"
+                )
+                result_table = result_table[quality_keep]
+                surviving_ids = set(str(t) for t in result_table['transient_id'])
+                lightcurves = {k: v for k, v in lightcurves.items() if k in surviving_ids}
+
         # Trail detection summary logging
         if 'candidate_type' in result_table.colnames:
             trail_mask = result_table['candidate_type'] == 'trail'

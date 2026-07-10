@@ -93,7 +93,23 @@ def compute_lightcurve_score_factor(features: Dict[str, Any], weights) -> float:
     if "mag_range" in features:
         mag_range_factor = features["mag_range"]
 
-    return lightcurve_boost * mag_range_factor
+    # Consistency across epochs: a candidate confirmed by many independent
+    # detections is much more likely to be real than one just barely past
+    # min_n_detections, even if each individual detection is only marginal
+    # (this is exactly the GRB151027B/210312B/211024B/210410A pattern found
+    # cross-checking against GCN -- a real, positionally- and
+    # photometrically-consistent afterglow present in nearly every epoch,
+    # but excluded by a hard per-epoch significance gate that has no memory
+    # of that consistency). Root-sum-square-style scaling: doubling the
+    # detection count is worth sqrt(2)x confidence, not a flat multiplier,
+    # normalized so a candidate right at min_n_detections gets a neutral 1.0
+    # (no change relative to pre-existing behavior at the threshold).
+    n_epochs_factor = 1.0
+    if "n_detections" in features:
+        reference_n = max(getattr(weights, "min_n_detections", 1), 1)
+        n_epochs_factor = math.sqrt(max(features["n_detections"], 1) / reference_n)
+
+    return lightcurve_boost * mag_range_factor * n_epochs_factor
 
 
 def compute_quality_score(features: Dict[str, Any], weights) -> float:
@@ -124,6 +140,8 @@ def _row_features(row, maglim: Optional[float], mag_calib_is_fallback: bool) -> 
         features["weighted_mean_mag"] = row["mag_weighted_mean"]
     if "mag_range" in row.colnames:
         features["mag_range"] = row["mag_range"]
+    if "n_detections" in row.colnames:
+        features["n_detections"] = row["n_detections"]
     return features
 
 
