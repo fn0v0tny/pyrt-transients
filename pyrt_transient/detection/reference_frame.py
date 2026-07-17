@@ -21,16 +21,45 @@ the same radius-match logic in this codebase.
 No check_baseline.py coverage here (this code was never callable before, so
 there's no existing behavior to preserve) -- see tests/test_reference_frame.py
 for fresh unit tests against synthetic WCS headers instead.
+
+Target-aware selection (target_ra/target_dec) added when this became the
+own-epoch template picker for the subtraction detection strategy (see
+detection/subtraction/templates.py, get_template_own_epoch): picking a
+reference epoch purely on generic image quality (seeing/depth/source count)
+has no way to know whether the *target itself* already has real flux in a
+candidate reference epoch. For a genuinely new transient that's harmless --
+there's nothing there yet in any epoch to accidentally subtract away. But
+for continued monitoring of an already-known, slowly-evolving source (the
+common case once a target has been flagged and a campaign starts), it can
+silently pick a reference epoch where the target is already near its normal
+brightness, and difference against it -- which reveals only the (possibly
+tiny) change relative to that reference, not the target's true magnitude,
+with no warning that this happened. Confirmed directly against the real
+tests/2026kid/ campaign: AT2026kid's own science-image magnitude was flat
+(15.35-15.73 mag, no real trend) across all seven nights, so *any* pair of
+those nights used as science/reference would reproduce the same
+under-representation this analysis found for the 0425->0426 pair
+specifically (true mag ~15.65, own-epoch residual mag 17.5-18.1 depending
+on differencing engine -- see FUTURE_IDEAS.md).
+
+target_ra/target_dec, when provided, make epoch selection prefer a
+genuinely target-free reference epoch when one exists, and log a clear
+warning (rather than silently degrading) when it doesn't -- e.g. exactly
+the all-epochs-contaminated case a persistent, already-known transient like
+AT2026kid produces.
 """
 
 from dataclasses import dataclass
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
+import logging
 
 import astropy.wcs
 import numpy as np
 from astropy.table import Table
 
 from pyrt_transient.core.matching import match_radius
+
+logger = logging.getLogger("detection.reference_frame")
 
 
 @dataclass
@@ -40,18 +69,37 @@ class ImageQuality:
     limiting_mag: float
     n_sources: int
     center_dist: float  # Distance of image center from field center
+    target_present: bool = False  # True if a source is detected near the known target position
 
 
 class ReferenceFrameSelector:
     """Manages multiple image extractions and selects optimal reference frame."""
 
-    def __init__(self, detection_tables: List[Table]):
+    def __init__(
+        self,
+        detection_tables: List[Table],
+        target_ra: Optional[float] = None,
+        target_dec: Optional[float] = None,
+        target_exclusion_radius_arcsec: float = 5.0,
+    ):
         """Initialize with list of detection tables.
 
         Args:
             detection_tables: List of detection tables with WCS metadata
+            target_ra/target_dec: Known target position, optional. When
+                given, epoch selection avoids picking a reference epoch
+                where a source already exists at this position (see this
+                module's docstring for why) -- unset (the default)
+                preserves the exact original generic-quality-only
+                selection behavior.
+            target_exclusion_radius_arcsec: Match radius around
+                target_ra/target_dec used to decide "is the target present
+                in this epoch".
         """
         self.detection_tables = detection_tables
+        self.target_ra = target_ra
+        self.target_dec = target_dec
+        self.target_exclusion_radius_arcsec = target_exclusion_radius_arcsec
         self.field_center = self._compute_field_center()
         self.quality_metrics = self._compute_quality_metrics()
         self.reference_idx = self._select_reference_image()
@@ -91,17 +139,42 @@ class ReferenceFrameSelector:
             img_dec = det.meta.get('CTRDEC', det.meta.get('CRVAL2'))
             center_dist = np.sqrt((img_ra - ra_center) ** 2 + (img_dec - dec_center) ** 2)
 
+            target_present = self._is_target_present(det) if self.target_ra is not None else False
+
             metrics.append(ImageQuality(
                 seeing=seeing,
                 limiting_mag=limiting_mag,
                 n_sources=n_sources,
-                center_dist=center_dist
+                center_dist=center_dist,
+                target_present=target_present,
             ))
 
         return metrics
 
+    def _is_target_present(self, det: Table) -> bool:
+        """Whether a detection exists within target_exclusion_radius_arcsec
+        of the known target position in this epoch's table -- see this
+        module's docstring for why an own-epoch template picker needs to
+        know this.
+        """
+        if 'ALPHA_J2000' not in det.colnames or 'DELTA_J2000' not in det.colnames or len(det) == 0:
+            return False
+        ra = np.asarray(det['ALPHA_J2000'], dtype=float)
+        dec = np.asarray(det['DELTA_J2000'], dtype=float)
+        dra = (ra - self.target_ra) * np.cos(np.radians(self.target_dec))
+        ddec = dec - self.target_dec
+        sep_arcsec = np.sqrt(dra ** 2 + ddec ** 2) * 3600.0
+        return bool(np.any(sep_arcsec <= self.target_exclusion_radius_arcsec))
+
     def _select_reference_image(self) -> int:
         """Select best reference image based on quality metrics.
+
+        When target_ra/target_dec was given: restricts the choice to
+        epochs where the target isn't already present, if any exist, and
+        only falls back to the single best-quality epoch overall (with a
+        clear warning, not a silent one) when every candidate epoch already
+        has the target in it -- e.g. the AT2026kid case in this module's
+        docstring, where the target is essentially always present.
 
         Returns:
             Index of best reference image
@@ -116,6 +189,20 @@ class ReferenceFrameSelector:
                 (1.0 / (1.0 + quality.center_dist)) * 0.1  # Closer to field center
             )
             scores.append(score)
+
+        if self.target_ra is not None:
+            clean_indices = [i for i, q in enumerate(self.quality_metrics) if not q.target_present]
+            if clean_indices:
+                return max(clean_indices, key=lambda i: scores[i])
+            logger.warning(
+                "ReferenceFrameSelector: target present in every candidate epoch -- "
+                "no genuinely quiescent own-epoch template available. Falling back to "
+                "the best-quality epoch overall, but differencing against it will "
+                "under-represent the target's true brightness (it will reveal only "
+                "the change relative to that epoch, not the total magnitude -- see "
+                "FUTURE_IDEAS.md's own-epoch-vs-PS1 analysis). Consider "
+                "template_source='ps1'/'legacysurvey' instead for absolute photometry."
+            )
 
         return int(np.argmax(scores))
 

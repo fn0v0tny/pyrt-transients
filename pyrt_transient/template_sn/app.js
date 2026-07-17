@@ -400,6 +400,28 @@ const sv = {
   },
 
   // ── Cutout viewer section ────────────────────────────────────────────────
+  // A cutout entry is either the blind-multicatalog shape {path, filename,
+  // date} (one image per epoch) or the subtraction shape
+  // {sci_path, ref_path?, diff_path, filename, date} (science/template/
+  // difference triplet per epoch -- ref_path is omitted when the template
+  // used for that epoch isn't locally reachable, see frontend_generator.py).
+  // Every cutout entry for one candidate shares the same shape (the pipeline
+  // that produced them doesn't change strategy mid-candidate), so it's
+  // enough to feature-detect once from the first entry.
+  isTripletShape(cu) {
+    return !!(cu && (cu.sci_path || cu.ref_path || cu.diff_path));
+  },
+
+  renderTripletPanel(label, src, idSuffix) {
+    return `
+      <div class="triplet-panel">
+        <div class="triplet-label">${label}</div>
+        ${src
+          ? `<img src="${src}" class="triplet-image" id="cutout-img-${idSuffix}">`
+          : `<div class="triplet-missing" id="cutout-img-${idSuffix}">no ${label.toLowerCase()}</div>`}
+      </div>`;
+  },
+
   renderCutouts(c, hasCutouts) {
     if (!hasCutouts) return `
       <div class="card">
@@ -408,25 +430,42 @@ const sv = {
       </div>`;
 
     const n = c.cutouts.length;
+    const first = c.cutouts[0];
+    const triplet = this.isTripletShape(first);
+
+    const imageMarkup = triplet
+      ? `<div class="cutout-triplet" id="cutout-triplet-wrap">
+           ${this.renderTripletPanel('Science', first.sci_path, 'sci')}
+           ${this.renderTripletPanel('Template', first.ref_path, 'ref')}
+           ${this.renderTripletPanel('Difference', first.diff_path, 'diff')}
+         </div>
+         <div class="cutout-filename" id="cutout-fname" style="text-align:center;">${first.filename}</div>`
+      : `<div class="cutout-image-container" id="cutout-img-wrap">
+           <img src="${first.path}" class="cutout-image" id="cutout-img" alt="${first.filename}">
+           <div class="cutout-filename" id="cutout-fname">${first.filename}</div>
+         </div>`;
+
+    // Thumbnail strip always shows one representative image per epoch --
+    // the difference stamp for triplets (most informative for a quick scan
+    // of a subtraction candidate), the single image otherwise.
+    const stripSrc = cu => triplet ? (cu.diff_path || cu.sci_path || cu.ref_path) : cu.path;
+
     return `
       <div class="card">
-        <h3>Cutout Viewer</h3>
+        <h3>Cutout Viewer${triplet ? ' <span style="font-size:0.6em;color:#888;font-weight:400;">(science / template / difference)</span>' : ''}</h3>
         <div class="cutout-nav">
           <button id="btn-prev" onclick="sv.prevCutout()" ${n <= 1 ? 'disabled' : ''}>&lt; Prev</button>
           <div class="cutout-time-info" id="cutout-info">
             Image 1 of ${n}
-            <div class="date-display">${c.cutouts[0].date || ''}</div>
+            <div class="date-display">${first.date || ''}</div>
           </div>
           <button id="btn-next" onclick="sv.nextCutout()" ${n <= 1 ? 'disabled' : ''}>Next &gt;</button>
         </div>
-        <div class="cutout-image-container" id="cutout-img-wrap">
-          <img src="${c.cutouts[0].path}" class="cutout-image" id="cutout-img" alt="${c.cutouts[0].filename}">
-          <div class="cutout-filename" id="cutout-fname">${c.cutouts[0].filename}</div>
-        </div>
+        ${imageMarkup}
         ${n > 1 ? `<input type="range" class="cutout-slider" min="0" max="${n-1}" value="0"
                           oninput="sv.cutoutIdx=+this.value; sv.updateCutout()" id="cutout-slider">` : ''}
         ${n > 1 ? `<div class="cutouts-strip">${c.cutouts.map((cu, i) =>
-          `<img src="${cu.path}" title="${cu.filename}" onclick="sv.cutoutIdx=${i};sv.updateCutout()">`
+          `<img src="${stripSrc(cu)}" title="${cu.filename}" onclick="sv.cutoutIdx=${i};sv.updateCutout()">`
         ).join('')}</div>` : ''}
       </div>`;
   },
@@ -448,11 +487,28 @@ const sv = {
     if (!c?.cutouts?.length) return;
     const cu = c.cutouts[this.cutoutIdx];
     const n = c.cutouts.length;
-    const img  = document.getElementById('cutout-img');
     const info = document.getElementById('cutout-info');
     const fname = document.getElementById('cutout-fname');
     const slider = document.getElementById('cutout-slider');
-    if (img)   { img.src = cu.path; img.alt = cu.filename; }
+
+    if (this.isTripletShape(cu)) {
+      for (const [key, suffix] of [['sci_path', 'sci'], ['ref_path', 'ref'], ['diff_path', 'diff']]) {
+        const el = document.getElementById(`cutout-img-${suffix}`);
+        if (!el) continue; // panel wasn't rendered at all (shouldn't happen -- shape is per-candidate)
+        if (cu[key] && el.tagName === 'IMG') {
+          el.src = cu[key];
+        }
+        // If this epoch is missing what a sibling epoch had (e.g. ref_path
+        // present for most epochs but not this one), leave the existing
+        // element as-is rather than trying to swap IMG<->placeholder --
+        // rare in practice since template availability doesn't usually
+        // vary epoch-to-epoch within one candidate.
+      }
+    } else {
+      const img = document.getElementById('cutout-img');
+      if (img) { img.src = cu.path; img.alt = cu.filename; }
+    }
+
     if (fname) fname.textContent = cu.filename;
     if (info)  info.innerHTML = `Image ${this.cutoutIdx+1} of ${n}<div class="date-display">${cu.date || ''}</div>`;
     if (slider) slider.value = this.cutoutIdx;
@@ -550,7 +606,7 @@ const sv = {
             <td>${fmt(c.DELTA_J2000, 6)}°</td>
           </tr>
           <tr>
-            <th>Reference cat.</th>
+            <th>${this.isTripletShape(c.cutouts?.[0]) ? 'Template source' : 'Reference cat.'}</th>
             <td>${c.reference_catalog || 'N/A'}</td>
             <th>Candidate type</th>
             <td>${typeBadge(c.candidate_type || 'unknown')}</td>

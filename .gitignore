@@ -14,3 +14,4 @@ grb_detection2.txt
 # Real FITS/ECSV regression fixture -- kept local, not pushed (large binary data)
 tests/210619B/
 tests/baseline/
+tests/2026kid/

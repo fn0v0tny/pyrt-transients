@@ -68,6 +68,64 @@ def test_select_reference_image_picks_better_seeing():
     assert sel.reference_idx == 1
 
 
+def test_target_aware_selection_avoids_contaminated_epoch():
+    # Image 0 has much better seeing (would normally win outright) but the
+    # target is right there in its detection table; image 1 has worse
+    # seeing but no source anywhere near the target -- target-awareness
+    # should override the seeing advantage and pick the clean epoch.
+    contaminated = _synthetic_detection_table(180.0, 30.0, fwhm=1.5)
+    clean = _synthetic_detection_table(180.0, 30.0, fwhm=5.0)
+    target_ra, target_dec = _pix_to_sky(contaminated, 500.0, 500.0)
+    contaminated['ALPHA_J2000'] = [target_ra] + [target_ra + 0.01] * (len(contaminated) - 1)
+    contaminated['DELTA_J2000'] = [target_dec] + [target_dec + 0.01] * (len(contaminated) - 1)
+    clean['ALPHA_J2000'] = [target_ra + 0.05] * len(clean)
+    clean['DELTA_J2000'] = [target_dec + 0.05] * len(clean)
+
+    # Without target-awareness, the better-seeing (contaminated) epoch wins.
+    sel_unaware = ReferenceFrameSelector([contaminated, clean])
+    assert sel_unaware.reference_idx == 0
+
+    # With target-awareness, the clean epoch wins despite worse seeing.
+    sel_aware = ReferenceFrameSelector(
+        [contaminated, clean], target_ra=target_ra, target_dec=target_dec,
+        target_exclusion_radius_arcsec=5.0,
+    )
+    assert sel_aware.quality_metrics[0].target_present is True
+    assert sel_aware.quality_metrics[1].target_present is False
+    assert sel_aware.reference_idx == 1
+
+
+def test_target_aware_selection_falls_back_when_all_contaminated():
+    # Target present in every candidate epoch -- must fall back to the
+    # generic best-quality choice (not raise, not silently pick randomly).
+    t0 = _synthetic_detection_table(180.0, 30.0, fwhm=5.0)
+    t1 = _synthetic_detection_table(180.0, 30.0, fwhm=1.5)
+    target_ra, target_dec = _pix_to_sky(t0, 500.0, 500.0)
+    for t in (t0, t1):
+        t['ALPHA_J2000'] = [target_ra] * len(t)
+        t['DELTA_J2000'] = [target_dec] * len(t)
+
+    sel = ReferenceFrameSelector(
+        [t0, t1], target_ra=target_ra, target_dec=target_dec,
+        target_exclusion_radius_arcsec=5.0,
+    )
+    assert all(q.target_present for q in sel.quality_metrics)
+    assert sel.reference_idx == 1  # falls back to the better-seeing epoch
+
+
+def test_target_ra_none_preserves_original_behavior():
+    # Backward compatibility: omitting target_ra/target_dec must reproduce
+    # the exact pre-existing selection (this is the default, used by every
+    # caller that doesn't know a target position).
+    tables = [
+        _synthetic_detection_table(180.0, 30.0, fwhm=5.0),
+        _synthetic_detection_table(180.0, 30.0, fwhm=1.5),
+    ]
+    sel = ReferenceFrameSelector(tables)
+    assert sel.reference_idx == 1
+    assert all(q.target_present is False for q in sel.quality_metrics)
+
+
 def test_reference_idx_actually_set_bug_fix():
     # The whole point of Phase 7: this must not raise/be None.
     tables = [_synthetic_detection_table(180.0, 30.0)]
@@ -143,6 +201,9 @@ def _pix_to_sky(det_table, x, y):
 if __name__ == "__main__":
     test_compute_field_center_is_median()
     test_select_reference_image_picks_better_seeing()
+    test_target_aware_selection_avoids_contaminated_epoch()
+    test_target_aware_selection_falls_back_when_all_contaminated()
+    test_target_ra_none_preserves_original_behavior()
     test_reference_idx_actually_set_bug_fix()
     test_transform_to_reference_uses_the_selected_images_wcs()
     test_validate_reference_coordinates_filters_out_of_bounds()

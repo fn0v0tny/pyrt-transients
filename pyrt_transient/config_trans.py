@@ -115,8 +115,85 @@ class DetectionConfig:
     vsx_match_radius_arcsec: float = 2.5
     vsx_catalog_id: str = "B/vsx/vsx"
 
+    # Detection strategy: "blind_multicatalog" (cross-match against reference
+    # catalogs, the only strategy today) or "subtraction" (differencing
+    # against a template -- see detection/subtraction/). Kept as a plain str
+    # rather than an enum so config files don't need an import to set it.
+    strategy: str = "blind_multicatalog"
 
-@dataclass 
+    # subtraction strategy only, below. template_source picks how the
+    # template image is obtained: "own_epoch" reuses
+    # detection/reference_frame.py's ReferenceFrameSelector to pick the best
+    # prior epoch of the same field (no external dependency, needs enough
+    # prior epochs); "ps1"/"legacysurvey" fetch an external-survey template
+    # via stdpipe.templates, reprojected onto the science WCS -- works on a
+    # field's very first observation but depends on survey coverage/network.
+    template_source: str = "ps1"
+    # subtraction_engine picks the differencing algorithm: "hotpants" (via
+    # stdpipe.subtraction.run_hotpants -- matches how tests/2026kid/'s real
+    # fixture was produced) or "zogy" (via PyZOGY, matching the one-off
+    # subtract_supernova.py reference script). Both write a diff FITS with a
+    # `TEMPLATE` header keyword so downstream cutout/frontend code doesn't
+    # need to know which engine produced a given diff image.
+    subtraction_engine: str = "hotpants"
+
+    # Dipole/artifact rejection (detection/subtraction/artifact_filters.py):
+    # a positive+negative flux pair close together is the standard signature
+    # of imperfect subtraction (bad registration, saturated-star wings,
+    # cosmic rays) rather than a real transient. Reject any diff detection
+    # whose nearest opposite-sign counterpart is closer than
+    # dipole_reject_radius_arcsec and whose flux ratio to that counterpart
+    # exceeds dipole_reject_flux_ratio (i.e. comparable brightness, not a
+    # coincidental faint neighbor).
+    dipole_reject_radius_arcsec: float = 3.0
+    dipole_reject_flux_ratio: float = 0.5
+
+    # Template cache (subtraction strategy, template_source != "own_epoch"):
+    # reprojected survey templates are expensive to build and reusable
+    # across many nights of the same field, but are large FITS files that
+    # will fill the disk if kept forever. template_cache_dir stores them
+    # keyed by field/radius/band; template_cache_max_size_gb bounds the
+    # cache the same way FrontendConfig.max_dir_size_gb bounds the website
+    # directory (LRU eviction, see frontend_generator.py's
+    # cleanup_old_files/enforce_disk_budget_strict).
+    template_cache_dir: str = "./template_cache"
+    template_cache_max_size_gb: float = 20.0
+
+    # diff_input_mode picks what pipeline_magic_sn.py's subtraction branch
+    # expects as input: "prebuilt" (Phase A -- ecsv_file/fits_file are
+    # already a diff-image pair, e.g. an externally-produced campaign like
+    # tests/2026kid/) or "raw" (Phase B -- ecsv_file/fits_file are a raw
+    # science epoch, and the pipeline builds the template/diff/extraction
+    # itself via detection/subtraction/templates.py, differencing.py,
+    # extraction.py before handing off to the same SubtractionStrategy).
+    # Defaults to "prebuilt" so existing Phase A behavior is unchanged
+    # unless a caller opts in.
+    diff_input_mode: str = "prebuilt"
+    # Reference photometric catalog used to derive each science epoch's own
+    # zeropoint (detection/subtraction/extraction.py) -- calibrating
+    # against the *science* image, never the diff image itself (see
+    # extraction.py's module docstring for why that doesn't work).
+    photometric_catalog: str = "ps1"
+
+    # apply_morphology_filter's thresholds (pipeline_magic_sn.py), exposed
+    # here rather than left hardcoded in the function signature: verified
+    # directly that the 0.4/({0.5,2.0}) defaults, implicitly tuned against
+    # the real tests/2026kid/ fixture's external SExtractor-based diff
+    # catalogs, are measurably too strict for stdpipe's SEP-based
+    # extraction (detection/subtraction/extraction.py, Phase B's own
+    # diff-image source measurement) -- on one real diff image, 57% of all
+    # genuine SEP detections (43/75) had ELLIPTICITY >= 0.4, including the
+    # real AT2026kid target itself (0.594), which was silently dropped by
+    # the filter as a result. Needs real-data tuning per extraction method
+    # rather than one blind guess at a replacement number -- exposed as
+    # config so that tuning can happen without a code change once there's
+    # enough real SEP-extracted data to calibrate against.
+    morphology_max_ellipticity: float = 0.4
+    morphology_fwhm_ratio_min: float = 0.5
+    morphology_fwhm_ratio_max: float = 2.0
+
+
+@dataclass
 class FrontendConfig:
     """Configuration for frontend website generation."""
     max_candidates: int = 100
@@ -241,6 +318,20 @@ class PipelineConfig:
             pipeline_config.detection.vsx_filter_enabled = det_section.getboolean("vsx_filter_enabled", pipeline_config.detection.vsx_filter_enabled)
             pipeline_config.detection.vsx_match_radius_arcsec = det_section.getfloat("vsx_match_radius_arcsec", pipeline_config.detection.vsx_match_radius_arcsec)
             pipeline_config.detection.vsx_catalog_id = det_section.get("vsx_catalog_id", pipeline_config.detection.vsx_catalog_id)
+
+            # Detection strategy / subtraction parameters
+            pipeline_config.detection.strategy = det_section.get("strategy", pipeline_config.detection.strategy)
+            pipeline_config.detection.template_source = det_section.get("template_source", pipeline_config.detection.template_source)
+            pipeline_config.detection.subtraction_engine = det_section.get("subtraction_engine", pipeline_config.detection.subtraction_engine)
+            pipeline_config.detection.dipole_reject_radius_arcsec = det_section.getfloat("dipole_reject_radius_arcsec", pipeline_config.detection.dipole_reject_radius_arcsec)
+            pipeline_config.detection.dipole_reject_flux_ratio = det_section.getfloat("dipole_reject_flux_ratio", pipeline_config.detection.dipole_reject_flux_ratio)
+            pipeline_config.detection.template_cache_dir = det_section.get("template_cache_dir", pipeline_config.detection.template_cache_dir)
+            pipeline_config.detection.template_cache_max_size_gb = det_section.getfloat("template_cache_max_size_gb", pipeline_config.detection.template_cache_max_size_gb)
+            pipeline_config.detection.diff_input_mode = det_section.get("diff_input_mode", pipeline_config.detection.diff_input_mode)
+            pipeline_config.detection.photometric_catalog = det_section.get("photometric_catalog", pipeline_config.detection.photometric_catalog)
+            pipeline_config.detection.morphology_max_ellipticity = det_section.getfloat("morphology_max_ellipticity", pipeline_config.detection.morphology_max_ellipticity)
+            pipeline_config.detection.morphology_fwhm_ratio_min = det_section.getfloat("morphology_fwhm_ratio_min", pipeline_config.detection.morphology_fwhm_ratio_min)
+            pipeline_config.detection.morphology_fwhm_ratio_max = det_section.getfloat("morphology_fwhm_ratio_max", pipeline_config.detection.morphology_fwhm_ratio_max)
         
         # Update frontend config
         if "frontend" in config:
@@ -407,6 +498,18 @@ class PipelineConfig:
             "vsx_filter_enabled": str(self.detection.vsx_filter_enabled),
             "vsx_match_radius_arcsec": str(self.detection.vsx_match_radius_arcsec),
             "vsx_catalog_id": self.detection.vsx_catalog_id,
+            "strategy": self.detection.strategy,
+            "template_source": self.detection.template_source,
+            "subtraction_engine": self.detection.subtraction_engine,
+            "dipole_reject_radius_arcsec": str(self.detection.dipole_reject_radius_arcsec),
+            "dipole_reject_flux_ratio": str(self.detection.dipole_reject_flux_ratio),
+            "template_cache_dir": self.detection.template_cache_dir,
+            "template_cache_max_size_gb": str(self.detection.template_cache_max_size_gb),
+            "diff_input_mode": self.detection.diff_input_mode,
+            "photometric_catalog": self.detection.photometric_catalog,
+            "morphology_max_ellipticity": str(self.detection.morphology_max_ellipticity),
+            "morphology_fwhm_ratio_min": str(self.detection.morphology_fwhm_ratio_min),
+            "morphology_fwhm_ratio_max": str(self.detection.morphology_fwhm_ratio_max),
         }
         
         # Frontend section  

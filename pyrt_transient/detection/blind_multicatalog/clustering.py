@@ -247,8 +247,23 @@ def combine_results(
     n_catalogs = max(1, len(transients))
     min_catalogs = max(1, math.ceil(min_catalogs_fraction * n_catalogs))
 
-    # Filter candidates appearing in enough catalogs and process components
-    reliable = []
+    # Filter candidates appearing in enough catalogs and process components.
+    #
+    # Vectorized: the original version built one brand-new single-row
+    # Table() per surviving subcluster, setting every column individually
+    # (Table.__setitem__/add_column has real per-call overhead -- profiled
+    # at ~14,000 calls / 6.5s for a single 436-candidate subtraction epoch,
+    # the dominant cost in this whole function). Collecting indices/override
+    # values in plain Python lists and building the result with one fancy-index
+    # select + at most two whole-column overwrites is behaviorally identical
+    # (same selection and override logic below) but avoids that per-row
+    # Table-construction cost entirely.
+    has_candidate_type = 'candidate_type' in all_candidates.colnames
+    has_magdiff = 'magnitude_difference' in all_candidates.colnames
+
+    best_indices: List[int] = []
+    type_overrides: List[str] = []
+    magdiff_overrides: List[float] = []
 
     for root, component_indices in components.items():
         # Count unique catalogs in this component
@@ -277,34 +292,34 @@ def combine_results(
                     subcluster_qualities = subcluster_data["quality_score"]
                     best_local_idx = np.argmax(subcluster_qualities)
                     best_global_idx = subcluster_indices[best_local_idx]
-
-                    # Create single-row table instead of appending Row object
-                    best_row = all_candidates[best_global_idx]
-                    single_row_table = Table()
-                    for col_name in best_row.colnames:
-                        single_row_table[col_name] = [best_row[col_name]]
+                    best_indices.append(best_global_idx)
 
                     # Use most informative candidate_type from the entire subcluster,
                     # not just the highest-quality-score detection. This prevents a USNO
                     # detection (always 'new' due to no Sloan photometry) from overriding
                     # a 'brightening'/'fading' classification from Gaia or ATLAS.
-                    if 'candidate_type' in subcluster_data.colnames:
+                    if has_candidate_type:
                         type_priority = {'brightening': 3, 'fading': 3, 'trail': 2, 'new': 1, 'unknown': 0}
                         all_types = [str(t) for t in subcluster_data['candidate_type']]
                         best_type = max(all_types, key=lambda t: type_priority.get(t, 0))
-                        single_row_table['candidate_type'] = [best_type]
+                        type_overrides.append(best_type)
                         # Copy magnitude_difference from the detection that provided
                         # best_type so it is consistent with the classification.
-                        if 'magnitude_difference' in subcluster_data.colnames:
+                        if has_magdiff:
                             type_mask = np.array([str(t) == best_type for t in subcluster_data['candidate_type']])
                             type_rows = subcluster_data[type_mask]
-                            if len(type_rows) > 0:
-                                best_md_idx = np.argmax(np.abs(type_rows['magnitude_difference']))
-                                single_row_table['magnitude_difference'] = [type_rows['magnitude_difference'][best_md_idx]]
+                            best_md_idx = np.argmax(np.abs(type_rows['magnitude_difference']))
+                            magdiff_overrides.append(type_rows['magnitude_difference'][best_md_idx])
 
-                    reliable.append(single_row_table)
+    if not best_indices:
+        return Table()
 
-    return vstack(reliable) if reliable else Table()
+    result = all_candidates[best_indices]
+    if has_candidate_type:
+        result['candidate_type'] = type_overrides
+        if has_magdiff:
+            result['magnitude_difference'] = magdiff_overrides
+    return result
 
 
 def split_component_by_epoch(

@@ -77,6 +77,26 @@ def _wcs_fallbacks(header):
         yield _replace_proj_with_tan(_strip_pv(_strip_sip(header)))
 
 
+def _try_open_fits(path):
+    """Open a FITS file for lazy `.section`-based cutout reads, or None if
+    `path` is falsy/missing/unreadable. Used for a subtraction epoch's
+    science-sibling and template companion images -- both are optional
+    (the template in particular may reference a path from a different host,
+    e.g. the real tests/2026kid/ fixture's TEMPLATE header points at a path
+    under a different user's home directory), so any failure here should
+    degrade to a missing panel, not an error.
+    """
+    if not path:
+        return None
+    try:
+        p = Path(path)
+        if not p.exists():
+            return None
+        return fits.open(p, memmap=True)
+    except Exception:
+        return None
+
+
 class FrontendGenerator:
     """Integrated frontend generator that uses templates and creates complete websites."""
     
@@ -431,7 +451,23 @@ class FrontendGenerator:
         
         # Find all FITS files and select subset for processing
         fits_files = sorted(self.data_dir.glob("*.fits"))
-        logger.info(f"Found {len(fits_files)} FITS files")
+
+        # Subtraction epochs (detection/subtraction/, see run_sn_pipeline)
+        # copy each diff epoch's science sibling into the same obs_dir --
+        # named `<stem>.fits` alongside the diff file `<stem>h.fits` --
+        # purely so candidates.py's find_science_sibling can locate it for
+        # calibration meta. It's not a separate epoch/cutout of its own, so
+        # exclude it here; it gets pulled in as the diff epoch's companion
+        # triplet panel instead (see the per-candidate loop below).
+        diff_stems = {
+            f.stem for f in fits_files
+            if f.stem.endswith('h') and self.data_dir.joinpath(f"{f.stem[:-1]}.fits").exists()
+        }
+        sibling_stems = {stem[:-1] for stem in diff_stems}
+        if sibling_stems:
+            fits_files = [f for f in fits_files if f.stem not in sibling_stems]
+        logger.info(f"Found {len(fits_files)} FITS files"
+                    + (f" ({len(diff_stems)} subtraction diff epochs)" if diff_stems else ""))
         
         # Select frames per candidate using smart sampling
         selected_fits_files = self.select_frames_for_candidates(fits_files, max_cutouts_per_candidate)
@@ -528,6 +564,18 @@ class FrontendGenerator:
                 logger.warning(f"Could not maintain disk budget, stopping FITS processing")
                 break
 
+            # Subtraction diff epoch: also open its science sibling and
+            # (if locally accessible) the template referenced in its own
+            # FITS header, so the per-candidate loop below can crop a
+            # sci/ref/diff triplet instead of a single stamp. Opened once
+            # per FITS file (not per-candidate) as lazy `.section`-readable
+            # HDULists, matching the main image's own access pattern;
+            # closed in the `finally` below regardless of what happens
+            # inside the main `with` block.
+            is_diff_epoch = frame_stem in diff_stems
+            sci_hdul = _try_open_fits(self.data_dir / f"{frame_stem[:-1]}.fits") if is_diff_epoch else None
+            ref_hdul = None
+
             try:
                 # Open FITS and read header only — defer per-pixel reads to hdul.section
                 # so a truncated file doesn't prevent all cutouts (only affected rows fail).
@@ -538,6 +586,13 @@ class FrontendGenerator:
                     if naxis1 == 0 or naxis2 == 0:
                         logger.warning(f"No image dimensions in FITS header {fits_file}")
                         continue
+
+                    if is_diff_epoch:
+                        template_path = header.get('TEMPLATE')
+                        ref_hdul = _try_open_fits(template_path)
+                        if ref_hdul is None and template_path:
+                            logger.debug(f"Triplet: template {template_path} not accessible "
+                                         f"for {fits_file.name} — sci/diff panels only")
 
                     wcs = None
                     for _h in _wcs_fallbacks(header):
@@ -601,10 +656,58 @@ class FrontendGenerator:
                                 if config_format in ['webp', 'jpeg', 'jpg']:
                                     image_format = config_format
 
+                            date_str = self.extract_date_from_filename(fits_file.name)
+
+                            # Create cutout bounds
+                            ymin = max(0, y - self.cutout_size)
+                            ymax = min(naxis2, y + self.cutout_size)
+                            xmin = max(0, x - self.cutout_size)
+                            xmax = min(naxis1, x + self.cutout_size)
+
+                            if is_diff_epoch:
+                                # Subtraction epoch: science/template share the
+                                # diff image's pixel grid (HOTPANTS/ZOGY run on
+                                # a reprojected-to-science-WCS template), so the
+                                # same (x, y)/bounds crop directly from each.
+                                entry = {"filename": fits_file.name, "date": date_str}
+
+                                diff_fn = f"{candidate_id}_{fits_file.stem}_diff.{image_format}"
+                                diff_out = self.output_dir / "cutouts" / diff_fn
+                                if not diff_out.exists():
+                                    diff_cutout = np.array(hdul[0].section[ymin:ymax, xmin:xmax])
+                                    self.save_cutout_plot(diff_cutout, x, y, xmin, ymin, diff_out, candidate_id)
+                                entry["diff_path"] = f"./cutouts/{diff_fn}"
+
+                                if sci_hdul is not None:
+                                    sci_fn = f"{candidate_id}_{fits_file.stem}_sci.{image_format}"
+                                    sci_out = self.output_dir / "cutouts" / sci_fn
+                                    try:
+                                        if not sci_out.exists():
+                                            sci_cutout = np.array(sci_hdul[0].section[ymin:ymax, xmin:xmax])
+                                            self.save_cutout_plot(sci_cutout, x, y, xmin, ymin, sci_out, candidate_id)
+                                        entry["sci_path"] = f"./cutouts/{sci_fn}"
+                                    except Exception as e:
+                                        logger.debug(f"Science stamp failed for {candidate_id}/"
+                                                     f"{fits_file.name}: {e}")
+
+                                if ref_hdul is not None:
+                                    ref_fn = f"{candidate_id}_{fits_file.stem}_ref.{image_format}"
+                                    ref_out = self.output_dir / "cutouts" / ref_fn
+                                    try:
+                                        if not ref_out.exists():
+                                            ref_cutout = np.array(ref_hdul[0].section[ymin:ymax, xmin:xmax])
+                                            self.save_cutout_plot(ref_cutout, x, y, xmin, ymin, ref_out, candidate_id)
+                                        entry["ref_path"] = f"./cutouts/{ref_fn}"
+                                    except Exception as e:
+                                        logger.debug(f"Template stamp failed for {candidate_id}/"
+                                                     f"{fits_file.name}: {e}")
+
+                                candidates_data[candidate_id]['cutouts'].append(entry)
+                                continue
+
+                            # ----- Non-subtraction epoch: original single-image behavior -----
                             output_filename = f"{candidate_id}_{fits_file.stem}.{image_format}"
                             output_path = self.output_dir / "cutouts" / output_filename
-
-                            date_str = self.extract_date_from_filename(fits_file.name)
 
                             # Skip if already exists
                             if output_path.exists():
@@ -614,12 +717,6 @@ class FrontendGenerator:
                                     "date": date_str
                                 })
                                 continue
-
-                            # Create cutout bounds
-                            ymin = max(0, y - self.cutout_size)
-                            ymax = min(naxis2, y + self.cutout_size)
-                            xmin = max(0, x - self.cutout_size)
-                            xmax = min(naxis1, x + self.cutout_size)
 
                             # Read only the cutout region (lazy — works on truncated files)
                             cutout = np.array(hdul[0].section[ymin:ymax, xmin:xmax])
@@ -640,6 +737,11 @@ class FrontendGenerator:
             except Exception as e:
                 logger.warning(f"Error processing FITS file {fits_file}: {e}")
                 continue
+            finally:
+                if sci_hdul is not None:
+                    sci_hdul.close()
+                if ref_hdul is not None:
+                    ref_hdul.close()
         
         # Load forced photometry lightcurves if available
         forced_lcs = self._load_forced_lightcurves()

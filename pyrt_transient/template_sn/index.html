@@ -161,6 +161,28 @@
     .cutout-image { max-width: 100%; border: 1px solid #ddd; border-radius: 4px; }
     .cutout-filename { font-size: 0.75em; color: #888; margin-top: 4px; font-family: monospace; }
 
+    /* ── Triplet cutout viewer (subtraction candidates: sci/ref/diff) ───── */
+    .cutout-triplet {
+      display: flex; gap: 8px; justify-content: center; margin-bottom: 8px;
+    }
+    .triplet-panel {
+      display: flex; flex-direction: column; align-items: center; flex: 1; min-width: 0;
+    }
+    .triplet-label {
+      font-size: 0.7em; font-weight: 700; text-transform: uppercase; letter-spacing: 0.03em;
+      color: #888; margin-bottom: 4px;
+    }
+    .triplet-image {
+      width: 100%; max-width: 180px; aspect-ratio: 1 / 1; object-fit: contain;
+      border: 1px solid #ddd; border-radius: 4px; background: #111;
+    }
+    .triplet-missing {
+      width: 100%; max-width: 180px; aspect-ratio: 1 / 1;
+      border: 1px dashed #ccc; border-radius: 4px;
+      display: flex; align-items: center; justify-content: center;
+      color: #bbb; font-size: 0.75em; text-align: center; padding: 8px;
+    }
+
     .cutout-slider { width: 100%; margin-top: 8px; }
     .cutouts-strip { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 10px; }
     .cutouts-strip img {

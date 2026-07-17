@@ -231,14 +231,32 @@ there's a demonstrated alternative that doesn't risk admitting noise.
    investigating directly in `pyrt`'s own aperture-photometry step
    (`phcat.py`/`dophot3`).
 4. **Image stacking/co-addition** — the only real fix for the
-   MAGLIM-limited cases above. A substantial, separate capability: combine
-   N raw/calibrated epochs into one deeper image before running
-   SExtractor/photometry, rather than (or alongside) per-epoch processing.
-   Reaching ~3 magnitudes deeper (roughly what 151027B/211024B/210410A
-   would need) needs on the order of 10²·⁴≈250 stacked frames for
-   comparable per-exposure noise — not something simply extending the
-   replayed epoch count achieves on its own, since each individual epoch
-   is still evaluated (and gated) independently either way.
+   MAGLIM-limited cases above. Reaching ~3 magnitudes deeper (roughly what
+   151027B/211024B/210410A would need) needs on the order of 10²·⁴≈250
+   stacked frames for comparable per-exposure noise — not something simply
+   extending the replayed epoch count achieves on its own, since each
+   individual epoch is still evaluated (and gated) independently either
+   way. **Not actually a "substantial, separate capability" to build from
+   scratch** — `pyrt-combine` (the `combine-images` tool) already exists
+   and is already used in production: `tests/2026kid/skel.hdr` is itself a
+   real combined-image header from it (`COMBINER=combine-images`,
+   `NCOMBINE=19`). Concrete proposal: once enough same-field, same-filter
+   epochs have accumulated (e.g. 10-20 — far short of the ~250 needed for
+   the full 3-mag MAGLIM gain, but still a real, worthwhile depth
+   improvement over any single exposure), run `pyrt-combine` on them and
+   run transient detection on the **summed image in parallel** with the
+   existing per-epoch detection, not instead of it — a stacked image
+   trades time resolution for depth, so it complements per-epoch detection
+   (which alone can catch fast/moving/single-epoch phenomena a stack would
+   blur together) rather than replacing it. This would also give
+   `template_source="own_epoch"` (see "New detection strategy: image
+   subtraction" above) a meaningfully deeper, lower-noise template option
+   for fields where enough genuinely target-free epochs exist to stack —
+   though note stacking epochs that *all* already contain the target
+   doesn't help remove it (see that section's target-aware
+   `ReferenceFrameSelector` note); it only helps build a deeper *clean*
+   baseline, the same "not enough clean epochs" case that selector already
+   detects and warns about.
 
 **A related, separate discovery**: three GRBs' catalog entries in
 `grb_detection2.txt` turned out to be data errors, not pipeline results —
@@ -305,29 +323,193 @@ unification), not a mechanical follow-up.
 
 ## New detection strategy: image subtraction
 
-Build a `detection/subtraction/` package implementing the same
-`DetectionStrategy` contract (`run(detection_tables, config) -> ...`) as
-`BlindMulticatalogStrategy`, so it's a genuinely swappable alternative, not
-a special case elsewhere in the pipeline:
+**Phase A implemented** (consuming already-differenced epochs; see
+`tests/2026kid/` — a real multi-night HOTPANTS/PS1 campaign for AT2026kid,
+and the subtraction-branch plan). `detection/subtraction/` now has:
 
-- `SubtractionStrategy(DetectionStrategy)` plus the actual differencing,
-  using `detection/reference_frame.py`'s `ReferenceFrameSelector` for
-  template selection.
-- Decide explicitly between two reference-template strategies rather than
-  defaulting to one: **own-epoch template** (pick the best of your own
-  prior epochs — zero external dependency, but needs enough prior epochs to
-  have a clean one) vs. **external-survey template**
-  (`stdpipe.templates.get_ps1_image_and_mask` /
-  `get_ls_image_and_mask` — works on the very first observation of a field,
-  but depends on survey coverage and network access). Worth supporting both
-  behind a config flag rather than picking one permanently.
-- Score via the same `core/scoring.py`, or a subtraction-specific scoring
-  function if the feature set genuinely differs — but still emitting
-  something with `quality_score` populated on the same schema, so
-  `pipeline_magic.py`, the frontend, and any tuning API don't need to know
-  which strategy produced a given candidate. This also finally lets
-  `frontend_generator.py`'s `sn_score`-vs-`quality_score` `elif` collapse
-  into a single `quality_score` read.
+- `SubtractionStrategy(DetectionStrategy)` (`__init__.py`), mirroring
+  `BlindMulticatalogStrategy` exactly: per-epoch candidate building →
+  `clustering.save_epoch_results` (cached to disk) → cross-epoch
+  `clustering.combine_with_lightcurves` (unchanged, reused as-is) →
+  lightcurve plotting. Only the per-epoch candidate *source* differs.
+- `candidates.py`: builds "new"-typed candidates directly from diff-image
+  detections (no cross-catalog matching needed — subtraction already
+  removed constant sources). Real-fixture finding: diff-image `.cat` files
+  carry no calibration meta at all (no `MAGZERO`/`MAGLIM`/`CTRRA`/etc.,
+  `MAG_AUTO` is a raw zp=0 instrumental magnitude) — these get borrowed from
+  the matching science epoch (same night/filter, name without the trailing
+  `h`) via `borrow_science_meta`/`calibrate_diff_magnitudes`, since
+  HOTPANTS's `-n i` normalization keeps the diff image in the same ADU
+  units as the science image.
+- `artifact_filters.py`: morphology/magnitude filters ported from
+  `pipeline_magic_sn.py`, plus a new `reject_dipole_artifacts` (samples the
+  diff FITS pixel data directly for a nearby negative-flux counterpart —
+  the catalog itself never lists negative detections, single-polarity
+  SExtractor).
+- Validated end-to-end against the real 7-night fixture: 3782 raw diff
+  detections → 4 final clustered candidates, with the real target surviving
+  at n_detections=5/7 and ranking #1-2 by quality_score even before the
+  SN-specific post-filters (PM-star/galaxy/TNS, still to be layered in via
+  `pipeline_magic_sn.py`) are applied.
+
+Reference-template strategy (own-epoch via `ReferenceFrameSelector` vs.
+external-survey via `stdpipe.templates`) and the differencing engine itself
+(HOTPANTS vs. PyZOGY) are **Phase B**, not built yet — Phase A works
+entirely from pre-made diff images. `core/scoring.py`'s existing
+`quality_score` schema turned out to need no subtraction-specific changes;
+`reference_catalog` is repurposed to record template provenance instead of
+a matched-catalog name.
+
+### Phase B implemented: template acquisition, differencing, extraction
+
+`detection/subtraction/templates.py`, `differencing.py`, `extraction.py` --
+own-epoch template (via `ReferenceFrameSelector`), PS1 external-survey
+template (`stdpipe.templates`, with a real bug found and fixed — see
+below), HOTPANTS and PyZOGY differencing engines, and SEP-based extraction/
+calibration, all validated against the real `tests/2026kid/` fixture end to
+end: real HOTPANTS and real PyZOGY differencing, real PS1 photometric
+calibration, real target recovered by both engines.
+
+### Phase B wired into `pipeline_magic_sn.py`: raw science images end to end
+
+`config.detection.diff_input_mode`: `"prebuilt"` (Phase A, default -- the
+input is already a diff-image pair) or `"raw"` (Phase B -- the input is a
+raw science epoch, and `_ensure_diff_epochs` builds the
+template/diff/extraction automatically before handing off to the same
+`SubtractionStrategy`). Validated with a real 7-night raw-mode run
+(own-epoch template, HOTPANTS, target position supplied via
+`--target-positions`): real target recovered at 0.90″, mag 16.70, ranked
+#7 of 21 final candidates by `sn_score`.
+
+Two real bugs found and fixed while wiring this up, both concrete
+consequences of running the full pipeline for the first time rather than
+each module in isolation:
+
+- **`FIELD`/`CTRRA`/`CTRDEC`/`MAGLIM` never reached the diff FITS header.**
+  These live only in the science `.ecsv`'s sidecar meta, never in the raw
+  FITS file's own header (verified directly) -- `differencing.py` was
+  copying just the FITS header, so every Phase-B-built diff image silently
+  had `FIELD=0.0`. Concrete, non-hypothetical consequence: a `FIELD=0.0`
+  field size turned into a 0-degree HyperLEDA search radius in Step 7,
+  which for reasons on VizieR's end returned **983,261 galaxies** and hung
+  the whole pipeline for minutes rather than erroring. Fixed:
+  `run_diff`/`run_hotpants_diff`/`run_zogy_diff`/`_write_diff` now take a
+  `science_meta` dict (the science table's own `.meta`) and merge the
+  relevant keys into the diff FITS header before writing.
+- **Same OBSID-fragmentation bug, one level deeper.** `derive_observation_id`
+  only handled being given a *diff* file (looks up its science sibling) --
+  Phase B's raw mode passes the *science* file directly as the input, which
+  `find_science_sibling` doesn't recognize (it isn't named with the
+  trailing `h` a diff file has), so it silently fell through to the
+  generic OBSID-based ID and refragmented every epoch into its own
+  `ObservationStore` directory again. Fixed: `derive_observation_id` now
+  checks the given path's own meta for `OBJECT`/`TARGET` first, before
+  falling back to the science-sibling lookup.
+
+**Also found (documented, not fixed -- needs real-data tuning, not a
+guessed replacement number)**: `apply_morphology_filter`'s
+`max_ellipticity=0.4` default was implicitly tuned against the real
+fixture's external SExtractor-based diff catalogs. Measured directly on
+one real diff image extracted via `extraction.py`'s stdpipe/SEP path: 57%
+of all genuine SEP detections (43/75) had `ELLIPTICITY >= 0.4`, including
+the real AT2026kid target itself (0.594) -- silently dropped by the filter
+as a result. A second, related SEP-specific quirk: `FWHM_IMAGE` comes back
+exactly `0` for a large fraction of marginal diff-image detections (38/75
+on the same image), which pushed the per-epoch median FWHM to 0 and
+silently disabled the `fwhm_ratio` half of the morphology check entirely
+(division guard fell back to a neutral 1.0 for every row). Exposed
+`morphology_max_ellipticity`/`morphology_fwhm_ratio_min`/`_max` as config
+(`DetectionConfig`, wired into both `SubtractionStrategy`'s internal
+per-epoch filtering and `pipeline_magic_sn.py`'s Step 3) so this can be
+tuned without a code change -- confirmed loosening `max_ellipticity` to
+0.65 recovers the real target -- but the right production value needs
+calibrating against more real SEP-extracted data, not one field's worth.
+
+**Important, non-obvious finding**: own-epoch template differencing
+reveals the *change* relative to the reference epoch, not the target's
+absolute brightness — not a bug, but easy to misread as one. Verified
+directly: AT2026kid's own science-image magnitude was 15.652 on 2026-04-25
+and 15.649 on 2026-04-26 (essentially flat, <0.01 mag change) — a genuinely
+slowly-evolving source. Differencing 04-26 against 04-25 as an own-epoch
+template therefore subtracts away nearly all of the target's actual flux
+(since it's nearly identical in both epochs), leaving a much fainter
+residual (HOTPANTS: 18.14 mag; PyZOGY: 17.53 mag) than the true total
+brightness (~15.65, matching the real PS1-template-based fixture). This is
+exactly correct behavior for detecting *new* transients or *sudden*
+changes, but means own-epoch differencing is the wrong choice for
+continued monitoring of an already-known, slowly-evolving source — an
+external, genuinely-quiescent template (PS1/LegacySurvey) is needed there
+to recover meaningful absolute photometry.
+
+**Implemented**: `ReferenceFrameSelector` (`detection/reference_frame.py`)
+and `get_template_own_epoch` now take optional `target_ra`/`target_dec`.
+Previously the selector picked purely on generic image quality
+(seeing/depth/source count/center distance) with no way to know whether
+the target itself already had real flux in a candidate reference epoch —
+confirmed this was a real, not hypothetical, gap: AT2026kid is present at
+essentially constant brightness in *every* one of the 7 real campaign
+epochs, so the selector could pick any of them as "best quality" with no
+warning that the resulting own-epoch template would already contain the
+target. Now: when a target position is given, epoch selection prefers a
+genuinely target-free epoch if one exists (verified: correctly overrides
+even a large seeing advantage on the contaminated epoch), and falls back
+to the best-quality epoch with an explicit warning log (plus a
+`:target-contaminated` suffix on the returned provenance string) when
+every candidate epoch already has the target in it — the AT2026kid case.
+`target_ra`/`target_dec` are optional and default to `None`, which
+reproduces the exact original quality-only selection (verified via a
+dedicated backward-compatibility test) — a caller doing a blind
+first-detection search with no known target position yet is unaffected.
+
+**PS1 template retrieval bug found and fixed**: this project's installed
+`stdpipe` build's `normalize_ps1_skycell` crashes on real PS1 downloads
+(`ValueError: cannot convert float NaN to integer`, inside astropy's own
+compressed-tile decompression of certain BLANK-valued integer skycell
+masks) — the exact same bug the one-off `subtract_supernova.py` reference
+script already found and worked around, by reading the skycell with
+`fitsio` instead of astropy for that one step. Reapplied verbatim in
+`templates.py`'s `_patch_normalize_ps1_skycell` (monkeypatches
+`stdpipe.templates.normalize_ps1_skycell`, only if `fitsio` is
+importable). Confirmed fixed: a real PS1 fetch got past skycell
+normalization after the patch, then correctly reported "missing `swarp`
+binary" (this dev machine doesn't have SWarp installed) rather than
+crashing — full PS1-template reprojection therefore still needs
+validating end-to-end on a host with `swarp` installed.
+
+### Performance: found and fixed a real scaling bottleneck
+
+Profiling the Phase-A validation run (7 epochs, 3782 raw candidates) found
+`clustering.py`'s `combine_results` — shared by both strategies — was
+building a brand-new single-row `Table()` **one column at a time** for
+every surviving cluster (~14,000 `astropy.table.Table.add_column` calls for
+436 candidates in one epoch, 6.5s just for that function). This wasn't
+particular to subtraction, but subtraction's raw per-epoch candidate counts
+(hundreds, no early catalog-cross-match narrowing) hit it much harder than
+blind-multicatalog's typically-smaller per-epoch counts — left alone, this
+would have made subtraction impractical at real survey scale (a full-frame
+image can have thousands of raw diff detections before filtering).
+
+Fixed by collecting per-cluster winning indices and override values in
+plain Python lists, then building the result with one fancy-index select
+plus at most two whole-column overwrites, instead of one Table() per
+cluster. Verified byte-for-byte identical output (same rows, same values in
+every column, including the `candidate_type`/`magnitude_difference`
+override logic) against the pre-fix version on three real epochs. Net
+effect: ~9x faster on `combine_results` alone (6.5s→0.7s for 436
+candidates), ~2.5x faster end-to-end for the 7-epoch validation run
+(22.5s→9.1s).
+
+Remaining cost after the fix is dominated by `combine_with_lightcurves`'s
+own per-component `Table` slicing (inherent to the union-find clustering
+approach, not a clear anti-pattern the way the single-row construction was)
+and `.ecsv` text I/O — both scale linearly with candidate/epoch count in
+this measurement, not superlinearly. Total runtime scaled roughly linearly
+with epoch count throughout (1→7 epochs: ~1.0s→9.1s, no blowup). Not yet
+measured: Phase B's own differencing cost (HOTPANTS/PyZOGY convolution
+scales with image pixel count and kernel size, a genuinely separate cost
+this profiling doesn't cover) — worth benchmarking again once Phase B
+lands, on a realistic full-frame image size rather than the 1024×1024
+fixture.
 
 ## `frontend_generator.py` split
 
