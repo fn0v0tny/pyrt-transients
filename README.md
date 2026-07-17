@@ -12,6 +12,13 @@ Compares sources extracted by pyrt against multi-catalog reference data (Gaia, A
 - **[stdpipe](https://github.com/karpov-sv/stdpipe)** — used for coordinate matching (`stdpipe.astrometry`) and VSX/SkyBoT candidate filtering (`stdpipe.pipeline.filter_transient_candidates`). Pin to a specific commit rather than "latest" — stdpipe is under active development and its API has moved (e.g. `stdpipe.artefacts` didn't exist a few months prior to this being written).
 - Python ≥ 3.10 (stdpipe uses PEP 604 union-type syntax internally; tested on 3.11).
 
+Optional, only needed for the subtraction strategy (see "SN search" below):
+
+- **[HOTPANTS](https://github.com/acbecker/hotpants)** — `subtraction_engine: hotpants` (the default), via `stdpipe.subtraction.run_hotpants`.
+- **[PyZOGY](https://github.com/dguevel/PyZOGY)** — `subtraction_engine: zogy`.
+- **SWarp** — reprojecting an external-survey template (`template_source: ps1`/`legacysurvey`) onto the science WCS, via `stdpipe.templates`. Not needed for `template_source: own_epoch`.
+- **[fitsio](https://github.com/esheldon/fitsio)** — optional; works around a real bug in some `stdpipe` builds' PS1 skycell normalization (`normalize_ps1_skycell` raises on certain BLANK-valued compressed masks). Without it, some PS1 template fetches may fail where they would otherwise succeed.
+
 ---
 
 ## Installation
@@ -92,6 +99,42 @@ So pyrt and pyrt-transient are two independent long-running processes on the sam
 
 ---
 
+## SN search (image subtraction)
+
+`pipeline_magic_sn.py` (entry point: `pyrt-transient-sn-pipeline`) is a second, independent pipeline built around `config.detection.strategy`:
+
+- `blind_multicatalog` (default) — the same catalog cross-match approach as `pipeline_magic.py`, plus an SN-specific post-filter chain: morphology, magnitude plausibility, SkyBoT asteroid rejection, high-proper-motion star rejection, HyperLEDA host-galaxy scoring, TNS cross-match, and a composite `sn_score`.
+- `subtraction` — differencing against a template (`detection/subtraction/`) instead of catalog cross-matching. Constant sources vanish in the difference image, so essentially any significant residual is a genuine candidate — this sidesteps several structural recall limits catalog cross-matching has (significance gates, unanimous-catalog requirements, single-exposure depth). The same SN post-filter chain above still runs on top, strategy-agnostic.
+
+### Subtraction: two ways to feed it
+
+`config.detection.diff_input_mode` controls what `ecsv_file`/`fits_file` are:
+
+- `prebuilt` (default) — they're already a diff-image pair (e.g. produced by an external pipeline). The science sibling is located automatically via a naming convention (`0429rh.fits` ↔ `0429r.fits`) to borrow calibration meta the diff catalog itself doesn't carry.
+- `raw` — they're a raw science epoch. The pipeline builds everything itself: picks a template (`template_source`), differences against it (`subtraction_engine`), detects and calibrates sources on the result (`photometric_catalog`), then feeds that into the same candidate pipeline as `prebuilt` mode.
+
+```yaml
+detection:
+  strategy: subtraction
+  diff_input_mode: raw
+  template_source: own_epoch      # or "ps1" / "legacysurvey"
+  subtraction_engine: hotpants    # or "zogy"
+  photometric_catalog: ps1
+  min_n_detections: 2
+```
+
+```bash
+pyrt-transient-sn-pipeline image.ecsv image.fits \
+  --config=sn_config.yaml --output-dir=/path/to/data/dir \
+  --target-positions=228.988292,56.309083 --generate-frontend
+```
+
+**Template choice matters.** `own_epoch` reuses one of the campaign's own prior epochs (picked by `detection/reference_frame.py`'s `ReferenceFrameSelector`) — no external dependency, but it reveals only the *change* relative to that epoch, not the target's absolute brightness. That's the right tool for a brand-new appearance or a sudden change, and the wrong one for continued monitoring of an already-known, slowly-evolving source (an external, genuinely quiescent template — `ps1`/`legacysurvey` — is needed there for meaningful absolute photometry). Pass `--target-positions` whenever it's known: `ReferenceFrameSelector` uses it to avoid picking a reference epoch that already has the target in it, and warns explicitly when every candidate epoch does. See `FUTURE_IDEAS.md` for the full analysis and the real campaign this was found against.
+
+Both differencing engines write a diff FITS with a `TEMPLATE` header keyword recording which template/provenance was used; `frontend_generator.py` uses this to render a science/template/difference triplet per epoch in the candidate browser (falling back to the single-image view for `blind_multicatalog` candidates, which have no template to show).
+
+---
+
 ## Python API
 
 ```python
@@ -156,6 +199,7 @@ generate_frontend: true
 ```
 pyrt_transient/
 ├── pipeline_magic.py        Entry point: pyrt-transient-pipeline (thin CLI)
+├── pipeline_magic_sn.py     Entry point: pyrt-transient-sn-pipeline (SN search, see above)
 ├── transient_daemon.py      Entry point: pyrt-transient-daemon
 ├── config_trans.py          PipelineConfig, DetectionConfig (dataclasses)
 │
@@ -172,16 +216,24 @@ pyrt_transient/
 │
 ├── detection/               Detection strategies
 │   ├── base.py                 DetectionStrategy ABC
-│   ├── reference_frame.py       ReferenceFrameSelector (multi-image reference-frame selection)
-│   └── blind_multicatalog/      Production strategy: catalog compare -> cluster -> score -> plot
-│       ├── __init__.py            BlindMulticatalogStrategy (the orchestrator)
-│       ├── catalog_query.py       Per-run catalog loading/caching
-│       ├── catalog_match.py       Per-catalog candidate detection
-│       ├── stdpipe_filters.py     VSX (positional) / SkyBoT (per-epoch) rejection filters
-│       ├── clustering.py          Cross-catalog/cross-epoch clustering + lightcurve combination
-│       ├── lightcurve.py          Lightcurve building and stats
-│       ├── trail_detection.py     Motion/trail features for moving-object candidates
-│       └── plotting.py            Lightcurve plots
+│   ├── reference_frame.py       ReferenceFrameSelector (multi-image reference-frame selection,
+│   │                             optionally target-aware -- see "SN search" above)
+│   ├── blind_multicatalog/      Production strategy: catalog compare -> cluster -> score -> plot
+│   │   ├── __init__.py            BlindMulticatalogStrategy (the orchestrator)
+│   │   ├── catalog_query.py       Per-run catalog loading/caching
+│   │   ├── catalog_match.py       Per-catalog candidate detection
+│   │   ├── stdpipe_filters.py     VSX (positional) / SkyBoT (per-epoch) rejection filters
+│   │   ├── clustering.py          Cross-catalog/cross-epoch clustering + lightcurve combination
+│   │   ├── lightcurve.py          Lightcurve building and stats
+│   │   ├── trail_detection.py     Motion/trail features for moving-object candidates
+│   │   └── plotting.py            Lightcurve plots
+│   └── subtraction/              SN-search strategy: difference against a template -> detect -> score
+│       ├── __init__.py            SubtractionStrategy (the orchestrator)
+│       ├── templates.py           Template acquisition: own-epoch / PS1 / LegacySurvey, with cache
+│       ├── differencing.py        HOTPANTS / PyZOGY differencing engines
+│       ├── extraction.py          SEP-based detection + science-image-calibrated photometry
+│       ├── candidates.py          Diff-detection -> Candidate table, science-meta borrowing
+│       └── artifact_filters.py    Morphology/magnitude filters + dipole-artifact rejection
 │
 ├── web/                     Frontend generation
 │   ├── orchestration.py        generate_frontend() entry point
@@ -202,7 +254,8 @@ tools/
 
 tests/
 └── test_*.py                  Unit tests (core/matching, core/radii, core/scoring,
-                                reference_frame, observation_store, site_state)
+                                reference_frame, observation_store, site_state,
+                                detection_subtraction)
 ```
 
 See `FUTURE_IDEAS.md` for known gaps, deferred work, and design decisions still open.

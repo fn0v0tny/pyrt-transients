@@ -46,8 +46,9 @@ dev = [
 
 [project.scripts]
 # Run the detection pipeline directly from the command line
-pyrt-transient-pipeline = "pyrt_transient.pipeline_magic:main"
-pyrt-transient-daemon   = "pyrt_transient.transient_daemon:main"
+pyrt-transient-pipeline    = "pyrt_transient.pipeline_magic:main"
+pyrt-transient-daemon      = "pyrt_transient.transient_daemon:main"
+pyrt-transient-sn-pipeline = "pyrt_transient.pipeline_magic_sn:main"
 
 [project.urls]
 Repository = "https://github.com/fn0v0tny/pyrt-transients"
