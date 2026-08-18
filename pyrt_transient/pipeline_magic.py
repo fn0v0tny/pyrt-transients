@@ -15,6 +15,7 @@ from pyrt_transient.io.logging_setup import setup_pipeline_logging
 from pyrt_transient.io.observation_store import ObservationStore, extract_observation_id
 from pyrt_transient.web.orchestration import generate_frontend
 from pyrt_transient.detection.blind_multicatalog import BlindMulticatalogStrategy
+from pyrt_transient.detection import stacking
 import os
 import warnings
 from pathlib import Path
@@ -207,6 +208,18 @@ def main():
                     height=1.2 * first_det.meta["FIELD"],
                     mlim=20,
                 )
+
+                # Image stacking/co-addition (FUTURE_IDEAS.md): a try-harder
+                # fallback that runs in parallel with, not instead of,
+                # per-epoch detection below -- adds at most one extra table.
+                # maybe_build_stack_table's return value is authoritative
+                # (see its docstring), so any previously-loaded stack table
+                # is dropped and replaced rather than appended to.
+                stack_table = stacking.maybe_build_stack_table(obs_dir, detection_tables, config, logger)
+                detection_tables = [t for t in detection_tables if not t.meta.get("IS_STACK")]
+                if stack_table is not None:
+                    detection_tables.append(stack_table)
+                    store.mark_processed(Path(stack_table.meta["filename"]).name)
 
                 # Run the analysis (Step 1 skips already-processed epochs)
                 strategy = BlindMulticatalogStrategy(data_dir=obs_dir, lightcurve_dir=obs_dir, config=config)

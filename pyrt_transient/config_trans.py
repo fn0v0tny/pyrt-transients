@@ -192,6 +192,37 @@ class DetectionConfig:
     morphology_fwhm_ratio_min: float = 0.5
     morphology_fwhm_ratio_max: float = 2.0
 
+    # Image stacking/co-addition (detection/stacking.py) -- GRB
+    # (blind_multicatalog) pipeline only, see FUTURE_IDEAS.md's "Image
+    # stacking/co-addition". Runs automatically (no separate strategy to
+    # opt into) once enough same-field epochs exist, but only as a
+    # try-harder fallback: skipped entirely once an existing candidate
+    # already scores above stacking_score_threshold, so it doesn't spend
+    # pyrt-combine's runtime on every single run.
+    stacking_enabled: bool = True
+    # FUTURE_IDEAS' proposed range (10-20 epochs) for a worthwhile depth
+    # gain without needing the full ~250 stacked frames a 3-mag gain would
+    # need.
+    stacking_min_epochs: int = 10
+    stacking_max_epochs: int = 20
+    # Don't re-run pyrt-combine on every single new epoch once triggered --
+    # only once this many more real epochs have accumulated since the last
+    # build.
+    stacking_rebuild_interval: int = 5
+    # Skip stacking once an existing candidate already scores at or above
+    # this -- min_quality=0.2 is the bare admission floor; real confirmed
+    # afterglows found via check_baseline.py range roughly 2.7-56.5, so a
+    # candidate already at 1.0 is meaningfully above noise and probably not
+    # worth the extra compute to try to beat. Tunable.
+    stacking_score_threshold: float = 1.0
+    # SEP detection threshold on the stack -- matches
+    # extraction.py's calibrate_science_zeropoint default.
+    stacking_detect_thresh: float = 5.0
+    # pyrt-combine -u: no per-frame photometry file available in this
+    # pipeline's context, so uniform (equal-weight) combination is used
+    # rather than photometric weighting.
+    stacking_uniform_weighting: bool = True
+
 
 @dataclass
 class FrontendConfig:
@@ -332,7 +363,16 @@ class PipelineConfig:
             pipeline_config.detection.morphology_max_ellipticity = det_section.getfloat("morphology_max_ellipticity", pipeline_config.detection.morphology_max_ellipticity)
             pipeline_config.detection.morphology_fwhm_ratio_min = det_section.getfloat("morphology_fwhm_ratio_min", pipeline_config.detection.morphology_fwhm_ratio_min)
             pipeline_config.detection.morphology_fwhm_ratio_max = det_section.getfloat("morphology_fwhm_ratio_max", pipeline_config.detection.morphology_fwhm_ratio_max)
-        
+
+            # Image stacking/co-addition
+            pipeline_config.detection.stacking_enabled = det_section.getboolean("stacking_enabled", pipeline_config.detection.stacking_enabled)
+            pipeline_config.detection.stacking_min_epochs = det_section.getint("stacking_min_epochs", pipeline_config.detection.stacking_min_epochs)
+            pipeline_config.detection.stacking_max_epochs = det_section.getint("stacking_max_epochs", pipeline_config.detection.stacking_max_epochs)
+            pipeline_config.detection.stacking_rebuild_interval = det_section.getint("stacking_rebuild_interval", pipeline_config.detection.stacking_rebuild_interval)
+            pipeline_config.detection.stacking_score_threshold = det_section.getfloat("stacking_score_threshold", pipeline_config.detection.stacking_score_threshold)
+            pipeline_config.detection.stacking_detect_thresh = det_section.getfloat("stacking_detect_thresh", pipeline_config.detection.stacking_detect_thresh)
+            pipeline_config.detection.stacking_uniform_weighting = det_section.getboolean("stacking_uniform_weighting", pipeline_config.detection.stacking_uniform_weighting)
+
         # Update frontend config
         if "frontend" in config:
             fe_section = config["frontend"]
@@ -510,6 +550,13 @@ class PipelineConfig:
             "morphology_max_ellipticity": str(self.detection.morphology_max_ellipticity),
             "morphology_fwhm_ratio_min": str(self.detection.morphology_fwhm_ratio_min),
             "morphology_fwhm_ratio_max": str(self.detection.morphology_fwhm_ratio_max),
+            "stacking_enabled": str(self.detection.stacking_enabled),
+            "stacking_min_epochs": str(self.detection.stacking_min_epochs),
+            "stacking_max_epochs": str(self.detection.stacking_max_epochs),
+            "stacking_rebuild_interval": str(self.detection.stacking_rebuild_interval),
+            "stacking_score_threshold": str(self.detection.stacking_score_threshold),
+            "stacking_detect_thresh": str(self.detection.stacking_detect_thresh),
+            "stacking_uniform_weighting": str(self.detection.stacking_uniform_weighting),
         }
         
         # Frontend section  

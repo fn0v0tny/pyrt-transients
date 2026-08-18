@@ -46,12 +46,85 @@ from astropy.wcs.utils import proj_plane_pixel_scales
 
 logger = logging.getLogger("detection.subtraction.extraction")
 
+_sep_sum_circle_patch_applied = False
+
+
+def _patch_sep_sum_circle_clip_kwargs() -> None:
+    """stdpipe.photometry.get_objects_sep's non-optimal aperture-photometry
+    path (used whenever SEP's newer sum_circle_optimal isn't available/used)
+    unconditionally passes clip_sigma/clip_iters through to the plain
+    sep.sum_circle() -- a call it always makes once, for a background-map
+    debug measurement, regardless of which extraction path was taken.
+    Plain sep.sum_circle() has never accepted those kwargs (only
+    sum_circle_optimal does), so this crashes with `TypeError: sum_circle()
+    got an unexpected keyword argument 'clip_sigma'`.
+
+    Verified directly: not a one-off, hit this on every SEP detection call
+    on a real production host (a live stdpipe checkout, distinct from the
+    version pinned for local development) -- both a 20-epoch stack and an
+    80-epoch one failed identically. No fix possible from our own call
+    site: get_objects_sep exposes no parameter to skip this internal call.
+
+    Same category of unavoidable stdpipe-internals bug templates.py already
+    works around (_patch_normalize_ps1_skycell) -- but the fix here is
+    narrower and safer: wrap sep.sum_circle so that if a call raises
+    exactly this TypeError, it retries once without clip_sigma/clip_iters.
+    That's not a guess at intended behavior -- it's what stdpipe's own
+    comment at this call site says should happen ("falling back to
+    aperture photometry" without the optimal path's clipping). Sep
+    versions that *do* accept these kwargs are entirely unaffected: the
+    first call always succeeds for them, so the except branch never runs.
+    """
+    global _sep_sum_circle_patch_applied
+    if _sep_sum_circle_patch_applied:
+        return
+    try:
+        import sep
+    except ImportError:
+        return
+
+    original_sum_circle = sep.sum_circle
+
+    def _sum_circle_compat(*args, **kwargs):
+        try:
+            return original_sum_circle(*args, **kwargs)
+        except TypeError as e:
+            if "clip_sigma" in str(e) or "clip_iters" in str(e):
+                kwargs.pop("clip_sigma", None)
+                kwargs.pop("clip_iters", None)
+                return original_sum_circle(*args, **kwargs)
+            raise
+
+    sep.sum_circle = _sum_circle_compat
+    _sep_sum_circle_patch_applied = True
+
+
+_patch_sep_sum_circle_clip_kwargs()
+
 
 def _load_image(path):
     with fits.open(Path(path)) as hdul:
         image = np.array(hdul[0].data, dtype=np.float64)
         header = hdul[0].header.copy()
     return image, header
+
+
+def _resolve_fwhm_px(header, default: float = 3.0) -> float:
+    """header['FWHM'] used as the SEP aperture radius -- guarded against a
+    degenerate (<=0 or non-finite) value, not just an absent one.
+
+    Verified directly against a real 2015-era GRB151027B campaign: its
+    original astrometry solution recorded FWHM=0.0 (a real, if degenerate,
+    header value -- present, not missing, so `header.get("FWHM", default)`
+    doesn't fall back on its own). `aper=0.0` isn't merely "use the
+    default" to SEP -- get_objects_sep found 0 sources at aper=0.0 versus
+    117 at aper=3.0 on the exact same image, silently producing "no
+    sources detected for calibration" instead of a usable result.
+    """
+    fwhm_px = float(header.get("FWHM", default))
+    if not np.isfinite(fwhm_px) or fwhm_px <= 0:
+        return default
+    return fwhm_px
 
 
 def calibrate_science_zeropoint(
@@ -82,7 +155,7 @@ def calibrate_science_zeropoint(
         logger.warning(f"{science_fits_path}: could not read image/WCS: {e}")
         return np.nan, np.nan
 
-    fwhm_px = float(header.get("FWHM", 3.0))
+    fwhm_px = _resolve_fwhm_px(header)
     aper_px = aper_px or fwhm_px
     mask = ~np.isfinite(image)
 
@@ -180,7 +253,7 @@ def build_diff_ecsv(
         logger.warning(f"{diff_fits_path}: could not read image/WCS: {e}")
         return None
 
-    fwhm_px = float(header.get("FWHM", 3.0))
+    fwhm_px = _resolve_fwhm_px(header)
     aper_px = aper_px or fwhm_px
     mask = ~np.isfinite(image)
 

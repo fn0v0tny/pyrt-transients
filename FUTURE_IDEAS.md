@@ -153,13 +153,24 @@ Checking each case's `MAG_CALIB / MAGLIM` ratio at the known position
 directly (not just assuming "significance gate" from the symptom) gives a
 much more precise diagnosis than the original pass:
 
-- **GRB151027B, GRB211024B, GRB210410A**: ratio consistently ~1.13-1.35
-  across every epoch — genuinely fainter than this system's own
-  single-exposure depth for these fields. Not fixable by (1)-(3), by more
-  replayed epochs, or by any per-epoch threshold at all. The only real fix
-  is image stacking/co-addition before detection (a substantial, separate
-  pipeline capability — see below) or simply accepting these are below this
-  telescope/exposure combination's single-frame sensitivity.
+- **GRB211024B, GRB210410A**: ratio consistently ~1.13-1.35 across every
+  epoch — genuinely fainter than this system's own single-exposure depth
+  for these fields. Not fixable by (1)-(3) or by any per-epoch threshold
+  at all. **Confirmed still true even with real, meaningfully more epochs
+  and working image stacking** — see "Validated: real production-data
+  stacking/replay pass" below, which is the actual conclusive test of the
+  "or simply accepting these are below this telescope/exposure
+  combination's single-frame sensitivity" possibility raised here
+  originally.
+- **GRB151027B**: same ~1.13-1.35 ratio in the original 18-epoch replay,
+  but **this one turned out to be replay-window-limited, not depth-limited
+  — reclassify alongside GRB220403B below.** Recovered cleanly once run
+  against 76 real epochs (still no stacking needed) — see "Validated: real
+  production-data stacking/replay pass" below for the full result. The
+  original MAGLIM-ratio measurement wasn't wrong, it just couldn't
+  distinguish "genuinely too faint for one exposure" from "too faint for
+  the specific 18 exposures replayed so far" without a real deeper-replay
+  test to compare against.
 - **GRB220403B**: ratio mixed, ~1.07-1.26 — borderline, some epochs pass.
   Consistent with the earlier finding that it *does* get flagged `"new"` in
   2/20 epochs, just never by all three catalogs at once. Primary blocker is
@@ -257,6 +268,98 @@ there's a demonstrated alternative that doesn't risk admitting noise.
    `ReferenceFrameSelector` note); it only helps build a deeper *clean*
    baseline, the same "not enough clean epochs" case that selector already
    detects and warns about.
+
+   **Implemented** (`detection/stacking.py`, wired into `pipeline_magic.py`
+   only — the GRB/`blind_multicatalog` pipeline, not the SN/subtraction
+   one): runs automatically once `stacking_min_epochs` real epochs exist,
+   but only as a try-harder fallback (skipped once an existing candidate
+   already scores at or above `stacking_score_threshold`, so it doesn't
+   spend `pyrt-combine`'s runtime on every single run once something
+   convincing has already been found). Reuses
+   `detection/subtraction/extraction.py::build_diff_ecsv` for the
+   detect+calibrate step (calling it with the stack as both the "diff" and
+   the "science" image — a stack, unlike a subtraction diff, keeps its own
+   real stars, so self-calibration is valid). The stack epoch is just one
+   more table handed to `BlindMulticatalogStrategy.run()`, so it's gated by
+   the existing cross-epoch clustering logic exactly like a real epoch —
+   **deliberately not changed here**.
+
+   **Deferred**: a stack-only candidate (zero independent per-epoch
+   support — exactly the 151027B/211024B/210410A case this feature targets)
+   still needs `min_n_detections=3` distinct epoch-detections to clear
+   `clustering.py`'s admission gate, same as any real epoch. A single deep
+   stack is, on its own, stronger evidence than a single ordinary epoch —
+   the confirmed direction for later is a `min_n_detections` (or an
+   equivalent admission bar) that scales down with stack depth (e.g. a
+   20-image stack needing less independent corroboration than a 6-image
+   one). Not implemented now — every stack today, regardless of
+   `NCOMBINE`, is gated identically to a real epoch.
+
+### Validated: real production-data stacking/replay pass on the three MAGLIM-limited GRBs
+
+Ran the actual shipped `detection/stacking.py` (not a simulation) against
+real, freshly-produced epochs for all three GRBs the MAGLIM-ratio check
+above flagged, using production's own `dophot3`/`phcat` pipeline
+(`~/bin/get_ecsv.py`'s recipe, run without IRAF via `pyrt-phcat -I`) to
+process additional raw frames beyond what the original 18-epoch replay
+used:
+
+- **GRB151027B: recovered, 76 real epochs, no stacking needed.** A
+  pre-existing deeper production backup (`transient_work.bak/obs_17125`,
+  76 real epochs vs. the original replay's 18) already had this — running
+  `BlindMulticatalogStrategy` against the full set found the real afterglow
+  at **2.95″ from its GCN position, quality_score=33.35**. This is exactly
+  the same "more replay, not more per-exposure depth" mechanism already
+  confirmed for GRB220403B above — GRB151027B was never actually
+  depth-limited, just replay-window-limited (see the reclassification in
+  "Re-classified after checking MAGLIM directly" above).
+- **GRB210410A: not recovered, even with 66 real epochs (20→66, 46 newly
+  processed from raw frames) plus a working stack** (`MAGLIM` gain
+  +1.2 to +1.75 mag across runs, `NCOMBINE` 20-62 depending on which
+  filter/exptime-consistent majority group was available that run — see
+  detection/stacking.py's filter/exptime grouping). Baseline replay alone
+  found 9 candidates with more epochs available (vs. 1 at 20 epochs); none
+  within 7′ of the real position.
+- **GRB211024B: not recovered, even with 80 real epochs (20→80) plus a
+  working stack** (`MAGLIM` gain +2.5 to +3.15 mag, `NCOMBINE` up to 80).
+  Baseline replay found 8 candidates, including one at
+  **quality_score=73.35** — by far the highest score seen in this entire
+  validation, exceeding even the confirmed GRB151027B recovery. **This is
+  not the GRB** — checked directly against three independent primary GCN
+  circulars (Swift-BAT #30989, Swift-XRT enhanced #30994, ground-based
+  optical afterglow #30984 — all three mutually consistent to sub-arcsec),
+  the real position is 4.00-5.02′ from every candidate found, over 100x
+  the true ~2″ localization uncertainty. A concrete example that
+  `quality_score` measures consistency/significance, not correct
+  identification — a very high score is not, by itself, evidence a
+  candidate is the actual target; always cross-check against the real GCN
+  position before trusting it.
+
+**Conclusion**: this is the conclusive version of the "or simply accepting
+these are below this telescope/exposure combination's single-frame
+sensitivity" possibility raised in the original MAGLIM-ratio finding.
+GRB210410A and GRB211024B remain genuinely unrecoverable at the depths
+reached here (up to 80 epochs stacked) — consistent with the original
+~250-frame estimate for the full 3-magnitude gain these two would need,
+which is far beyond what either GRB has raw frames available for
+(66 total for 210410A, 175 total for 211024B). GRB151027B, by contrast, was
+never actually a depth problem.
+
+**A real production-environment bug found and fixed along the way**:
+production's live `stdpipe` checkout (`/storage/home/fnovotny/src/stdpipe/`
+on the host that ran this validation) crashed every SEP source-detection
+call with `TypeError: sum_circle() got an unexpected keyword argument
+'clip_sigma'` — `get_objects_sep`'s non-optimal aperture-photometry path
+unconditionally calls the plain `sep.sum_circle()` with kwargs only the
+newer `sum_circle_optimal` accepts. Not reproducible against the pinned
+local dev `stdpipe`; this is a real, independent drift on that specific
+host, exactly the kind of thing this repo's README already warns about
+("stdpipe is under active development... pin to a specific commit").
+Fixed in `detection/subtraction/extraction.py`'s
+`_patch_sep_sum_circle_clip_kwargs()` — a narrow compatibility shim
+(retries `sep.sum_circle` once without the unsupported kwargs if the first
+call raises exactly that `TypeError`), not a stdpipe patch or a
+reimplementation of its extraction logic.
 
 **A related, separate discovery**: three GRBs' catalog entries in
 `grb_detection2.txt` turned out to be data errors, not pipeline results —

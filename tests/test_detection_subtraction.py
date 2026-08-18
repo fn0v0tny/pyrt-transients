@@ -23,6 +23,7 @@ from astropy.table import Table
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from pyrt_transient.detection.subtraction import candidates as sub_candidates
 from pyrt_transient.detection.subtraction import artifact_filters
+from pyrt_transient.detection.subtraction import extraction as sub_extraction
 
 
 def _assert_close(actual, expected, label, tol=1e-9):
@@ -298,6 +299,120 @@ def test_write_diff_without_science_meta_still_works():
         print("test_write_diff_without_science_meta_still_works: PASS")
 
 
+# ---------------------------------------------------------------------------
+# extraction.py: _resolve_fwhm_px -- regression for a real bug found while
+# validating the stacking feature (pyrt_transient/detection/stacking.py)
+# against real GRB151027B data: its original 2015-era astrometry solution
+# recorded FWHM=0.0 (present, not missing), which used to flow straight
+# through into SEP's aper= parameter -- aper=0.0 found 0 sources where
+# aper=3.0 found 117 on the exact same image.
+# ---------------------------------------------------------------------------
+
+def test_resolve_fwhm_px_passes_through_a_sane_value():
+    header = fits.Header({"FWHM": 2.5})
+    _assert_close(sub_extraction._resolve_fwhm_px(header), 2.5, "sane FWHM preserved")
+    print("test_resolve_fwhm_px_passes_through_a_sane_value: PASS")
+
+
+def test_resolve_fwhm_px_falls_back_on_zero():
+    header = fits.Header({"FWHM": 0.0})
+    _assert_close(sub_extraction._resolve_fwhm_px(header, default=3.0), 3.0, "FWHM=0.0 falls back to default")
+    print("test_resolve_fwhm_px_falls_back_on_zero: PASS")
+
+
+def test_resolve_fwhm_px_falls_back_on_negative_and_missing():
+    _assert_close(sub_extraction._resolve_fwhm_px(fits.Header({"FWHM": -1.0}), default=3.0), 3.0,
+                  "negative FWHM falls back to default")
+    _assert_close(sub_extraction._resolve_fwhm_px(fits.Header({}), default=3.0), 3.0,
+                  "missing FWHM falls back to default")
+    print("test_resolve_fwhm_px_falls_back_on_negative_and_missing: PASS")
+
+
+# ---------------------------------------------------------------------------
+# extraction.py: _patch_sep_sum_circle_clip_kwargs -- regression for a real
+# bug found running the stacking feature on a production host: that host's
+# live stdpipe checkout's get_objects_sep always makes one internal
+# background-photometry call via the plain sep.sum_circle(..., clip_sigma=,
+# clip_iters=) -- kwargs that function has never accepted (only the newer
+# sum_circle_optimal does) -- crashing every SEP detection with
+# `TypeError: sum_circle() got an unexpected keyword argument 'clip_sigma'`.
+# No local sep install reproduces this (it's a stdpipe-version-specific
+# bug), so these tests simulate it with a fake sep.sum_circle.
+# ---------------------------------------------------------------------------
+
+def test_patch_sep_sum_circle_retries_without_clip_kwargs_on_typeerror():
+    import sep
+
+    calls = []
+
+    def fake_sum_circle(*args, **kwargs):
+        calls.append(dict(kwargs))
+        if "clip_sigma" in kwargs:
+            raise TypeError("sum_circle() got an unexpected keyword argument 'clip_sigma'")
+        return "OK"
+
+    original = sep.sum_circle
+    sep.sum_circle = fake_sum_circle
+    sub_extraction._sep_sum_circle_patch_applied = False
+    try:
+        sub_extraction._patch_sep_sum_circle_clip_kwargs()
+        result = sep.sum_circle(1, 2, 3, clip_sigma=3.0, clip_iters=1)
+        assert result == "OK"
+        assert len(calls) == 2, "must retry once after the TypeError"
+        assert "clip_sigma" in calls[0] and "clip_iters" in calls[0]
+        assert "clip_sigma" not in calls[1] and "clip_iters" not in calls[1]
+    finally:
+        sep.sum_circle = original
+        sub_extraction._sep_sum_circle_patch_applied = True
+    print("test_patch_sep_sum_circle_retries_without_clip_kwargs_on_typeerror: PASS")
+
+
+def test_patch_sep_sum_circle_noop_when_kwargs_already_supported():
+    import sep
+
+    calls = []
+
+    def fake_sum_circle(*args, **kwargs):
+        calls.append(dict(kwargs))
+        return "OK"  # a sep version that genuinely supports clip_sigma -- never raises
+
+    original = sep.sum_circle
+    sep.sum_circle = fake_sum_circle
+    sub_extraction._sep_sum_circle_patch_applied = False
+    try:
+        sub_extraction._patch_sep_sum_circle_clip_kwargs()
+        result = sep.sum_circle(1, 2, 3, clip_sigma=3.0)
+        assert result == "OK"
+        assert len(calls) == 1, "must not retry when the first call already succeeded"
+        assert "clip_sigma" in calls[0]
+    finally:
+        sep.sum_circle = original
+        sub_extraction._sep_sum_circle_patch_applied = True
+    print("test_patch_sep_sum_circle_noop_when_kwargs_already_supported: PASS")
+
+
+def test_patch_sep_sum_circle_reraises_unrelated_typeerrors():
+    import sep
+
+    def fake_sum_circle(*args, **kwargs):
+        raise TypeError("some unrelated argument problem")
+
+    original = sep.sum_circle
+    sep.sum_circle = fake_sum_circle
+    sub_extraction._sep_sum_circle_patch_applied = False
+    try:
+        sub_extraction._patch_sep_sum_circle_clip_kwargs()
+        try:
+            sep.sum_circle(1, 2, 3)
+            assert False, "expected TypeError to propagate"
+        except TypeError as e:
+            assert "unrelated" in str(e)
+    finally:
+        sep.sum_circle = original
+        sub_extraction._sep_sum_circle_patch_applied = True
+    print("test_patch_sep_sum_circle_reraises_unrelated_typeerrors: PASS")
+
+
 if __name__ == "__main__":
     test_borrow_science_meta_only_fills_missing_keys()
     test_derive_observation_id_from_science_file_directly()
@@ -311,4 +426,10 @@ if __name__ == "__main__":
     test_reject_dipole_artifacts_empty_table_noop()
     test_write_diff_merges_science_meta_into_header()
     test_write_diff_without_science_meta_still_works()
+    test_resolve_fwhm_px_passes_through_a_sane_value()
+    test_resolve_fwhm_px_falls_back_on_zero()
+    test_resolve_fwhm_px_falls_back_on_negative_and_missing()
+    test_patch_sep_sum_circle_retries_without_clip_kwargs_on_typeerror()
+    test_patch_sep_sum_circle_noop_when_kwargs_already_supported()
+    test_patch_sep_sum_circle_reraises_unrelated_typeerrors()
     print("All detection/subtraction/ tests passed.")

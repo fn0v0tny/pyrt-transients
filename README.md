@@ -135,6 +135,25 @@ Both differencing engines write a diff FITS with a `TEMPLATE` header keyword rec
 
 ---
 
+## Image stacking (GRB pipeline)
+
+Some sources are genuinely fainter than any single exposure's own limiting magnitude (`MAGLIM`) — no amount of per-epoch threshold tuning recovers them, only reaching deeper via co-addition does. `pipeline_magic.py` (the GRB/`blind_multicatalog` pipeline) handles this automatically via `detection/stacking.py`: once enough same-field epochs have accumulated and no candidate found so far scores convincingly, it runs `pyrt-combine` (part of the already-required `pyrt` package — no extra install) over the accumulated epochs and feeds the resulting deeper image into the exact same candidate pipeline as one more epoch, run **in parallel with**, not instead of, per-epoch detection.
+
+It's a try-harder fallback, not a replacement strategy: skipped entirely once an existing candidate already scores at or above `stacking_score_threshold`, so it doesn't spend the extra `pyrt-combine` runtime once something convincing has already been found — but once a stack has been built, it stays included in every subsequent run regardless of later scoring, so a stack-anchored candidate doesn't disappear once it's done its job. Only same-filter, same-exposure-time epochs are ever combined together — `pyrt-combine` does not normalize for either.
+
+```yaml
+detection:
+  stacking_enabled: true          # default
+  stacking_min_epochs: 10         # don't attempt a stack before this many real epochs exist
+  stacking_max_epochs: 20         # cap on frames fed to pyrt-combine per stack
+  stacking_rebuild_interval: 5    # re-stack only after this many more real epochs accumulate
+  stacking_score_threshold: 1.0   # skip stacking once an existing candidate scores at least this well
+```
+
+`MAGLIM` for the stack is measured empirically from its own actually-detected sources (checked against the stack's own directly-measured background noise, not the per-source flux-error model `get_objects_sep` uses — that model assumes single-exposure statistics that don't hold once frames have been combined), not derived from a formula or borrowed from any single input epoch.
+
+---
+
 ## Python API
 
 ```python
@@ -218,6 +237,7 @@ pyrt_transient/
 │   ├── base.py                 DetectionStrategy ABC
 │   ├── reference_frame.py       ReferenceFrameSelector (multi-image reference-frame selection,
 │   │                             optionally target-aware -- see "SN search" above)
+│   ├── stacking.py              Image co-addition for the GRB pipeline -- see "Image stacking" above
 │   ├── blind_multicatalog/      Production strategy: catalog compare -> cluster -> score -> plot
 │   │   ├── __init__.py            BlindMulticatalogStrategy (the orchestrator)
 │   │   ├── catalog_query.py       Per-run catalog loading/caching

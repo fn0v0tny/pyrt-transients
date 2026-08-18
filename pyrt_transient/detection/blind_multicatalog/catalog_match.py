@@ -71,6 +71,26 @@ def _add_detection_features(candidates):
         candidates["near_bright"] = (candidates["FLAGS"] & 8) > 0
 
 
+def _empty_candidates_table() -> Table:
+    """Empty placeholder for a catalog that failed or found nothing.
+
+    Must give quality_score/candidate_type/reference_catalog the same
+    dtypes a real, non-empty result would -- `Table()['col'] = []` infers
+    float64 for an empty Python list, but a successful catalog's
+    candidate_type/reference_catalog are real strings. vstack-ing a
+    float64 empty column against a string column raises
+    `TableMergeError: incompatible types` in combine_results -- verified
+    directly against a real field (GRB151027B) where USNO-B genuinely has
+    zero coverage while Gaia succeeds, an entirely ordinary per-field
+    catalog-coverage gap, not a rare corner case.
+    """
+    return Table({
+        "quality_score": np.array([], dtype=float),
+        "candidate_type": np.array([], dtype=str),
+        "reference_catalog": np.array([], dtype=str),
+    })
+
+
 def find_transients_multicatalog(
     catalog_loader,
     config,
@@ -180,22 +200,13 @@ def find_transients_multicatalog(
                 candidates["reference_catalog"] = cat_name
             else:
                 logger.info(f"No candidates found from {cat_name}")
-                # Create empty table with required columns
-                candidates = Table()
-                candidates['quality_score'] = []
-                candidates['candidate_type'] = []
-                candidates["reference_catalog"] = []
+                candidates = _empty_candidates_table()
 
             results[cat_name] = candidates
 
         except Exception as e:
             logger.error(f"Failed to process catalog {cat_name}: {str(e)}")
-            # Create empty table with required columns for failed catalog
-            empty_table = Table()
-            empty_table['quality_score'] = []
-            empty_table['candidate_type'] = []
-            empty_table["reference_catalog"] = []
-            results[cat_name] = empty_table
+            results[cat_name] = _empty_candidates_table()
             continue
 
     # VSX/SkyBoT filtering does NOT happen here -- see stdpipe_filters.py.
