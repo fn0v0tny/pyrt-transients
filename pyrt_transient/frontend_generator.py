@@ -97,6 +97,34 @@ def _try_open_fits(path):
         return None
 
 
+def _read_padded_cutout(section, x, y, half, naxis1, naxis2):
+    """Read a fixed (2*half, 2*half) window centered on (x, y) from a FITS
+    HDU's lazy `.section`, padding with NaN wherever the window falls
+    outside the array bounds.
+
+    Without padding, a candidate near a frame edge (common here since this
+    pipeline's pointing drifts by tens to hundreds of pixels between
+    epochs) gets a smaller raw crop than a candidate near the frame
+    center, which save_cutout_plot then renders at a lower thumbnail
+    resolution and a different effective pixel scale -- making cutouts
+    from the same candidate look inconsistent across epochs for no
+    astrophysical reason. Padding keeps every cutout the same physical
+    extent and resolution; the NaN fill is turned into black background
+    only after normalization (see save_cutout_plot), not before, so it
+    doesn't skew the zscale/percentile stretch computed from real pixels.
+    """
+    size = 2 * half
+    out = np.full((size, size), np.nan, dtype=np.float32)
+    xmin_full, ymin_full = x - half, y - half
+    xmin, xmax = max(0, xmin_full), min(naxis1, x + half)
+    ymin, ymax = max(0, ymin_full), min(naxis2, y + half)
+    if xmax > xmin and ymax > ymin:
+        data = np.array(section[ymin:ymax, xmin:xmax])
+        ox, oy = xmin - xmin_full, ymin - ymin_full
+        out[oy:oy + data.shape[0], ox:ox + data.shape[1]] = data
+    return out, xmin_full, ymin_full
+
+
 class FrontendGenerator:
     """Integrated frontend generator that uses templates and creates complete websites."""
     
@@ -658,12 +686,6 @@ class FrontendGenerator:
 
                             date_str = self.extract_date_from_filename(fits_file.name)
 
-                            # Create cutout bounds
-                            ymin = max(0, y - self.cutout_size)
-                            ymax = min(naxis2, y + self.cutout_size)
-                            xmin = max(0, x - self.cutout_size)
-                            xmax = min(naxis1, x + self.cutout_size)
-
                             if is_diff_epoch:
                                 # Subtraction epoch: science/template share the
                                 # diff image's pixel grid (HOTPANTS/ZOGY run on
@@ -674,8 +696,9 @@ class FrontendGenerator:
                                 diff_fn = f"{candidate_id}_{fits_file.stem}_diff.{image_format}"
                                 diff_out = self.output_dir / "cutouts" / diff_fn
                                 if not diff_out.exists():
-                                    diff_cutout = np.array(hdul[0].section[ymin:ymax, xmin:xmax])
-                                    self.save_cutout_plot(diff_cutout, x, y, xmin, ymin, diff_out, candidate_id)
+                                    diff_cutout, xmin_full, ymin_full = _read_padded_cutout(
+                                        hdul[0].section, x, y, self.cutout_size, naxis1, naxis2)
+                                    self.save_cutout_plot(diff_cutout, x, y, xmin_full, ymin_full, diff_out, candidate_id)
                                 entry["diff_path"] = f"./cutouts/{diff_fn}"
 
                                 if sci_hdul is not None:
@@ -683,8 +706,9 @@ class FrontendGenerator:
                                     sci_out = self.output_dir / "cutouts" / sci_fn
                                     try:
                                         if not sci_out.exists():
-                                            sci_cutout = np.array(sci_hdul[0].section[ymin:ymax, xmin:xmax])
-                                            self.save_cutout_plot(sci_cutout, x, y, xmin, ymin, sci_out, candidate_id)
+                                            sci_cutout, xmin_full, ymin_full = _read_padded_cutout(
+                                                sci_hdul[0].section, x, y, self.cutout_size, naxis1, naxis2)
+                                            self.save_cutout_plot(sci_cutout, x, y, xmin_full, ymin_full, sci_out, candidate_id)
                                         entry["sci_path"] = f"./cutouts/{sci_fn}"
                                     except Exception as e:
                                         logger.debug(f"Science stamp failed for {candidate_id}/"
@@ -695,8 +719,9 @@ class FrontendGenerator:
                                     ref_out = self.output_dir / "cutouts" / ref_fn
                                     try:
                                         if not ref_out.exists():
-                                            ref_cutout = np.array(ref_hdul[0].section[ymin:ymax, xmin:xmax])
-                                            self.save_cutout_plot(ref_cutout, x, y, xmin, ymin, ref_out, candidate_id)
+                                            ref_cutout, xmin_full, ymin_full = _read_padded_cutout(
+                                                ref_hdul[0].section, x, y, self.cutout_size, naxis1, naxis2)
+                                            self.save_cutout_plot(ref_cutout, x, y, xmin_full, ymin_full, ref_out, candidate_id)
                                         entry["ref_path"] = f"./cutouts/{ref_fn}"
                                     except Exception as e:
                                         logger.debug(f"Template stamp failed for {candidate_id}/"
@@ -718,11 +743,14 @@ class FrontendGenerator:
                                 })
                                 continue
 
-                            # Read only the cutout region (lazy — works on truncated files)
-                            cutout = np.array(hdul[0].section[ymin:ymax, xmin:xmax])
+                            # Read only the cutout region (lazy — works on truncated files),
+                            # padded to a fixed size so edge-of-frame candidates don't end up
+                            # with a smaller crop (and thus a lower-res thumbnail) than others.
+                            cutout, xmin_full, ymin_full = _read_padded_cutout(
+                                hdul[0].section, x, y, self.cutout_size, naxis1, naxis2)
 
                             # Save cutout with crosshairs
-                            self.save_cutout_plot(cutout, x, y, xmin, ymin, output_path, candidate_id)
+                            self.save_cutout_plot(cutout, x, y, xmin_full, ymin_full, output_path, candidate_id)
 
                             candidates_data[candidate_id]['cutouts'].append({
                                 "path": f"./cutouts/{output_filename}",
@@ -1098,7 +1126,12 @@ class FrontendGenerator:
             
             # Apply normalization with enhanced contrast
             normalized = np.clip((cutout - vmin) / (vmax - vmin), 0, 1)
-            
+
+            # Cutouts padded by _read_padded_cutout carry NaN outside the frame
+            # (e.g. a candidate near the array edge); render that as black rather
+            # than propagating NaN into the uint8 cast below.
+            normalized = np.nan_to_num(normalized, nan=0.0)
+
             # Optional contrast enhancement for faint sources
             if hasattr(self.config, 'enhance_contrast') and self.config.enhance_contrast:
                 # Apply gamma correction for better visibility
@@ -1112,6 +1145,7 @@ class FrontendGenerator:
             if len(finite_data) > 0:
                 vmin, vmax = np.percentile(finite_data, [5, 95])
                 normalized = np.clip((cutout - vmin) / (vmax - vmin), 0, 1)
+                normalized = np.nan_to_num(normalized, nan=0.0)
             else:
                 normalized = np.zeros_like(cutout)
         
