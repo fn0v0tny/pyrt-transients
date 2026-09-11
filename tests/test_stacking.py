@@ -53,6 +53,28 @@ echo "simulated pyrt-combine failure" >&2
 exit 3
 """
 
+# Mirrors the real pyrt-combine CLI's "critical safety check": refuses (exit
+# 2, no output written) if -o's target already exists, with no way to force
+# it. combine_epochs must route around this on rebuilds -- see its docstring.
+_FAKE_COMBINE_REFUSES_EXISTING_OUTPUT_SCRIPT = """#!/bin/sh
+out=""
+prev=""
+for arg in "$@"; do
+    if [ "$prev" = "-o" ]; then
+        out="$arg"
+    fi
+    prev="$arg"
+done
+if [ -n "$out" ] && [ -e "$out" ]; then
+    echo "Output file $out already exists" >&2
+    exit 2
+fi
+if [ -n "$out" ]; then
+    printf 'FAKEFITS' > "$out"
+fi
+exit 0
+"""
+
 
 def _write_stub_binary(dir_path: Path, script: str) -> Path:
     path = dir_path / "pyrt-combine"
@@ -246,6 +268,47 @@ def test_combine_epochs_returns_none_on_nonzero_exit():
         print("test_combine_epochs_returns_none_on_nonzero_exit: PASS")
 
 
+def test_combine_epochs_succeeds_when_output_already_exists():
+    """Regression test: a rebuild targets the same fixed stack.fits every
+    time (see _attempt_rebuild), but pyrt-combine refuses to write to a
+    path that already exists. Before the fix, this made every rebuild after
+    the first fail silently and the stack would never actually update.
+    """
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        _write_stub_binary(d, _FAKE_COMBINE_REFUSES_EXISTING_OUTPUT_SCRIPT)
+        restore = _set_path([d])
+        try:
+            out_path = d / "stack.fits"
+            out_path.write_text("STALE PREVIOUS STACK")
+            result = stacking.combine_epochs([Path("a.fits"), Path("b.fits")], out_path)
+        finally:
+            restore()
+        assert result == out_path
+        assert out_path.read_text() == "FAKEFITS"
+        assert not (d / "stack.tmp.fits").exists()
+        assert not (d / "stack.fits.tmp").exists()
+        print("test_combine_epochs_succeeds_when_output_already_exists: PASS")
+
+
+def test_combine_epochs_leaves_previous_stack_in_place_on_failure():
+    with tempfile.TemporaryDirectory() as d:
+        d = Path(d)
+        _write_stub_binary(d, _FAKE_COMBINE_FAILING_SCRIPT)
+        restore = _set_path([d])
+        try:
+            out_path = d / "stack.fits"
+            out_path.write_text("STALE PREVIOUS STACK")
+            result = stacking.combine_epochs([Path("a.fits"), Path("b.fits")], out_path)
+        finally:
+            restore()
+        assert result is None
+        assert out_path.read_text() == "STALE PREVIOUS STACK"
+        assert not (d / "stack.tmp.fits").exists()
+        assert not (d / "stack.fits.tmp").exists()
+        print("test_combine_epochs_leaves_previous_stack_in_place_on_failure: PASS")
+
+
 def test_combine_epochs_requires_at_least_two_inputs():
     with tempfile.TemporaryDirectory() as d:
         d = Path(d)
@@ -417,7 +480,7 @@ def _fake_combine(fits_paths, output_path, uniform=True):
 
 
 def _fake_build_stack_ecsv(stack_fits_path, output_path=None, photometric_catalog="ps1",
-                            detect_thresh=5.0, n_combined=None):
+                            detect_thresh=5.0, n_combined=None, input_files=None):
     t = Table({"MAG_CALIB": [17.0]})
     t.meta["IS_STACK"] = True
     t.meta["NCOMBINE"] = n_combined
@@ -436,6 +499,55 @@ def _patch_build_fns(fake_combine=None, fake_build_ecsv=None):
         stacking.build_stack_ecsv = orig_build
 
     return restore
+
+
+def test_attempt_rebuild_keeps_old_stack_pair_when_ecsv_build_fails():
+    """Regression: a rebuild whose pyrt-combine succeeds but whose catalogue
+    build fails must leave the previous stack.fits + stack.ecsv *pair*
+    untouched, not a new image paired with the old catalogue."""
+    def failing_build_ecsv(stack_fits_path, output_path=None, **kwargs):
+        return None
+
+    restore = _patch_build_fns(fake_combine=_fake_combine, fake_build_ecsv=failing_build_ecsv)
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            obs_dir = Path(d)
+            (obs_dir / "stack.fits").write_bytes(b"OLDFITS")
+            old = Table({"MAG_CALIB": [17.0]})
+            old.meta.update({"IS_STACK": True, "NCOMBINE": 5})
+            old.write(str(obs_dir / "stack.ecsv"), format="ascii.ecsv")
+            cfg = _make_config(stacking_enabled=True, stacking_min_epochs=1,
+                                stacking_rebuild_interval=1, stacking_score_threshold=1e9)
+            tables = [_make_detection_table(i, obs_dir) for i in range(8)]
+            stacking._attempt_rebuild(obs_dir, tables, cfg.detection, len(tables), _LOG)
+
+            assert (obs_dir / "stack.fits").read_bytes() == b"OLDFITS"
+            assert Table.read(str(obs_dir / "stack.ecsv"), format="ascii.ecsv").meta["NCOMBINE"] == 5
+            assert not (obs_dir / "stack.new.fits").exists()
+            assert not (obs_dir / "stack.new.ecsv").exists()
+            assert not (obs_dir / "stack_state.json").exists()
+    finally:
+        restore()
+    print("test_attempt_rebuild_keeps_old_stack_pair_when_ecsv_build_fails: PASS")
+
+
+def test_attempt_rebuild_installs_fits_and_ecsv_together():
+    restore = _patch_build_fns(fake_combine=_fake_combine, fake_build_ecsv=_fake_build_stack_ecsv)
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            obs_dir = Path(d)
+            (obs_dir / "stack.fits").write_bytes(b"OLDFITS")
+            cfg = _make_config(stacking_enabled=True, stacking_min_epochs=1,
+                                stacking_rebuild_interval=1)
+            tables = [_make_detection_table(i, obs_dir) for i in range(8)]
+            stacking._attempt_rebuild(obs_dir, tables, cfg.detection, len(tables), _LOG)
+
+            assert (obs_dir / "stack.fits").read_bytes() == b"FAKEFITS"
+            assert Table.read(str(obs_dir / "stack.ecsv"), format="ascii.ecsv").meta["NCOMBINE"] == 8
+            assert not list(obs_dir.glob("stack.new.*"))
+    finally:
+        restore()
+    print("test_attempt_rebuild_installs_fits_and_ecsv_together: PASS")
 
 
 def test_maybe_build_stack_table_below_min_epochs_returns_none():
@@ -618,6 +730,8 @@ if __name__ == "__main__":
     test_combine_epochs_returns_none_when_binary_missing()
     test_combine_epochs_success_with_stub_binary()
     test_combine_epochs_returns_none_on_nonzero_exit()
+    test_combine_epochs_succeeds_when_output_already_exists()
+    test_combine_epochs_leaves_previous_stack_in_place_on_failure()
     test_combine_epochs_requires_at_least_two_inputs()
     test_build_stack_ecsv_delegates_with_stack_as_both_diff_and_science()
     test_build_stack_ecsv_returns_none_when_calibration_fails()

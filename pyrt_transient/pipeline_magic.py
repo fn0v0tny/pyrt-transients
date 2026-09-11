@@ -7,15 +7,16 @@ import time
 import logging
 import yaml
 from pyrt_transient.catalog import QueryParams, setup_catalog_cache
-from pyrt_transient.transients import *
+from pyrt_transient.io.ecsv import open_ecsv_file
 from pyrt_transient.extraction_manager import ImageExtractionManager
 from pyrt_transient.config_trans import PipelineConfig
 from pyrt_transient.core.config_loader import load_config_with_yaml_support
 from pyrt_transient.io.logging_setup import setup_pipeline_logging
-from pyrt_transient.io.observation_store import ObservationStore, extract_observation_id
+from pyrt_transient.io.observation_store import ObservationStore, resolve_observation_id
 from pyrt_transient.web.orchestration import generate_frontend
 from pyrt_transient.detection.blind_multicatalog import BlindMulticatalogStrategy
 from pyrt_transient.detection import stacking
+from pyrt_transient.followup import enrichment
 import os
 import warnings
 from pathlib import Path
@@ -77,14 +78,20 @@ def main():
     if debug_flag:
         config.logging.level = "DEBUG"
     
-    # Extract observation ID first (needed for logging setup)
-    observation_id = extract_observation_id(ecsv_file)
+    # Extract observation ID first (needed for logging setup); with
+    # observation_grouping_radius_arcmin set, an epoch pointing at a field
+    # that already has an observation directory joins it.
+    observation_id, id_reason = resolve_observation_id(
+        ecsv_file, config.base_data_dir,
+        radius_arcmin=config.observation_grouping_radius_arcmin,
+        max_gap_hours=config.observation_grouping_max_gap_hours,
+    )
 
     # Setup comprehensive logging
     logger = setup_pipeline_logging(config, observation_id)
     logger.info(f"=== Transient Pipeline Started ===")
     logger.info(f"Processing files: {Path(ecsv_file).name}, {Path(fits_file).name}")
-    logger.info(f"Observation ID: {observation_id}")
+    logger.info(f"Observation ID: {observation_id} ({id_reason})")
     logger.info(f"Log files will be at: {Path(config.base_data_dir) / 'logs'}")
     
     # Setup catalog cache in the user's home directory so it persists across
@@ -109,8 +116,11 @@ def main():
     ecsv_basename = Path(ecsv_file).name
     fits_basename = Path(fits_file).name
 
-    already_processed = store.already_processed(ecsv_basename)
-    logger.info(f"File {ecsv_basename} already processed: {already_processed}")
+    # Keyed on the analysis having finished, not on the epoch merely being
+    # registered: an epoch registered but not yet analysed must not take the
+    # "results should already exist" shortcut.
+    already_processed = store.already_analyzed(ecsv_basename)
+    logger.info(f"File {ecsv_basename} already analyzed: {already_processed}")
     
     if already_processed:
         logger.info(f"File {ecsv_basename} already processed for observation {observation_id}")
@@ -157,11 +167,26 @@ def main():
 
     # Process new ECSV file
     new_detection_added = False
+    new_detection = None
     try:
         new_detection = open_ecsv_file(str(ecsv_dest), verbose=True)
         if new_detection is not None and new_detection.meta is not None:
             detection_tables.append(new_detection)
+            # Registered now, analysed later. Registration is what makes the
+            # file visible to load_existing_tables, and it has to happen
+            # before the analysis: a run that died mid-analysis used to leave
+            # its ECSV sitting in obs_dir unregistered, and since the daemon
+            # deletes the job directory and never re-offers a failed file,
+            # that epoch was silently lost from the observation forever.
+            # store.mark_analyzed below is what gates the "skip, results
+            # exist" shortcut, so a failed run still re-analyses.
             store.mark_processed(ecsv_basename)
+            # Publish the pointing as soon as the epoch is registered, not
+            # only after a successful analysis: resolve_observation_id reads
+            # these files to group OBSIDs of one field, and a store that has
+            # not written one yet is invisible to a concurrently arriving
+            # sibling OBSID.
+            store.record_pointing(new_detection.meta)
             new_detection_added = True
             logger.info(f"Added new detection table: {ecsv_basename}")
         else:
@@ -196,6 +221,13 @@ def main():
             logger.info(f"Detection tables after lock acquired: {len(detection_tables)}")
 
             try:
+                # Drop any previously-loaded stack table *before* anything
+                # reads detection_tables[0]: a stack ECSV carries FIELD=0.0
+                # (pyrt-combine writes no FIELD), and if it sorted first the
+                # catalog query box below collapsed to zero width.
+                # maybe_build_stack_table's return value re-adds the
+                # authoritative stack afterwards (see its docstring).
+                detection_tables = [t for t in detection_tables if not t.meta.get("IS_STACK")]
                 first_det = detection_tables[0]
 
                 # Field center / query params
@@ -216,7 +248,6 @@ def main():
                 # (see its docstring), so any previously-loaded stack table
                 # is dropped and replaced rather than appended to.
                 stack_table = stacking.maybe_build_stack_table(obs_dir, detection_tables, config, logger)
-                detection_tables = [t for t in detection_tables if not t.meta.get("IS_STACK")]
                 if stack_table is not None:
                     detection_tables.append(stack_table)
                     store.mark_processed(Path(stack_table.meta["filename"]).name)
@@ -235,7 +266,20 @@ def main():
                 if len(reliable_candidates) > 0:
                     logger.info(reliable_candidates)
 
+                # Follow-up exposure recommendation: enrichment on the
+                # strategy's output (FUTURE_IDEAS.md, "Telescope strategy
+                # suggester"), not part of detection. Runs before
+                # save_results so followup_exptime_s lands in candidates.tbl;
+                # run_enrichment never raises, so it can't take the
+                # detection results down with it.
+                if config.followup.exposure_enabled:
+                    enrichment.run_enrichment(
+                        reliable_candidates, lightcurves, detection_tables, obs_dir,
+                        config=config, logger=logger,
+                    )
+
                 store.save_results(reliable_candidates, lightcurves)
+                store.mark_analyzed(ecsv_basename)
                 logger.info(f"Analysis completed successfully")
 
             except Exception as e:

@@ -33,13 +33,14 @@ import yaml
 from shutil import copy as shcopy
 
 from pyrt_transient.catalog import QueryParams, setup_catalog_cache
-from pyrt_transient.transients import open_ecsv_file
+from pyrt_transient.io.ecsv import open_ecsv_file
 from pyrt_transient.config_trans import PipelineConfig
 from pyrt_transient.core.config_loader import load_config_with_yaml_support
 from pyrt_transient.io.logging_setup import setup_pipeline_logging
 from pyrt_transient.io.observation_store import ObservationStore, extract_observation_id
 from pyrt_transient.web.orchestration import generate_frontend
 from pyrt_transient.detection.blind_multicatalog import BlindMulticatalogStrategy
+from pyrt_transient.detection.blind_multicatalog.clustering import detections_time
 from pyrt_transient.detection.subtraction import SubtractionStrategy
 from pyrt_transient.detection.subtraction.candidates import (
     load_diff_table, find_science_sibling, derive_observation_id,
@@ -998,9 +999,25 @@ def run_sn_pipeline(ecsv_file, fits_file, obs_dir, config, logger, tns_api_key=N
     # Step 5 — Asteroid rejection via IMCCE SkyBot
     # =========================================================================
     logger.info("--- Step 5: SkyBot asteroid rejection ---")
-    candidates, n_sso = reject_known_asteroids(
-        candidates, obs_jd, ra, dec, field_deg, logger
+    # The per-epoch pass (at each epoch's own observation time, inside
+    # clustering.combine_results) is the better one: repeating it here queries
+    # SkyBoT a second time against a single "reference" epoch's JD, wrong by
+    # up to arcminutes for the other nights of a multi-night campaign. But it
+    # only exists in the blind_multicatalog strategy, and only for epochs that
+    # carry a usable observation time -- the subtraction strategy never queries
+    # SkyBoT at all, so skipping unconditionally left asteroids in the list.
+    per_epoch_skybot = (
+        strategy_name != "subtraction"
+        and config.detection.vsx_filter_enabled
+        and all(detections_time(t) is not None for t in detection_tables)
     )
+    if per_epoch_skybot:
+        n_sso = 0
+        logger.info("  SkyBot: already applied per epoch during clustering, skipping")
+    else:
+        candidates, n_sso = reject_known_asteroids(
+            candidates, obs_jd, ra, dec, field_deg, logger
+        )
     logger.info(f"After SkyBot: {len(candidates)} candidates ({n_sso} SSOs removed)")
 
     if len(candidates) == 0:

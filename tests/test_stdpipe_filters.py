@@ -47,7 +47,7 @@ def test_apply_skybot_filter_survives_keyerror_from_empty_skybot_result(monkeypa
     original = stdpipe_filters.stdpipe_pipeline.filter_transient_candidates
     stdpipe_filters.stdpipe_pipeline.filter_transient_candidates = _raise_keyerror
     try:
-        result, n_removed = stdpipe_filters.apply_skybot_filter(
+        result, n_removed, ok = stdpipe_filters.apply_skybot_filter(
             candidates, time=Time("2021-04-10T23:00:00"),
         )
     finally:
@@ -55,6 +55,7 @@ def test_apply_skybot_filter_survives_keyerror_from_empty_skybot_result(monkeypa
 
     assert len(result) == len(candidates), "candidates must pass through unfiltered, not be dropped"
     assert n_removed == 0
+    assert ok, "an empty SkyBoT answer is a completed cross-match, not a failure"
     print("test_apply_skybot_filter_survives_keyerror_from_empty_skybot_result: PASS")
 
 
@@ -71,7 +72,7 @@ def test_apply_skybot_filter_still_removes_real_matches():
     original = stdpipe_filters.stdpipe_pipeline.filter_transient_candidates
     stdpipe_filters.stdpipe_pipeline.filter_transient_candidates = _fake_filter
     try:
-        result, n_removed = stdpipe_filters.apply_skybot_filter(
+        result, n_removed, ok = stdpipe_filters.apply_skybot_filter(
             candidates, time=Time("2021-04-10T23:00:00"),
         )
     finally:
@@ -79,15 +80,17 @@ def test_apply_skybot_filter_still_removes_real_matches():
 
     assert n_removed == 1
     assert len(result) == 2
+    assert ok
     print("test_apply_skybot_filter_still_removes_real_matches: PASS")
 
 
 def test_apply_skybot_filter_noop_on_empty_or_no_time():
     candidates = _candidates_table()
-    result, n_removed = stdpipe_filters.apply_skybot_filter(candidates[:0], time=Time("2021-04-10T23:00:00"))
-    assert len(result) == 0 and n_removed == 0
-    result, n_removed = stdpipe_filters.apply_skybot_filter(candidates, time=None)
+    result, n_removed, ok = stdpipe_filters.apply_skybot_filter(candidates[:0], time=Time("2021-04-10T23:00:00"))
+    assert len(result) == 0 and n_removed == 0 and ok
+    result, n_removed, ok = stdpipe_filters.apply_skybot_filter(candidates, time=None)
     assert len(result) == len(candidates) and n_removed == 0
+    assert not ok, "no observation time means the cross-match never ran"
     print("test_apply_skybot_filter_noop_on_empty_or_no_time: PASS")
 
 
@@ -96,3 +99,21 @@ if __name__ == "__main__":
     test_apply_skybot_filter_still_removes_real_matches()
     test_apply_skybot_filter_noop_on_empty_or_no_time()
     print("All stdpipe_filters.py tests passed.")
+
+
+
+def test_skybot_service_failure_degrades_to_no_rejection(monkeypatch):
+    """A SkyBoT outage (astroquery ValueError 'No table found', HTTP errors)
+    must not propagate out of apply_skybot_filter."""
+    from astropy.table import Table
+    from astropy.time import Time
+    from pyrt_transient.detection.blind_multicatalog import stdpipe_filters
+    def boom(*a, **k):
+        raise ValueError("No table found")
+    monkeypatch.setattr(stdpipe_filters.stdpipe_pipeline, "filter_transient_candidates", boom)
+    cands = Table({"ALPHA_J2000": [10.0], "DELTA_J2000": [20.0], "FLAGS": [0],
+                   "MAGERR_CALIB": [0.02], "FWHM_IMAGE": [3.0]})
+    out, n, ok = stdpipe_filters.apply_skybot_filter(cands, time=Time("2021-06-20T00:00:00"))
+    assert len(out) == 1 and n == 0
+    assert not ok, ("an outage must be distinguishable from 'nothing to reject' -- "
+                    "the epoch is cached on this flag")

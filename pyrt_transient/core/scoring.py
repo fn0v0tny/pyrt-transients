@@ -27,6 +27,7 @@ lc_shape_weight) -- normally `config.detection` itself.
 import math
 from typing import Any, Dict, Optional, Tuple
 
+import numpy as np
 from astropy.table import Table
 
 
@@ -84,14 +85,25 @@ def compute_lightcurve_score_factor(features: Dict[str, Any], weights) -> float:
     MAGLIM context -- see clustering.py's combine_with_lightcurves).
     """
     lightcurve_boost = 1.0
+    variability_factor = 1.0
     if "weighted_mean_mag" in features and "mag_range" in features:
         brightness_factor = math.exp(-(features["weighted_mean_mag"] - 15.0) / 3.0)
         variability_factor = min(features["mag_range"] / 0.5, 3.0)  # capped at 3x boost
-        lightcurve_boost = brightness_factor * variability_factor * weights.lc_shape_weight
+        lightcurve_boost = brightness_factor * weights.lc_shape_weight
 
     mag_range_factor = 1.0
     if "mag_range" in features:
         mag_range_factor = features["mag_range"]
+
+    # The two magnitude-range factors together. For a "new" (uncatalogued)
+    # source with new_source_variability_floor set, they can boost but never
+    # penalise: constancy is not evidence against a new source, only against
+    # a catalogued star having changed. Default (False) reproduces the
+    # historical product exactly.
+    variability = variability_factor * mag_range_factor
+    if (getattr(weights, "new_source_variability_floor", False)
+            and features.get("candidate_type") == "new"):
+        variability = max(variability, 1.0)
 
     # Consistency across epochs: a candidate confirmed by many independent
     # detections is much more likely to be real than one just barely past
@@ -109,7 +121,7 @@ def compute_lightcurve_score_factor(features: Dict[str, Any], weights) -> float:
         reference_n = max(getattr(weights, "min_n_detections", 1), 1)
         n_epochs_factor = math.sqrt(max(features["n_detections"], 1) / reference_n)
 
-    return lightcurve_boost * mag_range_factor * n_epochs_factor
+    return lightcurve_boost * variability * n_epochs_factor
 
 
 def compute_quality_score(features: Dict[str, Any], weights) -> float:
@@ -127,22 +139,42 @@ def compute_quality_score(features: Dict[str, Any], weights) -> float:
 def _row_features(row, maglim: Optional[float], mag_calib_is_fallback: bool) -> Dict[str, Any]:
     """Build a features dict from one candidate table row."""
     features: Dict[str, Any] = {}
+    # A masked or non-finite cell (e.g. a light curve whose photometry could
+    # not be calibrated) is treated as "column absent": that stage
+    # contributes a neutral factor instead of a masked/NaN score that
+    # later breaks the final quality gate.
     for col in ("fwhm_ratio", "axis_ratio", "snr_auto", "FLAGS", "nearest_source_dist",
-                "MAG_CALIB", "candidate_type"):
+                "MAG_CALIB"):
         if col in row.colnames:
-            features[col] = row[col]
+            value = _finite_or_none(row[col])
+            if value is not None:
+                features[col] = value
+    if "candidate_type" in row.colnames and not np.ma.is_masked(row["candidate_type"]):
+        features["candidate_type"] = row["candidate_type"]
     if "MAG_CALIB" in features:
         features["MAGLIM"] = maglim
         features["mag_calib_is_fallback"] = mag_calib_is_fallback
     # Column names on the candidate table differ from compute_quality_score's
     # feature-dict keys for the lightcurve stage.
-    if "mag_weighted_mean" in row.colnames:
-        features["weighted_mean_mag"] = row["mag_weighted_mean"]
-    if "mag_range" in row.colnames:
-        features["mag_range"] = row["mag_range"]
-    if "n_detections" in row.colnames:
-        features["n_detections"] = row["n_detections"]
+    for col, key in (("mag_weighted_mean", "weighted_mean_mag"), ("mag_range", "mag_range"),
+                     ("n_detections", "n_detections")):
+        if col in row.colnames:
+            value = _finite_or_none(row[col])
+            if value is not None:
+                features[key] = value
     return features
+
+
+def _finite_or_none(value):
+    if np.ma.is_masked(value):
+        return None
+    try:
+        as_float = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(as_float):
+        return None
+    return value
 
 
 def _table_maglim_and_fallback(meta) -> Tuple[Optional[float], bool]:
@@ -188,3 +220,26 @@ def apply_lightcurve_score_factor(candidate: Table, weights) -> None:
 
 def _clip(value, lo, hi):
     return min(max(value, lo), hi)
+
+
+def score_probability(quality_score, intercept: float, slope: float):
+    """Calibrated probability that a candidate with this final quality_score
+    is a real transient: sigmoid(intercept + slope * ln q). See
+    DetectionConfig.score_probability_intercept for where the constants
+    come from and which catalogue set they belong to."""
+    q = np.ma.filled(np.ma.asarray(quality_score, dtype=float), np.nan)
+    with np.errstate(divide="ignore", invalid="ignore"):
+        x = intercept + slope * np.log(np.clip(q, 1e-9, None))
+        p = 1.0 / (1.0 + np.exp(-np.clip(x, -50, 50)))
+    return np.where(np.isfinite(q) & (q > 0), p, np.nan)
+
+
+def add_score_probability(candidates: Table, weights) -> bool:
+    """Add candidates['p_real'] when the config carries calibration
+    constants; returns whether the column was added."""
+    a = getattr(weights, "score_probability_intercept", None)
+    b = getattr(weights, "score_probability_slope", None)
+    if a is None or b is None or len(candidates) == 0 or "quality_score" not in candidates.colnames:
+        return False
+    candidates["p_real"] = score_probability(candidates["quality_score"], float(a), float(b))
+    return True

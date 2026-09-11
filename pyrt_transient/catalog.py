@@ -27,6 +27,9 @@ import numpy as np
 from astropy.coordinates import SkyCoord
 from sklearn.neighbors import KDTree
 
+from pyrt_transient.core.color_model import has_colour_terms, simple_color_model
+from pyrt_transient.core.radii import scaled_position_error
+
 # ---------------------------------------------------------------------------
 # Import base class from pyrt.  Re-export QueryParams / CatalogFilter so that
 # callers can do `from pyrt_transient.catalog import QueryParams` without
@@ -51,6 +54,17 @@ CatalogConfig = Dict[str, Any]
 FilterDict = Dict[str, CatalogFilter]
 
 
+class CatalogNoCoverageError(ValueError):
+    """The catalogue simply has no rows for this field.
+
+    Distinct from a download that blew up: no coverage is a property of the
+    field that will be just as true next run, so a caller can exclude the
+    catalogue without marking the epoch degraded and re-analysing the whole
+    campaign every time.  Kept a ValueError so the plain
+    ``No data retrieved from ...`` handlers this replaced still catch it.
+    """
+
+
 # ---------------------------------------------------------------------------
 # Per-instance optimisation cache (precomputed photometry + spatial indices)
 # ---------------------------------------------------------------------------
@@ -64,6 +78,12 @@ class CatalogOptimizationCache:
     colors: np.ndarray
     valid_stars: np.ndarray
     kdtrees: Dict[str, KDTree]                 # cached KDTrees per image
+    # Best available single magnitude per star from whatever the catalogue
+    # carries (Sloan r, USNO-B R2/R1, Gaia G, ...), NaN if none: used only
+    # to decide whether a positional match without usable Sloan photometry
+    # can plausibly be the detected source (see
+    # DetectionConfig.unphotometered_veto_max_brightening_mag).
+    rough_mags: Optional[np.ndarray] = None
 
 
 # ---------------------------------------------------------------------------
@@ -80,8 +100,8 @@ class CatalogCache:
     def __init__(self, cache_dir: str = "./catalog_cache") -> None:
         self.cache_dir = Path(cache_dir)
         self.cache_dir.mkdir(exist_ok=True)
-        for name in ("panstarrs", "gaia", "atlas_vizier", "usno", "vsx",
-                     "legacysurvey"):
+        for name in ("panstarrs", "panstarrs@vizier", "gaia", "gaia_full", "atlas_vizier",
+                     "atlas@vizier", "usno", "vsx", "legacysurvey"):
             (self.cache_dir / name).mkdir(exist_ok=True)
 
     # ------------------------------------------------------------------
@@ -109,6 +129,7 @@ class CatalogCache:
 
     def get_cache_path(self, catalog_name: str, params: QueryParams) -> Path:
         key = self._generate_cache_key(catalog_name, params)
+        (self.cache_dir / catalog_name).mkdir(parents=True, exist_ok=True)
         return self.cache_dir / catalog_name / f"{key}.pkl"
 
     def is_cached(self, catalog_name: str, params: QueryParams) -> bool:
@@ -429,14 +450,57 @@ class CatTransients(_PyrtCatalog):
     * Optimised transient-candidate detection with magnitude-change analysis
     """
 
-    # Extra catalog identifier not present in the base class
+    # Extra catalog identifiers not present in the base class
     LEGACYSURVEY: str = "legacysurvey"
+    # Gaia DR3 without pyrt's calibrator quality cuts (ruwe < 1.4,
+    # visibility_periods_used >= 8, BP/RP present). Those cuts are right for
+    # picking photometric calibrators and wrong for vetting transients: on
+    # the 210619B field they drop ~9% of real 12-17 mag stars, every one of
+    # which then becomes a persistent "new" candidate. Stars without BP/RP
+    # come back with NaN Sloan magnitudes (positionally present,
+    # photometrically invalid -- see DetectionConfig.unphotometered_match_is_new).
+    GAIA_FULL: str = "gaia_full"
+    # Pan-STARRS DR1 mean photometry from VizieR (II/349/ps1): fast (a
+    # 0.3 deg box in ~1 s), includes galaxies, no calibrator cuts. The MAST
+    # DR2 route ("panstarrs") is deeper but slower; both are limited to
+    # Dec > -30 and return None (-> "catalogue unavailable", excluded from
+    # the agreement requirement) south of that without querying.
+    PANSTARRS_VIZIER: str = "panstarrs@vizier"
+    PS1_SOUTHERN_LIMIT_DEG: float = -30.0
+
+    # Substrings of the parent's Gaia ADQL WHERE clause that implement the
+    # calibrator cuts; _get_gaia_full_data drops any "AND ..." line containing one.
+    _GAIA_QUALITY_CUT_TOKENS = ("ruwe", "visibility_periods_used", "IS NOT NULL",
+                                "flux_over_error")
 
     # Extend parent's KNOWN_CATALOGS: mark remote catalogs as cacheable and
     # add the Legacy Survey entry.
     KNOWN_CATALOGS = {
         k: dict(v, cacheable=(not v.get("local", False)))
         for k, v in _PyrtCatalog.KNOWN_CATALOGS.items()
+    }
+    KNOWN_CATALOGS["gaia_full"] = dict(
+        KNOWN_CATALOGS["gaia"],
+        description="Gaia DR3, no calibrator quality cuts (positionally complete)",
+    )
+    KNOWN_CATALOGS["panstarrs@vizier"] = {
+        "description": "Pan-STARRS DR1 mean photometry (VizieR II/349/ps1)",
+        "filters":     {k: v for k, v in _PyrtCatalog.KNOWN_CATALOGS["atlas@vizier"]["filters"].items()
+                        if k in ("Sloan_g", "Sloan_r", "Sloan_i", "Sloan_z")},
+        "epoch":       2012.0,
+        "local":       False,
+        "service":     "VizieR",
+        "catalog_id":  "II/349/ps1",
+        "column_mapping": {
+            "RAJ2000": "radeg", "DEJ2000": "decdeg",
+            "gmag": "Sloan_g", "e_gmag": "Sloan_g_err",
+            "rmag": "Sloan_r", "e_rmag": "Sloan_r_err",
+            "imag": "Sloan_i", "e_imag": "Sloan_i_err",
+            "zmag": "Sloan_z", "e_zmag": "Sloan_z_err",
+            "ymag": "y", "e_ymag": "y_err",
+            "Nd": "n_detections", "Qual": "quality_flag",
+        },
+        "cacheable":   True,
     }
     KNOWN_CATALOGS["legacysurvey"] = {
         "description": "DESI Legacy Imaging Survey DR10",
@@ -511,6 +575,10 @@ class CatTransients(_PyrtCatalog):
         """Fetch Gaia data and append Sloan_g/Sloan_r synthetic columns."""
         result = super()._get_gaia_data()
         if result is not None and "G" in result.colnames:
+            for col in ("G", "BP", "RP"):
+                # Masked (missing BP/RP) -> NaN, never a fill value.
+                if hasattr(result[col], "filled"):
+                    result[col] = np.asarray(result[col].filled(np.nan), dtype=np.float64)
             G  = np.array(result["G"],  dtype=np.float64)
             BP = np.array(result["BP"], dtype=np.float64)
             RP = np.array(result["RP"], dtype=np.float64)
@@ -518,6 +586,152 @@ class CatTransients(_PyrtCatalog):
             result["Sloan_g"] = sloan_g
             result["Sloan_r"] = sloan_r
         return result
+
+    # ------------------------------------------------------------------
+    # Pan-STARRS (Dec > -30 only)
+    # ------------------------------------------------------------------
+
+    @classmethod
+    def ps1_covers(cls, dec_deg: float, height_deg: float = 0.0) -> bool:
+        """True if any part of the query box lies north of the PS1 footprint edge."""
+        return (dec_deg + height_deg / 2.0) > cls.PS1_SOUTHERN_LIMIT_DEG
+
+    @staticmethod
+    def _to_float_nan(col) -> np.ndarray:
+        """Column -> float64 array with masked / sentinel (-999) values as NaN."""
+        if hasattr(col, "mask"):
+            # Convert BEFORE filling: filled(nan) raises on integer columns
+            # (VizieR's Nd/Qual are masked int16).
+            arr = np.asarray(col.data, dtype=np.float64)
+            arr[np.asarray(col.mask, dtype=bool)] = np.nan
+        else:
+            arr = np.asarray(col, dtype=np.float64)
+        arr = np.where(arr < -100, np.nan, arr)
+        return arr
+
+    @classmethod
+    def _ps1_vizier_to_catalog(cls, table: "astropy.table.Table") -> "astropy.table.Table":
+        """Map a VizieR II/349/ps1 table onto our column names (pure)."""
+        mapping = cls.KNOWN_CATALOGS[cls.PANSTARRS_VIZIER]["column_mapping"]
+        out = astropy.table.Table()
+        for src, dst in mapping.items():
+            if src in table.colnames:
+                out[dst] = cls._to_float_nan(table[src])
+        n = len(out) if out.colnames else 0
+        for col in ("pmra", "pmdec", "parallax"):
+            out[col] = np.zeros(n, dtype=np.float64)
+        return out
+
+    def _get_panstarrs_vizier_data(self) -> Optional["astropy.table.Table"]:
+        """Pan-STARRS DR1 from VizieR. None (unavailable) south of Dec -30."""
+        from astroquery.vizier import Vizier
+
+        qp = self._query_params
+        if not self.ps1_covers(qp.dec, qp.height):
+            logging.warning(f"Pan-STARRS has no coverage at Dec {qp.dec:.2f} (limit "
+                            f"{self.PS1_SOUTHERN_LIMIT_DEG}); catalogue unavailable for this field")
+            return None
+        mapping = self.KNOWN_CATALOGS[self.PANSTARRS_VIZIER]["column_mapping"]
+        vizier = Vizier(columns=list(mapping.keys()),
+                        column_filters={"rmag": f"<{qp.mlim}"},
+                        # The cache-padded box (~1.3 deg) is ~60k rows; VizieR
+                        # normally answers in ~6 s but occasionally stalls, and a
+                        # timeout here only degrades to "catalogue unavailable".
+                        row_limit=-1, timeout=max(300, int(qp.timeout or 60)))
+        coords = SkyCoord(ra=qp.ra * u.deg, dec=qp.dec * u.deg, frame="icrs")
+        result = vizier.query_region(coords, width=qp.width * u.deg, height=qp.height * u.deg,
+                                     catalog=self.KNOWN_CATALOGS[self.PANSTARRS_VIZIER]["catalog_id"])
+        if not result or len(result) == 0 or len(result[0]) == 0:
+            logging.warning("No Pan-STARRS (VizieR) data found for this field")
+            return None
+        cat = self._ps1_vizier_to_catalog(result[0])
+        logging.info(f"Pan-STARRS (VizieR): {len(cat)} sources")
+        return cat
+
+    _PS1_MAST_COLUMNS = ("objName", "raMean", "decMean", "nDetections", "qualityFlag",
+                         "gMeanPSFMag", "gMeanPSFMagErr", "rMeanPSFMag", "rMeanPSFMagErr",
+                         "iMeanPSFMag", "iMeanPSFMagErr", "zMeanPSFMag", "zMeanPSFMagErr",
+                         "yMeanPSFMag", "yMeanPSFMagErr")
+
+    def _get_panstarrs_data(self) -> Optional["astropy.table.Table"]:
+        """Pan-STARRS DR2 from MAST, replacing pyrt's implementation.
+
+        pyrt's version passes criteria as ``nDetections.gt`` etc., which the
+        current MAST API rejects (``Filter 'nDetections.gt' does not
+        exist``); without an explicit column list the response also fails
+        to parse (``could not convert string to float: 'None'``). It then
+        drops every star lacking any of the five bands, which is right for
+        calibrators and wrong for vetting. This override uses the
+        ``column=[(op, value)]`` syntax, requests only numeric columns,
+        keeps incomplete stars (NaN bands), and adds ``Sloan_*`` aliases so
+        the photometric cache can use PS1 magnitudes. Unavailable (None)
+        south of Dec -30.
+        """
+        from astroquery.mast import Catalogs
+
+        qp = self._query_params
+        if not self.ps1_covers(qp.dec, qp.height):
+            logging.warning(f"Pan-STARRS has no coverage at Dec {qp.dec:.2f}; catalogue unavailable")
+            return None
+        config = self.KNOWN_CATALOGS[self.PANSTARRS]
+        radius = np.sqrt(qp.width ** 2 + qp.height ** 2) / 2
+        coords = SkyCoord(ra=qp.ra * u.deg, dec=qp.dec * u.deg, frame="icrs")
+        ps1 = Catalogs.query_region(
+            coords, catalog=config["catalog_id"], radius=radius * u.deg,
+            data_release=config.get("release", "dr2"), table=config.get("table", "mean"),
+            columns=list(self._PS1_MAST_COLUMNS),
+            nDetections=[("gt", 4)], rMeanPSFMag=[("lt", qp.mlim)], qualityFlag=[("lt", 128)],
+        )
+        if ps1 is None or len(ps1) == 0:
+            logging.warning("No Pan-STARRS (MAST) data found for this field")
+            return None
+        result = astropy.table.Table()
+        for ps1_name, our_name in config["column_mapping"].items():
+            if ps1_name in ps1.colnames:
+                result[our_name] = self._to_float_nan(ps1[ps1_name])
+        for band in ("g", "r", "i", "z"):
+            if band in result.colnames:
+                result[f"Sloan_{band}"] = result[band]
+            if f"d{band}" in result.colnames:
+                result[f"Sloan_{band}_err"] = result[f"d{band}"]
+        for col in ("pmra", "pmdec", "parallax"):
+            result[col] = np.zeros(len(result), dtype=np.float64)
+        logging.info(f"Pan-STARRS (MAST): {len(result)} sources")
+        return result
+
+    @classmethod
+    def _strip_gaia_quality_cuts(cls, query: str) -> str:
+        """Remove the calibrator-quality conditions from pyrt's Gaia ADQL."""
+        kept = []
+        for line in query.splitlines():
+            stripped = line.strip()
+            if stripped.startswith("AND ") and any(tok in stripped for tok in cls._GAIA_QUALITY_CUT_TOKENS):
+                continue
+            if stripped.startswith("--"):
+                continue
+            kept.append(line)
+        return "\n".join(kept)
+
+    def _get_gaia_full_data(self) -> Optional[astropy.table.Table]:
+        """Gaia DR3 query without the calibrator quality cuts (GAIA_FULL).
+
+        Reuses the parent's query construction and column mapping by
+        intercepting the ADQL string on its way to astroquery and stripping
+        the quality conditions, so the two variants cannot drift apart in
+        anything but the WHERE clause.
+        """
+        from astroquery.gaia import Gaia
+
+        original = Gaia.launch_job_async
+
+        def launch(query, *args, **kwargs):
+            return original(self._strip_gaia_quality_cuts(query), *args, **kwargs)
+
+        Gaia.launch_job_async = launch
+        try:
+            return self._get_gaia_data()
+        finally:
+            Gaia.launch_job_async = original
 
     # ------------------------------------------------------------------
     # Override _fetch_catalog_data to add disk caching + Legacy Survey
@@ -553,12 +767,21 @@ class CatTransients(_PyrtCatalog):
         try:
             if self._catalog_name == self.LEGACYSURVEY:
                 result = self._get_legacysurvey_data()
+            elif self._catalog_name == self.GAIA_FULL:
+                result = self._get_gaia_full_data()
+            elif self._catalog_name == self.PANSTARRS_VIZIER:
+                result = self._get_panstarrs_vizier_data()
             else:
                 # Parent handles ATLAS, PANSTARRS, GAIA, USNOB, SDSS, MAKAK
                 result = super()._fetch_catalog_data()
 
             if result is None:
-                raise ValueError(f"No data retrieved from {self._catalog_name}")
+                # Every path that returns None here means "the query ran and
+                # this field has no rows" (PS1 below its southern limit, an
+                # empty box).  A download that actually failed raises out of
+                # astroquery instead, and stays a failure.
+                raise CatalogNoCoverageError(
+                    f"No data retrieved from {self._catalog_name}")
 
             result.meta.update(
                 {
@@ -716,17 +939,12 @@ class CatTransients(_PyrtCatalog):
         valid_stars = np.sum(~np.isnan(magnitudes), axis=1) >= 2
         logging.info(f"  {np.sum(valid_stars)} valid stars with >=2 Sloan bands")
 
-        for i in np.where(valid_stars)[0]:
-            filled = self.fill_missing_photometry(magnitudes[i].copy())
-            if filled is not None:
-                magnitudes[i] = filled
-                if len(filled) >= 5:
-                    colors[i] = [
-                        filled[0] - filled[1],  # g-r
-                        filled[1] - filled[2],  # r-i
-                        filled[2] - filled[3],  # i-z
-                        filled[3] - filled[4],  # z-J
-                    ]
+        filled, filled_ok = self.fill_missing_photometry_batch(magnitudes)
+        use = valid_stars & filled_ok
+        magnitudes[use] = filled[use]
+        if len(bands) >= 5:
+            # g-r, r-i, i-z, z-J
+            colors[use, :4] = -np.diff(magnitudes[use, :5], axis=1)
 
         self._photometric_cache = CatalogOptimizationCache(
             coordinates=coordinates,
@@ -735,8 +953,43 @@ class CatTransients(_PyrtCatalog):
             colors=colors,
             valid_stars=valid_stars,
             kdtrees={},
+            rough_mags=self.rough_magnitudes(self),
         )
         return self._photometric_cache
+
+    # Index into the photometric cache's magnitude columns
+    # (Sloan_g, Sloan_r, Sloan_i, Sloan_z, J) for a frame's PHFILTER.
+    _BAND_INDEX = {"sloan_g": 0, "g": 0, "sloan_r": 1, "r": 1, "sloan_i": 2, "i": 2,
+                   "sloan_z": 3, "z": 3, "j": 4}
+
+    @classmethod
+    def catalog_band_index(cls, phfilter) -> int:
+        """Column of the cached magnitudes matching this frame band; Sloan r
+        (1) for anything unknown (Johnson, narrow-band, 'N', None)."""
+        if phfilter is None:
+            return 1
+        return cls._BAND_INDEX.get(str(phfilter).strip().lower(), 1)
+
+    # Magnitude columns usable as a rough brightness when a star has no
+    # Sloan photometry, in order of preference (red/visual first: the
+    # pipeline compares against Sloan r).
+    ROUGH_MAG_COLUMNS = ("Sloan_r", "R2", "R1", "Johnson_R", "G", "Johnson_V",
+                         "Sloan_i", "I", "Sloan_g", "B2", "B1", "J")
+
+    @classmethod
+    def rough_magnitudes(cls, table: astropy.table.Table) -> np.ndarray:
+        """Per-row best available magnitude from ROUGH_MAG_COLUMNS (first
+        finite value in preference order), NaN where the catalogue has none."""
+        n = len(table)
+        out = np.full(n, np.nan)
+        for col in cls.ROUGH_MAG_COLUMNS:
+            if col not in table.columns:
+                continue
+            vals = np.ma.filled(np.ma.asarray(table[col], dtype=float), np.nan)
+            vals = np.where(np.isfinite(vals) & (vals < 99) & (vals > -5), vals, np.nan)
+            fill = np.isnan(out) & np.isfinite(vals)
+            out[fill] = vals[fill]
+        return out
 
     @staticmethod
     def fill_missing_photometry(
@@ -765,6 +1018,61 @@ class CatTransients(_PyrtCatalog):
                 filled[i] = last
         return filled if not np.any(np.isnan(filled)) else None
 
+    @classmethod
+    def fill_missing_photometry_batch(
+        cls,
+        mags: np.ndarray,
+        typical_colors: Optional[List[float]] = None,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        """Vectorised `fill_missing_photometry` over a whole catalogue.
+
+        `mags` is an (n, n_bands) array.  Returns the filled array and a
+        boolean mask of the rows that could be filled completely; rows where
+        the scalar version returns None are masked False and returned
+        unchanged.  Equivalent to calling `fill_missing_photometry` per row,
+        but ~1000x faster on the million-star queries the pipeline runs
+        (the per-star loop cost ~35 s of pure CPU in every subprocess).
+        """
+        if typical_colors is None:
+            typical_colors = [0.6, 0.3, 0.2, 0.8]
+        mags = np.asarray(mags, dtype=float)
+        filled = mags.copy()
+        n, n_bands = filled.shape
+        ok = np.sum(~np.isnan(filled), axis=1) >= 2
+        if n == 0 or n_bands == 0:
+            return filled, ok
+
+        rows  = np.arange(n)[:, None]
+        # Bands 0..reach are chained by the typical colors, so subtracting the
+        # cumulative colour offset turns the scalar version's forward and
+        # backward passes into plain fills of a single quantity.
+        reach = min(len(typical_colors), n_bands - 1)
+        if reach > 0:
+            offset = np.concatenate([[0.0], np.cumsum(typical_colors[:reach])])
+            cols   = np.arange(reach + 1)
+            chain  = filled[:, :reach + 1] - offset
+
+            src = np.where(~np.isnan(chain), cols, 0)          # carry forward
+            np.maximum.accumulate(src, axis=1, out=src)
+            chain = chain[rows, src]
+
+            src = np.where(~np.isnan(chain), cols, reach)      # then backward
+            src = np.minimum.accumulate(src[:, ::-1], axis=1)[:, ::-1]
+            chain = chain[rows, src]
+
+            filled[:, :reach + 1] = chain + offset
+
+        # Bands past the colour chain simply repeat the last known magnitude.
+        if np.isnan(filled).any():
+            cols = np.arange(n_bands)
+            src  = np.where(~np.isnan(filled), cols, 0)
+            np.maximum.accumulate(src, axis=1, out=src)
+            filled = filled[rows, src]
+
+        ok &= ~np.any(np.isnan(filled), axis=1)
+        filled[~ok] = mags[~ok]
+        return filled, ok
+
     # --- pixel-coordinate cache ---
 
     def _generate_image_id(self, detections: astropy.table.Table) -> str:
@@ -782,14 +1090,39 @@ class CatTransients(_PyrtCatalog):
         ).hexdigest()[:12]
 
     def _transform_catalog_to_pixel(self, det: astropy.table.Table) -> np.ndarray:
-        header = dict(det.meta)
-        header["CTYPE1"] = "RA---TAN"
-        header["CTYPE2"] = "DEC--TAN"
+        # X_IMAGE/Y_IMAGE are measured on the distorted image, so a frame's
+        # SIP terms have to stay in the projection. Projecting through the
+        # bare TAN core put stars near the edges of FRAM frames (order-3
+        # SIP, tests/190919B) up to ~2 px off -- beyond the 1 px adaptive
+        # match floor -- so the same edge stars came back "new" in every
+        # epoch. Zenithal projections keep their PV terms too: pyrt's
+        # astrometric refit writes ZPN for wide-field cameras (FRAM's NF4,
+        # PV2_3 ~ 87), and flattening that to TAN cost up to ~3 px at the
+        # edges. For TAN, stray PV cards would be read as TPV distortion, so
+        # there they are still dropped.
+        # Non-finite values are dropped: astropy refuses NaN header cards, and
+        # a single one anywhere in the meta (pyrt writes ASTSIGMA=nan when its
+        # astrometric refit has nothing to fit) sent the matcher to the
+        # legacy fallback.
+        # Only the WCS keywords themselves: astropy serialises the whole dict
+        # into header cards, and a list or an over-long string (the stack
+        # ECSV's STACK_INPUTS) failed it just like a NaN did.
+        from pyrt_transient.core.wcs_meta import wcs_header_from_meta
+        header = wcs_header_from_meta(det.meta)
+        ctype1 = str(header.get("CTYPE1", ""))
+        keep_pv = ctype1[5:8] in ("ZPN", "AZP", "ZEA")
+        has_sip = not keep_pv and "SIP" in ctype1 and "A_ORDER" in header
+        if not keep_pv:
+            suffix = "-SIP" if has_sip else ""
+            header["CTYPE1"] = "RA---TAN" + suffix
+            header["CTYPE2"] = "DEC--TAN" + suffix
         for key in list(header):
             if key in ("CTYPE1T", "CTYPE2T", "CRVAL1T", "CRVAL2T",
                        "CDELT1T", "CDELT2T", "CROTA2T"):
                 del header[key]
-            elif any(p in key for p in ("PV", "A_", "B_", "AP_", "BP_")):
+            elif "PV" in key and not keep_pv:
+                del header[key]
+            elif not has_sip and any(p in key for p in ("A_", "B_", "AP_", "BP_")):
                 del header[key]
         wcs = astropy.wcs.WCS(header)
         cat_x, cat_y = wcs.all_world2pix(self["radeg"], self["decdeg"], 1)
@@ -847,7 +1180,12 @@ class CatTransients(_PyrtCatalog):
         radius: float,
         filter_pattern: Optional[str] = None,
         image_id: Optional[str] = None,
+        max_mag: Optional[float] = None,
     ) -> Dict[str, List]:
+        """max_mag: when given, only catalogue entries brighter than this
+        (by their rough magnitude, see rough_magnitudes; entries without any
+        magnitude are kept) enter the isolation/density statistics -- see
+        DetectionConfig.isolation_max_mag_margin."""
         n = len(positions)
         defaults: Dict[str, List] = {
             "nearby_sources":      [0]      * n,
@@ -876,11 +1214,26 @@ class CatTransients(_PyrtCatalog):
         if cat_coords is None or len(cat_coords) == 0:
             return defaults
 
+        index_suffix = ""
+        neighbor_map = None
+        if max_mag is not None and self._photometric_cache is not None:
+            rough = getattr(self._photometric_cache, "rough_mags", None)
+            if rough is not None and len(rough) == len(cat_coords):
+                keep = ~(np.isfinite(rough) & (rough >= max_mag))
+                if not np.all(keep):
+                    cat_coords = cat_coords[keep]
+                    neighbor_map = np.flatnonzero(keep)
+                    index_suffix = f"_m{max_mag:.2f}"
+                    if len(cat_coords) == 0:
+                        return defaults
+
         try:
             tree      = self.build_spatial_index(
-                cat_coords, f"stats_{image_id}" if image_id else None
+                cat_coords, f"stats_{image_id}{index_suffix}" if image_id else None
             )
             neighbors = tree.query_radius(positions, r=radius)
+            if neighbor_map is not None:
+                neighbors = [neighbor_map[nb] for nb in neighbors]
             nearby    = [len(nb) for nb in neighbors]
             density   = [cnt / (np.pi * radius ** 2) for cnt in nearby]
             dists, _  = tree.query(positions, k=1)
@@ -954,8 +1307,9 @@ class CatTransients(_PyrtCatalog):
                 if np.any(ok):
                     pos_err = np.sqrt(ex2 + ey2)
                     if use_astvar:
-                        av = float(detections.meta.get("ASTVAR", 1.0))
-                        pos_err *= np.sqrt(av if (np.isfinite(av) and av > 0) else 1.0)
+                        # ASTSIGMA floor + ASTVAR scale for pyrt >= 97101a7,
+                        # plain sqrt(ASTVAR) for older ECSVs.
+                        pos_err = scaled_position_error(pos_err, detections.meta)
                     radii = np.where(
                         ok & np.isfinite(nsigma * pos_err), nsigma * pos_err, np.nan
                     )
@@ -989,10 +1343,7 @@ class CatTransients(_PyrtCatalog):
                     )
                     pos_err = (fwhm / 2.35) / np.maximum(snr, 1e-6)
                     if use_astvar:
-                        av = float(detections.meta.get("ASTVAR", 1.0))
-                        pos_err *= np.sqrt(
-                            av if (np.isfinite(av) and av > 0) else 1.0
-                        )
+                        pos_err = scaled_position_error(pos_err, detections.meta)
                     radii = np.where(
                         ok & np.isfinite(nsigma * pos_err), nsigma * pos_err, np.nan
                     )
@@ -1012,7 +1363,9 @@ class CatTransients(_PyrtCatalog):
         siglim: float = 5.0,
         frame: float = 10.0,
         adaptive_radii: Optional[np.ndarray] = None,
+        unphotometered_match_is_new: bool = True,
         new_source_siglim: Optional[float] = None,
+        unphotometered_veto_max_brightening: Optional[float] = None,
     ) -> astropy.table.Table:
         if len(detections) == 0:
             return astropy.table.Table()
@@ -1079,6 +1432,8 @@ class CatTransients(_PyrtCatalog):
         return self._process_detections_for_candidates(
             detections, matches_list, mag_change_threshold, siglim, frame,
             new_source_siglim=new_source_siglim,
+            unphotometered_match_is_new=unphotometered_match_is_new,
+            unphotometered_veto_max_brightening=unphotometered_veto_max_brightening,
         )
 
     def get_transient_candidates(
@@ -1111,6 +1466,8 @@ class CatTransients(_PyrtCatalog):
         siglim: float,
         frame: float,
         new_source_siglim: Optional[float] = None,
+        unphotometered_match_is_new: bool = True,
+        unphotometered_veto_max_brightening: Optional[float] = None,
     ) -> astropy.table.Table:
         """new_source_siglim, when lower than siglim, admits fainter/noisier
         detections as "new" candidates (no reference-catalog match at all)
@@ -1126,6 +1483,23 @@ class CatTransients(_PyrtCatalog):
         det_y    = detections["Y_IMAGE"].data
         det_mags = detections["MAG_CALIB"].data
         det_errs = detections["MAGERR_CALIB"].data
+        # Catalogue band to compare MAG_CALIB with: the frame's photometric
+        # band (PHFILTER, e.g. "Sloan_i"), not always Sloan r. Falls back to
+        # r per star when the catalogue lacks that band.
+        band_idx = self.catalog_band_index(detections.meta.get("PHFILTER", detections.meta.get("FILTER")))
+        # SExtractor FLAGS bit 2 = blended with another source. Threaded
+        # through to _check_magnitude_changes_cached so a blend's combined
+        # flux being brighter than the catalogued star alone would predict
+        # can use the same more permissive significance bar new-source
+        # detections already get, instead of silently reading as "same star,
+        # unchanged" -- see DetectionConfig.new_source_siglim's docstring
+        # and FUTURE_IDEAS.md's blending mechanism note for why this
+        # dilution is real, not hypothetical.
+        det_blended = (
+            (detections["FLAGS"].data & 2) > 0
+            if "FLAGS" in detections.colnames
+            else np.zeros(len(detections), dtype=bool)
+        )
         img_w = detections.meta.get(
             "NAXIS1", detections.meta.get(
                 "IMGAXIS1", detections.meta.get("IMAGEW", np.max(det_x) + 100)
@@ -1138,7 +1512,17 @@ class CatTransients(_PyrtCatalog):
         )
         edge = ((det_x < frame) | (det_y < frame) |
                 (det_x > img_w - frame) | (det_y > img_h - frame))
-        bad_snr_matched = det_errs >= (1.091 / siglim)
+        # Blended detections use new_source_siglim here too (not just inside
+        # _check_magnitude_changes_cached below) -- otherwise a blend's
+        # inherently noisier combined-flux measurement gets filtered out by
+        # this admission gate before it ever reaches the blend-aware check,
+        # regardless of that check's own bar.
+        # min(): nothing enforces new_source_siglim < siglim, and a config
+        # with it higher must not make blended matched detections stricter
+        # than unblended ones.
+        blended_siglim = min(new_source_siglim, siglim)
+        effective_matched_siglim = np.where(det_blended, blended_siglim, siglim)
+        bad_snr_matched = det_errs >= (1.091 / effective_matched_siglim)
         bad_snr_new     = det_errs >= (1.091 / new_source_siglim)
 
         candidates: List[int] = []
@@ -1161,6 +1545,11 @@ class CatTransients(_PyrtCatalog):
             is_cand, ctype, mdiff = self._check_magnitude_changes_cached(
                 matches, det_mags[i], det_errs[i], response,
                 mag_change_threshold, siglim,
+                is_blended=bool(det_blended[i]),
+                new_source_siglim=new_source_siglim,
+                unphotometered_match_is_new=unphotometered_match_is_new,
+                unphotometered_veto_max_brightening=unphotometered_veto_max_brightening,
+                band_idx=band_idx,
             )
             if is_cand:
                 candidates.append(i)
@@ -1182,7 +1571,26 @@ class CatTransients(_PyrtCatalog):
         response_model: str,
         mag_change_threshold: float,
         siglim: float,
+        is_blended: bool = False,
+        new_source_siglim: Optional[float] = None,
+        unphotometered_match_is_new: bool = True,
+        unphotometered_veto_max_brightening: Optional[float] = None,
+        band_idx: int = 1,
     ) -> Tuple[bool, str, float]:
+        """is_blended/new_source_siglim: a detection blended with a known
+        catalog star (SExtractor FLAGS bit 2) measures the *combined* flux
+        of both, which dilutes a real superimposed source's excess enough
+        that it can fail the ordinary `siglim` significance bar even when
+        genuinely brighter than the catalogued star alone -- see
+        FUTURE_IDEAS.md's blending mechanism note (found via GRB200410A,
+        a real GCN-confirmed afterglow this diluting effect hid). For a
+        blended detection specifically, a real brightening excess is
+        checked against the same more permissive bar new-source detections
+        already get (`new_source_siglim`) instead of the strict one, rather
+        than treating any blend as automatically "same star, unchanged".
+        """
+        if new_source_siglim is None:
+            new_source_siglim = siglim
         name = self.catalog_name.lower()
         cat_sys = (
             0.01 if "gaia"         in name else
@@ -1195,29 +1603,52 @@ class CatTransients(_PyrtCatalog):
 
         significant: List[Tuple[float, str]] = []
         any_valid = False
+        # Catalogue magnitudes of every usable match, for the blend check
+        # below: a blended detection measures the *summed* flux of all the
+        # catalogued stars under it, so its excess has to be judged against
+        # that sum. Comparing against each match individually flagged every
+        # ordinary unresolved pair as "brightening" (the pair is always
+        # brighter than its fainter member).
+        matched_cat_mags: List[float] = []
+        # Rough magnitudes of the matches without usable Sloan photometry
+        # (USNO-B plate magnitudes, Gaia G without BP/RP, ...).
+        rough_mags = getattr(self._photometric_cache, "rough_mags", None)
+        unphotometered_rough: List[float] = []
 
         for idx in matches:
             if not self._photometric_cache.valid_stars[idx]:  # type: ignore[union-attr]
+                if rough_mags is not None and np.isfinite(rough_mags[idx]):
+                    unphotometered_rough.append(float(rough_mags[idx]))
                 continue
             try:
-                r_mag  = self._photometric_cache.magnitudes[idx, 1]  # type: ignore[union-attr]
+                # The frame's own band where the catalogue has it (an i-band
+                # frame compared against Sloan r read every red star as a
+                # magnitude change -- FUTURE_IDEAS.md "Catalogue comparison
+                # is always against Sloan r"), else Sloan r.
+                r_mag  = self._photometric_cache.magnitudes[idx, band_idx]  # type: ignore[union-attr]
+                if np.isnan(r_mag):
+                    r_mag = self._photometric_cache.magnitudes[idx, 1]  # type: ignore[union-attr]
                 colors = self._photometric_cache.colors[idx]          # type: ignore[union-attr]
                 if np.isnan(r_mag) or np.any(np.isnan(colors)):
                     continue
 
-                try:
-                    from pyrt_transient.transients import simple_color_model
-                    cat_mag = simple_color_model(
-                        response_model,
-                        (r_mag, colors[0], colors[1], colors[2], colors[3]),
-                    )
-                except ImportError:
-                    cat_mag = r_mag
+                cat_mag = simple_color_model(
+                    response_model,
+                    (r_mag, colors[0], colors[1], colors[2], colors[3]),
+                )
 
                 sigma  = np.sqrt(det_mag_err ** 2 + det_sys ** 2 + cat_sys ** 2)
                 diff   = det_mag - cat_mag
                 nsigma = abs(diff) / sigma
                 any_valid = True
+                matched_cat_mags.append(float(cat_mag))
+
+                if is_blended:
+                    # A blend measures every star under it at once, so a
+                    # per-star comparison is meaningless (the pair is always
+                    # "brighter" than its fainter member) -- judged once
+                    # against the summed prediction below instead.
+                    continue
 
                 if abs(diff) >= mag_change_threshold and nsigma > siglim:
                     significant.append(
@@ -1225,19 +1656,54 @@ class CatTransients(_PyrtCatalog):
                     )
                 # else (not significantly different, or intermediate): keep
                 # checking the remaining matches before deciding -- with more
-                # than one catalog match nearby (e.g. a blended pair), an
-                # early "not significant" on the first one checked must not
-                # pre-empt a genuinely significant match still to come.
+                # than one catalog match nearby, an early "not significant"
+                # on the first one checked must not pre-empt a genuinely
+                # significant match still to come.
 
             except Exception:
                 continue
+
+        if is_blended and matched_cat_mags:
+            combined_cat_mag = -2.5 * np.log10(
+                np.sum(10.0 ** (-0.4 * np.asarray(matched_cat_mags)))
+            )
+            sigma = np.sqrt(det_mag_err ** 2 + det_sys ** 2 + cat_sys ** 2)
+            diff = float(det_mag - combined_cat_mag)
+            nsigma = abs(diff) / sigma
+            if abs(diff) >= mag_change_threshold and nsigma > siglim:
+                significant.append((diff, "brightening" if diff < 0 else "fading"))
+            elif (diff < 0 and abs(diff) >= mag_change_threshold
+                    and nsigma > min(new_source_siglim, siglim)):
+                # Combined flux measurably brighter than all the catalogued
+                # stars under it together would predict, but not enough to
+                # clear the strict bar -- the diluted-excess case
+                # new_source_siglim exists for (FUTURE_IDEAS.md, GRB200410A).
+                significant.append((diff, "brightening"))
 
         if significant:
             best = max(significant, key=lambda x: abs(x[0]))
             return True, best[1], float(best[0])
         if any_valid:
             return False, "none", 0.0
-        return True, "new", np.nan
+        # Matches exist but none has usable photometry. Historically this
+        # was reported as "new", which for a catalogue without Sloan bands
+        # (USNO-B) makes every detection "new" -- see
+        # DetectionConfig.unphotometered_match_is_new.
+        if unphotometered_match_is_new:
+            return True, "new", np.nan
+        # A positional-only veto must still be magnitude-aware: a 20 mag
+        # USNO-B star 2" away cannot be a 15 mag detection (GRB 250813B's
+        # afterglow was lost exactly this way). If the detection is brighter
+        # than the brightest rough catalogue magnitude among the matches by
+        # more than the allowed margin (colour terms, plate photometry
+        # scatter and blending are all covered by a generous margin), report
+        # it as brightening instead of vetoing it.
+        if (unphotometered_veto_max_brightening is not None and unphotometered_rough
+                and np.isfinite(det_mag)):
+            diff = float(det_mag - min(unphotometered_rough))
+            if diff <= -abs(unphotometered_veto_max_brightening):
+                return True, "brightening", diff
+        return False, "matched_unphotometered", 0.0
 
     # --- convenience helpers ---
 

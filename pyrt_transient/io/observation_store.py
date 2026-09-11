@@ -30,12 +30,12 @@ import os
 import re
 from datetime import datetime
 from pathlib import Path
-from typing import List, Set, Tuple
+from typing import List, Optional, Set, Tuple
 
 import numpy as np
 from astropy.table import Table
 
-from pyrt_transient.transients import open_ecsv_file
+from pyrt_transient.io.ecsv import open_ecsv_file
 
 
 def extract_observation_id(ecsv_file_path):
@@ -66,6 +66,118 @@ def extract_observation_id(ecsv_file_path):
     except Exception as e:
         logging.warning(f"Could not extract observation ID from {ecsv_file_path}: {e}")
         return clean_observation_id(Path(ecsv_file_path).stem)
+
+
+POINTING_FILE = "pointing.json"
+
+
+def frame_pointing(meta) -> Optional[Tuple[float, float]]:
+    """(CTRRA, CTRDEC) of a frame in degrees, or None."""
+    meta = meta or {}
+    try:
+        return float(meta["CTRRA"]), float(meta["CTRDEC"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _sep_arcmin(ra1, dec1, ra2, dec2) -> float:
+    import math
+    r1, d1, r2, d2 = (math.radians(v) for v in (ra1, dec1, ra2, dec2))
+    c = math.sin(d1) * math.sin(d2) + math.cos(d1) * math.cos(d2) * math.cos(r1 - r2)
+    return math.degrees(math.acos(max(-1.0, min(1.0, c)))) * 60.0
+
+
+def resolve_observation_id(ecsv_file_path, base_dir, radius_arcmin=None, max_gap_hours=12.0):
+    """Observation ID for this epoch: the raw OBSID-derived one, unless an
+    existing observation under base_dir points at the same field (frame
+    centre within radius_arcmin) and its last epoch is within
+    max_gap_hours -- then that observation's ID, so a campaign split over
+    several telescope OBSIDs accumulates in one store. Returns
+    (observation_id, reason)."""
+    raw_id = extract_observation_id(ecsv_file_path)
+    if radius_arcmin is None:
+        return raw_id, "obsid"
+    try:
+        table = open_ecsv_file(ecsv_file_path, verbose=False)
+        meta = table.meta if table is not None else {}
+    except Exception:
+        meta = {}
+    pointing = frame_pointing(meta)
+    t_mid = epoch_mid_time(meta)
+    if pointing is None or t_mid is None:
+        return raw_id, "obsid (no pointing/time in header)"
+    base = Path(base_dir)
+    if not base.exists():
+        return raw_id, "obsid"
+    best = None
+    for pfile in base.glob(f"obs_*/{POINTING_FILE}"):
+        try:
+            info = json.loads(pfile.read_text())
+            sep = _sep_arcmin(pointing[0], pointing[1], float(info["ra"]), float(info["dec"]))
+            gap_h = abs(t_mid - float(info["last_mid_time"])) / 3600.0
+        except Exception:
+            continue
+        if sep <= radius_arcmin and gap_h <= max_gap_hours:
+            obs_id = pfile.parent.name[len("obs_"):]
+            # The epoch's own raw OBSID wins over any other store that also
+            # points here. Without that tie-break, two OBSIDs of one field
+            # that were created concurrently (neither had written its
+            # pointing.json yet, so neither could join the other) stayed
+            # split forever, and later epochs could even alternate between
+            # them on sub-arcminute differences in the running mean.
+            if best is None or (obs_id == raw_id and best[0] != raw_id) or (
+                    best[0] != raw_id and sep < best[1]):
+                best = (obs_id, sep, gap_h)
+    if best is not None:
+        if best[0] == raw_id:
+            return raw_id, "obsid (pointing agrees)"
+        return best[0], f"pointing: {best[1]:.1f}' from obs_{best[0]}, {best[2]:.1f} h after its last epoch (raw OBSID {raw_id})"
+    # No observation points here. The raw ID may still belong to a
+    # different field (the telescope reuses block IDs; GRB 250813B's set
+    # carried one frame 7.5 deg away): never pour this epoch into a store
+    # whose pointing disagrees -- take the first free suffix instead.
+    candidate = raw_id
+    for suffix in ("", "b", "c", "d", "e", "f"):
+        candidate = f"{raw_id}{suffix}"
+        pfile = base / f"obs_{candidate}" / POINTING_FILE
+        if not pfile.exists():
+            break
+        try:
+            info = json.loads(pfile.read_text())
+            sep = _sep_arcmin(pointing[0], pointing[1], float(info["ra"]), float(info["dec"]))
+        except Exception:
+            break
+        if sep <= radius_arcmin:
+            break
+    if candidate != raw_id:
+        return candidate, f"obsid {raw_id} already used by another pointing; new observation {candidate}"
+    return raw_id, "obsid (no matching pointing)"
+
+
+def epoch_mid_time(meta) -> Optional[float]:
+    """Mid-exposure unix time (CTIME + EXPTIME/2 -- the same convention
+    core/epochs.py stamps on detections as `obs_time`), or None if the
+    table carries no CTIME."""
+    meta = meta or {}
+    try:
+        ctime = float(meta["CTIME"])
+    except (KeyError, TypeError, ValueError):
+        return None
+    try:
+        exptime = float(meta.get("EXPTIME", 0.0) or 0.0)
+    except (TypeError, ValueError):
+        exptime = 0.0
+    return ctime + exptime / 2.0
+
+
+def epoch_sort_key(table):
+    """Sort key putting epochs in observation order: dated tables by
+    mid-exposure time, undated ones first (by filename) so `[-1]` is always
+    the newest dated epoch."""
+    meta = getattr(table, "meta", None) or {}
+    t = epoch_mid_time(meta)
+    name = str(meta.get("filename", ""))
+    return (0, 0.0, name) if t is None else (1, t, name)
 
 
 def clean_observation_id(obs_id):
@@ -131,6 +243,12 @@ class AnalysisLock:
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
+        # The lock file is deliberately never unlinked. flock() locks an
+        # inode, not a path: if A unlinks on release while B is blocked on
+        # the old inode, C opens the path, gets a fresh inode, and acquires
+        # immediately -- B and C then both run the analysis concurrently.
+        # A stale lock file on disk costs nothing (flock state dies with the
+        # holding process).
         if self._fd is not None:
             try:
                 fcntl.flock(self._fd, fcntl.LOCK_UN)
@@ -139,10 +257,6 @@ class AnalysisLock:
                 logging.warning(f"Could not release analysis lock: {e}")
             finally:
                 self._fd = None
-            try:
-                self.lock_path.unlink(missing_ok=True)
-            except Exception:
-                pass
             logging.info("Analysis lock released")
         return False  # don't suppress exceptions
 
@@ -160,17 +274,46 @@ class ObservationStore:
     def _setup_observation_directory(self) -> Path:
         """Create and return observation-specific directory."""
         obs_dir = self.base_dir / f"obs_{self.observation_id}"
-        try:
-            # Try to create directory (race condition safe)
-            obs_dir.mkdir(exist_ok=True)
-            return obs_dir
-        except Exception as e:
-            logging.warning(f"Could not create observation directory {obs_dir}: {e}")
-            # Fallback to base directory if obs directory creation fails
-            return self.base_dir
+        # No fallback to base_dir: that silently pooled every observation's
+        # epochs, metadata and candidates.tbl into one shared directory.
+        obs_dir.mkdir(parents=True, exist_ok=True)
+        return obs_dir
 
     def _metadata_path(self) -> Path:
         return self.obs_dir / "detection_metadata.json"
+
+    def record_pointing(self, meta) -> None:
+        """Keep this observation's pointing and last epoch time in
+        pointing.json (read by resolve_observation_id)."""
+        pointing = frame_pointing(meta)
+        t_mid = epoch_mid_time(meta)
+        if pointing is None or t_mid is None:
+            return
+        path = self.obs_dir / POINTING_FILE
+        info = {"ra": pointing[0], "dec": pointing[1], "first_mid_time": t_mid, "last_mid_time": t_mid, "n_epochs": 0}
+        try:
+            if path.exists():
+                old = json.loads(path.read_text())
+                info["first_mid_time"] = min(float(old.get("first_mid_time", t_mid)), t_mid)
+                info["last_mid_time"] = max(float(old.get("last_mid_time", t_mid)), t_mid)
+                info["n_epochs"] = int(old.get("n_epochs", 0))
+                # Running mean pointing. RA is averaged through the wrapped
+                # offset from the stored value, not linearly: a field
+                # straddling RA=0 (359.9 and 0.1) averaged linearly to 180,
+                # i.e. a stored centre half the sky away, after which every
+                # later epoch failed resolve_observation_id's radius test.
+                n = info["n_epochs"]
+                ra_old = float(old.get("ra", pointing[0]))
+                dra = (pointing[0] - ra_old + 180.0) % 360.0 - 180.0
+                info["ra"] = (ra_old + dra / (n + 1)) % 360.0
+                info["dec"] = (float(old.get("dec", pointing[1])) * n + pointing[1]) / (n + 1)
+        except Exception as e:
+            logging.warning(f"Could not read {path}: {e}")
+        info["n_epochs"] += 1
+        try:
+            path.write_text(json.dumps(info, indent=1))
+        except Exception as e:
+            logging.warning(f"Could not write {path}: {e}")
 
     def _read_processed_files(self) -> Set[str]:
         metadata_file = self._metadata_path()
@@ -185,11 +328,18 @@ class ObservationStore:
             return set()
 
     def load_existing_tables(self) -> Tuple[List[Table], Set[str]]:
-        """Load existing detection tables from observation directory."""
+        """Load existing detection tables from observation directory, in
+        observation order (oldest first).
+
+        Ordering matters: several consumers take `detection_tables[0]` (the
+        field/query box) or `[-1]` ("the most recent epoch": follow-up
+        conditions, the SN pipeline's SkyBoT/PM epoch, the stack's most-
+        recent-N input selection). A bare glob() is filesystem order, which
+        made all of those arbitrary on any run after the first.
+        """
         detection_tables = []
         processed_files = self._read_processed_files()
 
-        # Load existing detection tables
         for ecsv_file in self.obs_dir.glob("*.ecsv"):
             if ecsv_file.name in processed_files:
                 try:
@@ -200,47 +350,95 @@ class ObservationStore:
                 except Exception as e:
                     logging.warning(f"Could not load {ecsv_file}: {e}")
 
+        detection_tables.sort(key=epoch_sort_key)
         return detection_tables, processed_files
 
-    def mark_processed(self, filename) -> None:
-        """Update metadata file with newly processed file (thread-safe)."""
-        processed_files = self._read_processed_files()
-        processed_files.add(filename)
+    def _metadata_lock_path(self) -> Path:
+        return self.obs_dir / ".metadata.lock"
+
+    def _read_metadata(self) -> dict:
         metadata_file = self._metadata_path()
-
-        metadata = {
-            'processed_files': list(processed_files),
-            'last_updated': datetime.now().isoformat(),
-            'total_files': len(processed_files),
-            'observation_id': self.obs_dir.name.replace('obs_', ''),
-            'process_id': os.getpid()
-        }
-
-        temp_file = metadata_file.with_suffix('.tmp')
+        if not metadata_file.exists():
+            return {}
         try:
-            # Use atomic write with temporary file to prevent corruption
-            with open(temp_file, 'w') as f:
-                # Try to get exclusive lock (non-blocking)
+            with open(metadata_file, 'r') as f:
+                return json.load(f)
+        except Exception as e:
+            logging.warning(f"Could not load metadata: {e}")
+            return {}
+
+    def _add_to_metadata_set(self, key: str, filename) -> None:
+        """Add `filename` to the `key` set in detection_metadata.json, safe
+        across concurrent runs.
+
+        The read-modify-write happens under an exclusive, blocking flock on a
+        dedicated lock file (never unlinked -- see AnalysisLock), and the JSON
+        is written to a per-process temp file that is atomically renamed into
+        place. The previous version truncated one shared `.tmp` before taking
+        a non-blocking lock, so two runs could install a partial/empty file,
+        or one could silently skip recording its epoch.
+        """
+        metadata_file = self._metadata_path()
+        temp_file = metadata_file.with_name(f"{metadata_file.name}.{os.getpid()}.tmp")
+        try:
+            with open(self._metadata_lock_path(), "a+") as lock_fd:
+                fcntl.flock(lock_fd.fileno(), fcntl.LOCK_EX)
                 try:
-                    fcntl.flock(f.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-                    json.dump(metadata, f, indent=2)
-                    fcntl.flock(f.fileno(), fcntl.LOCK_UN)
-                except BlockingIOError:
-                    # If we can't get the lock, another process is updating
-                    logging.info(f"Another process is updating metadata, skipping...")
-                    return
-
-            # Atomic move
-            temp_file.replace(metadata_file)
-
+                    metadata = self._read_metadata()
+                    registered = set(metadata.get('processed_files', []))
+                    # Stores written before registration and analysis were
+                    # split have no 'analyzed_files': everything registered
+                    # there had been analysed, so seed it that way once.
+                    analyzed = set(metadata.get('analyzed_files', registered))
+                    target = registered if key == 'processed_files' else analyzed
+                    target.add(filename)
+                    if key == 'analyzed_files':
+                        registered.add(filename)   # analysed implies registered
+                    metadata.update({
+                        'processed_files': sorted(registered),
+                        'analyzed_files': sorted(analyzed),
+                        'last_updated': datetime.now().isoformat(),
+                        'total_files': len(registered),
+                        'observation_id': self.obs_dir.name.replace('obs_', ''),
+                        'process_id': os.getpid()
+                    })
+                    with open(temp_file, 'w') as f:
+                        json.dump(metadata, f, indent=2)
+                    temp_file.replace(metadata_file)
+                finally:
+                    fcntl.flock(lock_fd.fileno(), fcntl.LOCK_UN)
         except Exception as e:
             logging.warning(f"Could not save metadata: {e}")
-            # Clean up temp file if it exists
-            if temp_file.exists():
-                temp_file.unlink()
+            try:
+                temp_file.unlink(missing_ok=True)
+            except Exception:
+                pass
+
+    def mark_processed(self, filename) -> None:
+        """Register `filename` as an epoch of this observation, i.e. make it
+        visible to load_existing_tables. Says nothing about whether its
+        analysis finished -- see mark_analyzed."""
+        self._add_to_metadata_set('processed_files', filename)
+
+    def mark_analyzed(self, filename) -> None:
+        """Record that `filename`'s analysis completed and its results were
+        saved. Kept apart from registration so that an epoch whose run died
+        mid-analysis is still loaded by the next run (it is on disk and
+        registered) instead of vanishing from the observation, while
+        pipeline_magic's "already processed, skip" test stays keyed on the
+        analysis actually having finished."""
+        self._add_to_metadata_set('analyzed_files', filename)
+
+    def already_analyzed(self, filename) -> bool:
+        """Whether `filename`'s analysis has completed (thread-safe read)."""
+        metadata = self._read_metadata()
+        if not metadata:
+            return False
+        return filename in set(metadata.get('analyzed_files',
+                                            metadata.get('processed_files', [])))
 
     def already_processed(self, filename) -> bool:
-        """Check if this specific file has already been processed (thread-safe)."""
+        """Whether `filename` is registered as an epoch of this observation."""
         metadata_file = self._metadata_path()
 
         if not metadata_file.exists():

@@ -46,7 +46,6 @@ class SubtractionStrategy(DetectionStrategy):
         config=None,
         template_provenance: str = "unknown",
         position_match_radius: Optional[float] = None,
-        add_strategy_fields_fn=None,
     ) -> Tuple[Table, Dict]:
         """detection_tables: diff-image detection tables, one per epoch,
         each loaded via candidates.load_diff_table (so meta['filename'] is
@@ -161,7 +160,6 @@ class SubtractionStrategy(DetectionStrategy):
             position_match_radius=position_match_radius,
             min_n_detections=min_n_detections,
             config=config,
-            add_strategy_fields_fn=add_strategy_fields_fn,
         )
 
         # Step 3: lightcurve plots and analysis.

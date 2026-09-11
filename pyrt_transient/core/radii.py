@@ -97,8 +97,68 @@ def compute_adaptive_radius(
         return np.array([]) if coord_system == "pixel" else np.full(n_det, 2.0)
 
 
+def _finite_meta(meta, key):
+    try:
+        value = float(meta.get(key))
+    except (TypeError, ValueError):
+        return None
+    return value if np.isfinite(value) else None
+
+
+def astrometric_error_model(meta):
+    """(floor_px2, centroid_scale) of a frame's astrometric error model.
+
+    pyrt from mates14/pyrt 97101a7 on fits sigma_total^2 = ASTSIGMA^2 +
+    (ERRX2+ERRY2)*ASTVAR: ASTSIGMA is the systematic WCS floor (px) and
+    ASTVAR the centroid scale factor; those ECSVs also carry ASTSCATT, the
+    plain residual scatter. Older pyrt wrote ASTSIGMA as that scatter and
+    ASTVAR as a pure multiplier with no floor, which is what is assumed
+    when ASTSCATT is absent -- so ECSVs of either vintage keep working.
+    """
+    meta = meta or {}
+    astvar = _finite_meta(meta, "ASTVAR")
+    if "ASTSCATT" in meta:
+        astsigma = _finite_meta(meta, "ASTSIGMA")
+        floor = astsigma ** 2 if astsigma is not None else 0.0
+        return floor, (astvar if astvar is not None and astvar >= 0 else 1.0)
+    return 0.0, (astvar if astvar is not None and astvar > 0 else 1.0)
+
+
+def scaled_position_error(pos_err, meta):
+    """Centroid error (px) -> total positional error (px) under the frame's
+    astrometric error model; for older ECSVs this is pos_err*sqrt(ASTVAR)."""
+    floor, scale = astrometric_error_model(meta)
+    return np.sqrt(floor + np.asarray(pos_err, dtype=float) ** 2 * scale)
+
+
+def astrometric_scatter_arcsec(meta, default=None):
+    """Per-frame astrometric residual scatter in arcsec.
+
+    pyrt writes it in pixels: ASTSCATT from 97101a7 on, ASTSIGMA before
+    (where ASTSIGMA now means the WCS floor instead). Converted with PIXEL
+    (arcsec/px), else the CD matrix/CDELT1; `default` when either the
+    scatter or the plate scale is unavailable.
+    """
+    meta = meta or {}
+    scatter_px = _finite_meta(meta, "ASTSCATT" if "ASTSCATT" in meta else "ASTSIGMA")
+    if scatter_px is None or scatter_px <= 0:
+        return default
+    scale = _finite_meta(meta, "PIXEL")
+    if scale is None or scale <= 0:
+        cd11, cd22 = _finite_meta(meta, "CD1_1"), _finite_meta(meta, "CD2_2")
+        cdelt1 = _finite_meta(meta, "CDELT1")
+        if cd11 and cd22:
+            scale = 3600 * np.sqrt(abs(cd11 * cd22))
+        elif cdelt1:
+            scale = 3600 * abs(cdelt1)
+        else:
+            return default
+    return scatter_px * scale
+
+
 def _primary_errxy_radius(detections, nsigma, use_astvar):
-    """nsigma * sqrt(ERRX2_IMAGE + ERRY2_IMAGE), optionally x sqrt(ASTVAR).
+    """nsigma * sqrt(ERRX2_IMAGE + ERRY2_IMAGE), optionally scaled by the
+    frame's astrometric error model (scaled_position_error).
 
     Returns None if the columns are missing or all non-finite/negative, so
     callers can fall back to the PSF+SNR heuristic.
@@ -114,8 +174,7 @@ def _primary_errxy_radius(detections, nsigma, use_astvar):
 
     pos_err = np.sqrt(ex2 + ey2)
     if use_astvar:
-        av = float(detections.meta.get("ASTVAR", 1.0))
-        pos_err = pos_err * np.sqrt(av if (np.isfinite(av) and av > 0) else 1.0)
+        pos_err = scaled_position_error(pos_err, detections.meta)
 
     radii = np.where(ok & np.isfinite(nsigma * pos_err), nsigma * pos_err, np.nan)
     return radii if np.sum(np.isfinite(radii)) > 0 else None

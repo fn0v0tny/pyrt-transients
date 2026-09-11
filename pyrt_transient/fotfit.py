@@ -6,7 +6,10 @@ Photometric response fitter
 """
 
 import numpy as np
-import termfit
+try:
+    from pyrt_transient import termfit  # the bundled copy, importable when installed
+except ImportError:
+    import termfit  # standalone pyrt checkout on sys.path
 from astropy.table import Table
 
 # wishlist :)

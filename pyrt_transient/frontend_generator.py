@@ -125,6 +125,22 @@ def _read_padded_cutout(section, x, y, half, naxis1, naxis2):
     return out, xmin_full, ymin_full
 
 
+def _lightcurve_pixel_positions(lightcurve):
+    """{fits_stem: (x, y)}, 0-based, of a candidate's per-epoch detections.
+
+    Lightcurve rows carry SExtractor X_IMAGE/Y_IMAGE, which are 1-based
+    (on tests/190919B, X_IMAGE minus the frame WCS's 0-based pixel is
+    +1.000 for every row), while _read_padded_cutout and save_cutout_plot
+    index 0-based -- used raw, every cutout was centred one pixel off.
+    """
+    positions = {}
+    for row in lightcurve:
+        # source_file stores the full path to the per-epoch ecsv; stem matches fits stem
+        stem = Path(str(row['source_file'])).stem
+        positions[stem] = (float(row['X_IMAGE']) - 1, float(row['Y_IMAGE']) - 1)
+    return positions
+
+
 class FrontendGenerator:
     """Integrated frontend generator that uses templates and creates complete websites."""
     
@@ -228,15 +244,14 @@ class FrontendGenerator:
             if not directory.exists():
                 return
             
-            # Get all files with their modification times and access times
+            # Oldest-modified first. Not st_atime: relatime/noatime mounts
+            # (the Linux default) don't maintain it, so "least recently
+            # accessed" was effectively random.
             files_with_times = []
             for file_path in directory.rglob("*"):
                 if file_path.is_file():
                     stat_info = file_path.stat()
-                    # Use access time for LRU, modification time as secondary
-                    files_with_times.append((file_path, stat_info.st_atime, stat_info.st_mtime, stat_info.st_size))
-            
-            # Sort by access time (LRU) then by modification time (oldest first for removal)
+                    files_with_times.append((file_path, stat_info.st_mtime, stat_info.st_mtime, stat_info.st_size))
             files_with_times.sort(key=lambda x: (x[1], x[2]))
             
             # Remove old files beyond the keep limit
@@ -291,26 +306,26 @@ class FrontendGenerator:
             for file_path in cleanup_dir.rglob("*"):
                 if file_path.is_file() and file_path.suffix not in ['.json', '.html', '.js']:  # Preserve essential files
                     stat_info = file_path.stat()
-                    files_to_clean.append((file_path, stat_info.st_atime, stat_info.st_size))
+                    files_to_clean.append((file_path, stat_info.st_mtime, stat_info.st_size))
             
-            # Sort by access time (LRU - least recently used first)
+            # Oldest-modified first (st_atime is not maintained on
+            # relatime/noatime mounts -- see cleanup_old_files).
             files_to_clean.sort(key=lambda x: x[1])
             
-            # Remove files until we're under budget
+            # Remove files until we're under budget.  The remaining size is
+            # tracked from the measurement above rather than re-walking the
+            # whole tree after every unlink (thousands of files over budget
+            # meant thousands of full walks).
             files_removed = 0
             bytes_freed = 0
             
             for file_path, atime, size in files_to_clean:
+                if current_size - bytes_freed <= target_size:
+                    break
                 try:
                     file_path.unlink()
                     files_removed += 1
                     bytes_freed += size
-                    
-                    # Check if we're now under budget
-                    current_size = self.get_directory_size(self.output_dir)
-                    if current_size <= target_size:
-                        break
-                        
                 except Exception as e:
                     logger.debug(f"Could not remove {file_path}: {e}")
             
@@ -339,23 +354,10 @@ class FrontendGenerator:
         
         if current_size > self.max_dir_size_bytes:
             logger.warning(f"Website size exceeds limit ({self.max_dir_size_bytes / (1024**3):.1f} GB), cleaning up...")
-            
-            # Clean up cutouts first (usually the biggest space users)
-            cutouts_dir = self.output_dir / "cutouts"
-            if cutouts_dir.exists():
-                self.cleanup_old_files(cutouts_dir, keep_newest=50)
-            
-            # Clean up lightcurves
-            lc_dir = self.output_dir / "lightcurves"
-            if lc_dir.exists():
-                self.cleanup_old_files(lc_dir, keep_newest=20)
-            
-            # Check size again
-            new_size = self.get_directory_size(self.output_dir)
-            new_size_gb = new_size / (1024 * 1024 * 1024)
-            logger.info(f"Size after cleanup: {new_size_gb:.2f} GB")
-            
-            return new_size <= self.max_dir_size_bytes
+            # Delete oldest files only until back under budget. The previous
+            # keep_newest=50 wiped all but 50 cutouts of possibly thousands,
+            # which the next run then regenerated -- thrash, not a budget.
+            return self.enforce_disk_budget_strict(target_size_ratio=0.8)
         
         return True
     
@@ -570,11 +572,7 @@ class FrontendGenerator:
             try:
                 from astropy.table import Table as _Table
                 lc = _Table.read(lc_path, format='ascii.ecsv')
-                positions = {}
-                for row in lc:
-                    # source_file stores the full path to the per-epoch ecsv; stem matches fits stem
-                    src_stem = Path(str(row['source_file'])).stem
-                    positions[src_stem] = (float(row['X_IMAGE']), float(row['Y_IMAGE']))
+                positions = _lightcurve_pixel_positions(lc)
                 if positions:
                     epoch_positions[candidate_id] = positions
             except Exception as e:
@@ -1806,7 +1804,7 @@ class FrontendGenerator:
             return True
             
         except Exception as e:
-            logging.info(f"Error generating website: {e}")
+            logger.error(f"Error generating website: {e}", exc_info=True)
             return False
     
     def create_info_file(self, candidates):

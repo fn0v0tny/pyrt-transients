@@ -17,6 +17,7 @@ from pyrt_transient.detection.base import DetectionStrategy
 from pyrt_transient.detection.blind_multicatalog.catalog_query import CatalogLoader
 from pyrt_transient.detection.blind_multicatalog import catalog_match
 from pyrt_transient.detection.blind_multicatalog import clustering
+from pyrt_transient.detection.blind_multicatalog import forced
 from pyrt_transient.detection.blind_multicatalog import plotting
 
 
@@ -40,18 +41,17 @@ class BlindMulticatalogStrategy(DetectionStrategy):
         radius_check: float = 30.0,
         filter_pattern: Optional[str] = None,
         mag_change_threshold: float = 1.0,
-        add_strategy_fields_fn=None,
+        plot_lightcurves: bool = True,
     ) -> Tuple[Table, Dict]:
         """Returns (final_candidates_table, lightcurves_dict) -- see
         detection/base.py's module docstring for why this isn't
         List[Candidate] yet.
 
-        add_strategy_fields_fn: not wired to anything by default -- no
-        working implementation exists yet (see FUTURE_IDEAS.md, "Dead code
-        to remove" -- the old attempt's `strategy_v2` import never
-        resolved). Pass one explicitly if a caller has it; strategy fields
-        are simply skipped otherwise (same as
-        lightcurve.update_candidate_with_lightcurve_stats's default).
+        plot_lightcurves: Step 3 (per-candidate lightcurve plots + summary
+        file) is skipped when False. Detection output is identical either
+        way; the validation replay (validation/replay.py) turns it off
+        because it calls run() once per epoch count and only needs the
+        candidate table.
         """
         config = config or self.config
 
@@ -77,13 +77,19 @@ class BlindMulticatalogStrategy(DetectionStrategy):
             base_filename = get_base_filename(det_table, i)
             ecsv_path = self.data_dir / f"{base_filename}_transients.ecsv"
 
-            if ecsv_path.exists():
+            if clustering.epoch_is_cached(ecsv_path):
                 self.logger.info(f"Epoch {i+1}/{len(detection_tables)} already processed ({base_filename}), skipping")
                 continue
+            if ecsv_path.exists():
+                # Written by an earlier run that lost a catalogue or SkyBoT
+                # to an outage: recompute rather than inherit the outage.
+                self.logger.info(f"Epoch {i+1}/{len(detection_tables)} ({base_filename}) was cached "
+                                 f"as degraded, recomputing")
+                ecsv_path.unlink()
 
             self.logger.info(f"Processing detection table {i+1}/{len(detection_tables)} ({base_filename})")
 
-            transients = catalog_match.find_transients_multicatalog(
+            transients, failed_catalogs = catalog_match.find_transients_multicatalog(
                 self.catalog_loader,
                 config,
                 self.logger,
@@ -99,6 +105,9 @@ class BlindMulticatalogStrategy(DetectionStrategy):
             clustering.save_epoch_results(
                 transients, det_table, i, min_catalogs, min_quality,
                 self.data_dir, config=config, logger=self.logger,
+                degraded_reason=(
+                    f"reference catalogue(s) failed to load: {sorted(failed_catalogs)}"
+                    if failed_catalogs else None),
             )
 
         # Step 2: Enhanced cross-matching with lightcurve data collection
@@ -113,11 +122,18 @@ class BlindMulticatalogStrategy(DetectionStrategy):
             position_match_radius=position_match_radius,
             min_n_detections=min_n_detections,
             config=config,
-            add_strategy_fields_fn=add_strategy_fields_fn,
+        )
+
+        # Step 2b: stack-only candidates -- the stack is one epoch, so they
+        # cannot reach min_n_detections; admit them on a forced lightcurve
+        # from the stack's input frames (forced.py). No-op without a stack.
+        final_candidates, lightcurves = forced.admit_stack_candidates(
+            self.data_dir, detection_tables, final_candidates, lightcurves,
+            position_match_radius=position_match_radius, config=config, log=self.logger,
         )
 
         # Step 3: Generate lightcurve plots and analysis
-        if lightcurves:
+        if lightcurves and plot_lightcurves:
             self.logger.info("Step 3: Generating lightcurve analysis...")
             plotting.analyze_and_plot_lightcurves(
                 lightcurves, self.lightcurve_dir, config=config,

@@ -185,6 +185,8 @@ const transientViewer = {
           <div class="candidate-info">
             <div>Mag: ${Number(candidate.MAG_CALIB ?? candidate.mag_weighted_mean ?? 0).toFixed(2)}</div>
             <div>Quality: ${Number(candidate.quality_score ?? 0).toFixed(2)}</div>
+            ${candidate.p_real !== undefined && candidate.p_real !== null && !Number.isNaN(Number(candidate.p_real))
+              ? `<div>P(real): ${Number(candidate.p_real).toFixed(2)}</div>` : ''}
           </div>
           <div class="candidate-stats">
             <div>ΔMag: ${magDiff.toFixed(2)} | FWHM: ${fwhmRatio.toFixed(2)}</div>
@@ -551,7 +553,9 @@ const transientViewer = {
             <th>Type:</th>
             <td>${this.getCandidateTypeBadge(candidate.candidate_type || 'new')}</td>
             <th>Quality:</th>
-            <td>${Number(candidate.quality_score ?? 0).toFixed(3)}</td>
+            <td>${Number(candidate.quality_score ?? 0).toFixed(3)}${
+              candidate.p_real !== undefined && candidate.p_real !== null && !Number.isNaN(Number(candidate.p_real))
+                ? ` (P(real) ${Number(candidate.p_real).toFixed(2)})` : ''}</td>
           </tr>
           <tr>
             <th>RA:</th>

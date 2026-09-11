@@ -19,6 +19,10 @@ Core (always available):
 
     PipelineConfig            Full pipeline configuration (wraps DetectionConfig etc.)
     DetectionConfig
+    FollowupConfig
+
+    recommend_exposures       Post-detection enrichment: follow-up exposure time for
+                              each candidate, from the last real epoch's conditions
 
 Optional — pipeline entry point (requires pyrt_transient.pipeline_magic):
     Run directly:  python -m pyrt_transient.pipeline_magic <ecsv> ...
@@ -41,10 +45,12 @@ from pyrt_transient.catalog import (
     Catalog,
 )
 
-from pyrt_transient.config_trans import PipelineConfig, DetectionConfig
+from pyrt_transient.config_trans import PipelineConfig, DetectionConfig, FollowupConfig
 
 from pyrt_transient.detection.base import DetectionStrategy
 from pyrt_transient.detection.blind_multicatalog import BlindMulticatalogStrategy
+
+from pyrt_transient.followup import recommend_exposures, run_enrichment, write_exposure_report
 
 from pyrt_transient.io.observation_store import ObservationStore
 
@@ -69,6 +75,11 @@ __all__ = [
     # config
     "PipelineConfig",
     "DetectionConfig",
+    "FollowupConfig",
+    # followup enrichment
+    "recommend_exposures",
+    "run_enrichment",
+    "write_exposure_report",
     # version
     "__version__",
 ]

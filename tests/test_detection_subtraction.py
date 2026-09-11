@@ -341,7 +341,8 @@ def test_resolve_fwhm_px_falls_back_on_negative_and_missing():
 # ---------------------------------------------------------------------------
 
 def test_patch_sep_sum_circle_retries_without_clip_kwargs_on_typeerror():
-    import sep
+    from stdpipe import photometry as stdpipe_photometry
+    sep = stdpipe_photometry.sep
 
     calls = []
 
@@ -368,7 +369,8 @@ def test_patch_sep_sum_circle_retries_without_clip_kwargs_on_typeerror():
 
 
 def test_patch_sep_sum_circle_noop_when_kwargs_already_supported():
-    import sep
+    from stdpipe import photometry as stdpipe_photometry
+    sep = stdpipe_photometry.sep
 
     calls = []
 
@@ -392,7 +394,8 @@ def test_patch_sep_sum_circle_noop_when_kwargs_already_supported():
 
 
 def test_patch_sep_sum_circle_reraises_unrelated_typeerrors():
-    import sep
+    from stdpipe import photometry as stdpipe_photometry
+    sep = stdpipe_photometry.sep
 
     def fake_sum_circle(*args, **kwargs):
         raise TypeError("some unrelated argument problem")
