@@ -236,9 +236,9 @@ monitoring.
 - **Keep the service at nice 0.** A process can only lower its own
   priority.
 
-**Status page.** `tools/status_page.py` writes
-`<public dir>/observations/index.html`, plus `transient_status.json`. It
-shows:
+**Status page.** `<public dir>/observations/index.html` is a fixed page. Its
+JavaScript loads `transient_status.json` when opened and every 30 s after
+that, and redraws in place. It shows:
 
 - daemon health;
 - the frames being processed now;
@@ -246,8 +246,17 @@ shows:
 - the latest observations: frames, candidates, and the last job result;
 - recent failures.
 
-The entry point refreshes it in the background at the start and end of
-every frame, so no cron job is needed.
+**How the JSON is written.** The data (observations, daemon log, RTS2
+database) is outside the web root, so the server still writes the JSON,
+with `tools/status_page.py`. There is no cron job:
+
+- the entry point asks for a refresh at the start and end of every frame,
+  in the background;
+- requests are merged into at most one run per minute
+  (`PYRT_STATUS_MIN_INTERVAL`), and a request inside that minute is served
+  by one delayed run, so the latest state reaches the page within about a
+  minute;
+- a run takes about 0.4 s on lascaux50.
 
 - Set the title with `PYRT_STATUS_TITLE`, and the locations with
   `PYRT_STATUS_DATA_DIR`, `PYRT_STATUS_PUBLIC_DIR` and

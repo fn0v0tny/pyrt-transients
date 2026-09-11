@@ -27,9 +27,10 @@ Without the database (PYRT_TARGETS_DB="" or unreachable), the header's
 GRB_RA and OBJECT decide the same way.
 
 For the status page (tools/status_page.py), the script leaves a marker in
-<data dir>/.running/ while the frame runs. It also refreshes the page at the
-start and the end, in the background, so the frame never waits for it.
-PYRT_STATUS_PAGE=0 turns that off.
+<data dir>/.running/ while the frame runs. It asks for a refresh of the
+page's JSON at the start and the end, in the background, so the frame never
+waits for it. status_page.py merges those requests into at most one run a
+minute. PYRT_STATUS_PAGE=0 turns the requests off.
 """
 import json
 import os
