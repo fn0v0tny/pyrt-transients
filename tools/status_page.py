@@ -393,7 +393,7 @@ def main(argv=None):
     ap.add_argument("--daemon-log", default=os.environ.get("PYRT_STATUS_DAEMON_LOG",
                                                            home / "logs" / "transient_daemon.log"))
     ap.add_argument("--rows", type=int, default=40)
-    ap.add_argument("--title")
+    ap.add_argument("--title", default=os.environ.get("PYRT_STATUS_TITLE"))
     args = ap.parse_args(argv)
 
     data_dir = Path(args.data_dir)
