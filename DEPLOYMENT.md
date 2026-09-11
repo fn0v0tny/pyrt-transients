@@ -168,12 +168,17 @@ Environment=PYRT_TRANSIENT_LOG_DIR=/srv/pyrt-transient/logs
 Environment=PYRT_TRANSIENT_PIPELINE_ARGS=--config=/etc/pyrt-transient/site.yaml
 Environment=PYRT_TRANSIENT_MAX_PARALLEL=2
 Environment=OMP_NUM_THREADS=2 OPENBLAS_NUM_THREADS=2 MKL_NUM_THREADS=2 NUMEXPR_NUM_THREADS=2
-# Lower priority than interactive work. Keep comments on their own lines:
-# systemd does not strip a trailing "# ..." and throws away the whole value
-# (lascaux50's CPUQuota=200% has been ignored for exactly this reason).
-Nice=10
-IOSchedulingClass=best-effort
-IOSchedulingPriority=7
+# Priority per frame: tools/pipeline_entry.py runs GRB-type frames at nice 0
+# and everything else at nice 10 with low IO priority (see "GRB frames
+# first" below). A process can only lower its own priority, so the unit
+# itself stays at nice 0.
+Environment=PYRT_TRANSIENT_PIPELINE=/home/pyrt/venv/bin/python /home/pyrt/src/pyrt-transient/tools/pipeline_entry.py
+Environment=PYRT_STATUS_DATA_DIR=/srv/pyrt-transient/data
+Environment=PYRT_STATUS_PUBLIC_DIR=/srv/pyrt-transient/public
+Environment=PYRT_STATUS_DAEMON_LOG=/srv/pyrt-transient/logs/transient_daemon.log
+# Keep comments on their own lines: systemd does not strip a trailing
+# "# ..." and throws away the whole value (lascaux50's CPUQuota=200% has
+# been ignored for exactly this reason).
 CPUQuota=200%
 # lascaux50 runs with 1 GB. Raise it if jobs die with exit -9 while stacking.
 MemoryMax=2G
@@ -193,7 +198,8 @@ Check the last command's output:
 
 - `CPUQuotaPerSecUSec=2s` means the quota is applied; `infinity` means
   systemd rejected it.
-- `Nice=10` should be listed.
+- `Nice=0` should be listed. The priority is set per frame, not for the
+  whole service.
 
 **Without root:** the same unit works as a user unit.
 
@@ -205,9 +211,49 @@ Check the last command's output:
 `Nice=` and `IOScheduling*` work in user units. `CPUQuota`/`MemoryMax`
 need cgroup delegation, so check them with `systemctl --user show`.
 
-**If the unit can't be changed:** do what lascaux50 does, and make the
-pipeline entry point lower its own priority before it imports anything.
-See `~/bin/pipeline_magic.py` in section 9.
+**GRB frames first.** `tools/pipeline_entry.py` is the per-frame entry
+point. Point `PYRT_TRANSIENT_PIPELINE` at it, as in the unit above. Before
+the package is imported, it sets the frame's priority:
+
+| target | nice | ionice (best-effort) | BLAS threads |
+|---|---|---|---|
+| GRB-type | 0 | 4 | 4 |
+| everything else | 10 | 7 | 2 |
+
+Under load a burst frame then gets about ten times the CPU share of routine
+monitoring.
+
+- **How the target is judged:**
+  - by the ECSV's `TARGET` id, looked up in the RTS2 database
+    (`stars.targets`) for every frame, because names and numbers change;
+  - GRB-type means type `G` (the automatic GRB/SVOM/EP/IceCube/GCN
+    triggers), or a current name of that kind: manual follow-ups such as
+    "GRB 260310A/AT2026fgk" are type `O`.
+- **Read-only.** The lookup is a single `SELECT` in a read-only `psql`
+  session.
+- **Without the database:** a site without RTS2 sets `PYRT_TARGETS_DB=`
+  (empty), and the header's `GRB_RA` and `OBJECT` decide instead.
+- **Keep the service at nice 0.** A process can only lower its own
+  priority.
+
+**Status page.** `tools/status_page.py` writes
+`<public dir>/observations/index.html`, plus `transient_status.json`. It
+shows:
+
+- daemon health;
+- the frames being processed now;
+- the latest GRB observation and its best candidates;
+- the latest observations: frames, candidates, and the last job result;
+- recent failures.
+
+The entry point refreshes it in the background at the start and end of
+every frame, so no cron job is needed.
+
+- Set the title with `PYRT_STATUS_TITLE`, and the locations with
+  `PYRT_STATUS_DATA_DIR`, `PYRT_STATUS_PUBLIC_DIR` and
+  `PYRT_STATUS_DAEMON_LOG`.
+- A failed refresh leaves its traceback in
+  `<data dir>/.status_page.error`.
 
 **Where the logs go:**
 
@@ -426,12 +472,17 @@ have erased them (see section 10).
 - **Throttle:**
   - The unit's `CPUQuota=200%  # ...` line is ignored by systemd
     (`CPUQuotaPerSecUSec=infinity`). `MemoryLimit=1G` does apply.
-  - Changing the unit needs root. Until someone with root moves the
-    comment to its own line and adds `Nice=10`, the throttle lives in
-    `~/bin/pipeline_magic.py` (since 2026-09-11): nice 10, ionice
-    best-effort 7, and `*_NUM_THREADS=2`, all set before the package is
-    imported.
-  - The previous wrapper is `~/bin/pipeline_magic.py.bak-20260911`.
+  - Changing the unit needs root, so the throttle lives in
+    `~/bin/pipeline_magic.py`.
+  - Since 2026-09-11 that wrapper runs `tools/pipeline_entry.py` from the
+    checkout, which sets the priority per frame: GRB-type frames get
+    nice 0, everything else nice 10 (section 5, "GRB frames first"). It
+    also sets `PYRT_STATUS_TITLE`.
+  - Previous wrappers: `~/bin/pipeline_magic.py.bak-20260911` (the
+    original) and `.bak-20260911b` (nice 10 for every frame).
+- **Status page:** `https://lascaux50.asu.cas.cz/f/observations/`.
+  `/var/www/f` links to `~/public_html`; Apache's userdir module is not
+  enabled, so the page is not reachable under `~fnovotny`.
 - **2026-09-11 deploy:**
   - The checkout went from 468c9c1 to 74060f1.
   - Its two uncommitted host edits (templates `_patch_get_skycells`, the
