@@ -1,0 +1,408 @@
+#!/usr/bin/env python3
+"""Status page for a pyrt-transient host: the latest observations, their
+processing status, and the latest GRB observation.
+
+  status_page.py [--data-dir DIR] [--public-dir DIR] [--out-dir DIR]
+                 [--daemon-log FILE] [--rows N] [--title TEXT]
+
+Defaults: ~/transient_work, ~/public_html, <public-dir>/observations and
+~/logs/transient_daemon.log, overridable with PYRT_STATUS_DATA_DIR,
+PYRT_STATUS_PUBLIC_DIR, PYRT_STATUS_OUT_DIR and PYRT_STATUS_DAEMON_LOG.
+
+Writes <out-dir>/index.html, which reloads itself every minute, and
+<out-dir>/transient_status.json. The per-observation sites it links are
+<public-dir>/obs_<id>/.
+
+Targets: names and types come from the RTS2 database on every run (see
+pipeline_entry.lookup_targets), because they change. The only thing cached
+(<data-dir>/.status_cache.json) is what an observation's own ECSV header
+says, keyed by that file's name.
+
+It uses only the standard library and psql. It reads just the
+observations it shows plus the end of the daemon log. tools/pipeline_entry.py
+runs it at the start and end of every frame. Runs that overlap collapse
+into one: a run that finds another in progress leaves a flag, and the run in
+progress goes once more.
+
+Status of an observation:
+- "running" while a frame of it is being processed (the markers
+  pipeline_entry.py writes);
+- otherwise the daemon's last result for it: done, failed or timeout;
+- "-" if that result is no longer in the part of the log that is read.
+"""
+import argparse
+import fcntl
+import html
+import json
+import os
+import re
+import socket
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import pipeline_entry  # noqa: E402  (one header reader, target lookup and GRB test for both)
+
+LOG_TAIL_BYTES = 4 << 20
+GRB_SEARCH_CHUNK = 100
+_TS = r"(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d),\d+"
+STATUS_RE = re.compile(_TS + r" - INFO: Status: (.*)$")
+JOB_RE = re.compile(_TS + r" - (?:INFO|ERROR): Batch (\S+?)(?: \[\d+/\d+\])?: job \S+ "
+                    r"(succeeded|failed \(exit -?\d+\)|timed out|failed: .*)$")
+CANDIDATE_COLUMNS = ("ALPHA_J2000", "DELTA_J2000", "MAG_CALIB", "quality_score",
+                     "n_detections", "candidate_type")
+
+
+def _utc(ts):
+    return datetime.fromtimestamp(ts, timezone.utc).strftime("%Y-%m-%d %H:%M")
+
+
+def _ago(seconds):
+    seconds = max(0, int(seconds))
+    for unit, size in (("d", 86400), ("h", 3600), ("min", 60)):
+        if seconds >= size:
+            return f"{seconds // size} {unit} ago"
+    return "just now"
+
+
+def _float(value, default=float("nan")):
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def read_ipac(path, columns=CANDIDATE_COLUMNS):
+    """Rows of an astropy ascii.ipac table as {column: str}, for `columns`."""
+    try:
+        lines = Path(path).read_text(errors="replace").splitlines()
+    except OSError:
+        return []
+    header = next((line for line in lines if line.startswith("|")), None)
+    if header is None:
+        return []
+    bars = [i for i, c in enumerate(header) if c == "|"]
+    names = [header[a + 1:b].strip() for a, b in zip(bars, bars[1:])]
+    wanted = {name: k for k, name in enumerate(names) if name in columns}
+    rows = []
+    for line in lines:
+        if not line.strip() or line[0] in "|\\":
+            continue
+        rows.append({name: line[bars[k] + 1:bars[k + 1] + 1].strip()
+                     for name, k in wanted.items()})
+    return rows
+
+
+def read_daemon_log(path):
+    """Last status line, last job result per observation, recent failures."""
+    info = {"status": None, "last_job": {}, "failures": []}
+    try:
+        with open(path, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            fh.seek(max(0, fh.tell() - LOG_TAIL_BYTES))
+            text = fh.read().decode("utf-8", "replace")
+    except OSError:
+        return info
+    for line in text.splitlines()[1:]:  # the first one may be cut
+        m = STATUS_RE.match(line)
+        if m:
+            info["status"] = {"time": m.group(1), "text": m.group(2)}
+            continue
+        m = JOB_RE.match(line)
+        if m:
+            when, obs, raw = m.groups()
+            outcome = "done" if raw == "succeeded" else "timeout" if raw == "timed out" else "failed"
+            info["last_job"][obs] = {"time": when, "outcome": outcome}
+            if outcome != "done":
+                info["failures"].append({"time": when, "obs_id": obs, "outcome": raw})
+    info["failures"] = info["failures"][-10:][::-1]
+    return info
+
+
+def running_frames(data_dir):
+    frames = []
+    for marker in (data_dir / ".running").glob("*.json"):
+        try:
+            entry = json.loads(marker.read_text())
+            os.kill(int(entry["pid"]), 0)
+        except (OSError, ValueError, KeyError):
+            continue  # finished, or a marker left by a killed run
+        frames.append(entry)
+    return sorted(frames, key=lambda e: e.get("started", 0))
+
+
+def _first_ecsv(obs_dir):
+    try:
+        with os.scandir(obs_dir) as it:
+            for entry in it:
+                if entry.name.endswith(".ecsv") and not entry.name.endswith("_transients.ecsv"):
+                    return entry.name
+    except OSError:
+        pass
+    return None
+
+
+def _frame_time(name):
+    """'20260909011221-634-i-020-df.ecsv' -> '2026-09-09 01:12:21'."""
+    s = name[:14]
+    return f"{s[:4]}-{s[4:6]}-{s[6:8]} {s[8:10]}:{s[10:12]}:{s[12:14]}" if s.isdigit() else ""
+
+
+def header_facts(obs_dir, cache):
+    """What the observation's own ECSV header says, cached by that file.
+
+    A file's header does not change. If the file is gone (the directory
+    was cleaned up or reused), the header is read again.
+    """
+    cached = cache.get(obs_dir.name)
+    if cached and (obs_dir / cached["file"]).exists():
+        return cached
+    ecsv = _first_ecsv(obs_dir)
+    if not ecsv:
+        return {"file": "", "target": None, "object": "", "grb_ra": None}
+    meta = pipeline_entry.read_header(obs_dir / ecsv)
+    facts = {"file": ecsv, "target": pipeline_entry.target_id(meta), "object": meta.get("OBJECT", ""),
+             "grb_ra": meta.get("GRB_RA"), "grb_dec": meta.get("GRB_DEC"), "grb_err": meta.get("GRB_ERR")}
+    cache[obs_dir.name] = facts
+    return facts
+
+
+def classify(facts, targets):
+    """(current target name, GRB-type?) from the database, else the header."""
+    target = targets.get(facts["target"]) if facts["target"] is not None else None
+    meta = {"OBJECT": facts["object"], **({"GRB_RA": facts["grb_ra"]} if facts.get("grb_ra") else {})}
+    return (target["name"] if target else facts["object"]), pipeline_entry.is_grb(meta, target)
+
+
+def describe(obs_dir, facts, targets, with_candidates=0):
+    name, grb = classify(facts, targets)
+    try:
+        processed = json.loads((obs_dir / "detection_metadata.json").read_text()).get("processed_files", [])
+    except (OSError, ValueError):
+        processed = []
+    frames = sorted(processed)
+    rows = read_ipac(obs_dir / "candidates.tbl")
+    for row in rows:
+        row["q"] = _float(row.get("quality_score"), 0.0)
+    summary = {"obs_id": obs_dir.name[4:], "object": name, "grb": grb, "target": facts["target"],
+               "grb_ra": facts.get("grb_ra"), "grb_dec": facts.get("grb_dec"), "grb_err": facts.get("grb_err"),
+               "frames": len(frames), "first_frame": _frame_time(frames[0]) if frames else "",
+               "last_frame": _frame_time(frames[-1]) if frames else "",
+               "updated": obs_dir.stat().st_mtime,
+               "candidates": len(rows), "reliable": sum(r["q"] >= 1 for r in rows)}
+    if with_candidates:
+        summary["top"] = sorted(rows, key=lambda r: -r["q"])[:with_candidates]
+    return summary
+
+
+def collect(data_dir, public_dir, daemon_log, rows):
+    cache_path = data_dir / ".status_cache.json"
+    try:
+        cache = json.loads(cache_path.read_text())
+    except (OSError, ValueError):
+        cache = {}
+    try:
+        with os.scandir(data_dir) as it:
+            obs_dirs = [(e.stat().st_mtime, Path(e.path)) for e in it
+                        if e.name.startswith("obs_") and e.is_dir()]
+    except OSError:
+        obs_dirs = []
+    obs_dirs = [p for _, p in sorted(obs_dirs, reverse=True)]
+
+    targets = {}
+
+    def facts_for(dirs):
+        facts = [header_facts(d, cache) for d in dirs]
+        missing = {f["target"] for f in facts if f["target"] is not None} - targets.keys()
+        targets.update(pipeline_entry.lookup_targets(missing))
+        return facts
+
+    shown = obs_dirs[:rows]
+    latest = [describe(d, f, targets) for d, f in zip(shown, facts_for(shown))]
+    latest_grb = None
+    for start in range(0, len(obs_dirs), GRB_SEARCH_CHUNK):  # newest first
+        chunk = obs_dirs[start:start + GRB_SEARCH_CHUNK]
+        for d, f in zip(chunk, facts_for(chunk)):
+            if classify(f, targets)[1]:
+                latest_grb = describe(d, f, targets, with_candidates=5)
+                break
+        if latest_grb:
+            break
+
+    log = read_daemon_log(daemon_log)
+    running = running_frames(data_dir)
+    running_obs = {r.get("obs_id") for r in running}
+    for obs in latest + ([latest_grb] if latest_grb else []):
+        job = log["last_job"].get(obs["obs_id"])
+        obs["status"] = ("running" if obs["obs_id"] in running_obs else
+                         job["outcome"] if job else "-")
+        obs["last_job"] = job["time"] if job else ""
+        obs["site"] = (f"../obs_{obs['obs_id']}/index.html"
+                       if (public_dir / f"obs_{obs['obs_id']}" / "index.html").exists() else "")
+    try:
+        tmp = cache_path.with_name(".status_cache.tmp")
+        tmp.write_text(json.dumps(cache))
+        os.replace(tmp, cache_path)
+    except OSError:
+        pass
+    return {"generated": time.time(), "daemon": log["status"], "targets_db": bool(targets),
+            "running": running, "latest_grb": latest_grb, "observations": latest,
+            "failures": log["failures"]}
+
+
+CSS = """
+:root{--bg:#f7f7f5;--fg:#1d1d1f;--muted:#6b6b70;--card:#fff;--line:#e3e3e0;--grb:#b3261e;
+--grb-bg:#fdecea;--ok:#1b7f3b;--run:#1f5fbf;--bad:#b3261e}
+@media (prefers-color-scheme:dark){:root{--bg:#141416;--fg:#ececef;--muted:#9a9aa2;--card:#1d1d21;
+--line:#2e2e34;--grb:#ff8a80;--grb-bg:#3a1d1b;--ok:#6fd08c;--run:#8ab4ff;--bad:#ff8a80}}
+*{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);
+font:14px/1.45 system-ui,-apple-system,"Segoe UI",sans-serif}
+main{max-width:1100px;margin:0 auto;padding:24px 16px 48px}
+h1{font-size:22px;margin:0 0 4px}h2{font-size:16px;margin:28px 0 10px}
+.meta,.muted{color:var(--muted)}.card{background:var(--card);border:1px solid var(--line);
+border-radius:10px;padding:14px 16px}.grb{border-left:4px solid var(--grb)}
+.scroll{overflow-x:auto}table{border-collapse:collapse;width:100%;background:var(--card)}
+th,td{padding:6px 10px;border-bottom:1px solid var(--line);text-align:left;white-space:nowrap}
+th{font-weight:600;color:var(--muted);font-size:12px;text-transform:uppercase;letter-spacing:.03em}
+td.obj{white-space:normal;min-width:180px}.num{text-align:right;font-variant-numeric:tabular-nums}
+.tag{display:inline-block;padding:1px 7px;border-radius:9px;font-size:12px;font-weight:600}
+.t-grb{background:var(--grb-bg);color:var(--grb)}.s-done{color:var(--ok)}.s-running{color:var(--run)}
+.s-failed,.s-timeout,.warn{color:var(--bad)}a{color:var(--run)}ul{padding-left:18px;margin:6px 0}
+"""
+
+
+def _e(value):
+    return html.escape(str(value if value is not None else ""))
+
+
+def _status(s):
+    return f'<span class="s-{_e(s)}">{_e(s)}</span>'
+
+
+def _daemon_line(daemon, now):
+    if not daemon:
+        return '<span class="warn">no daemon status found in the log</span>'
+    try:
+        when = datetime.strptime(daemon["time"], "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc)
+        age = now - when.timestamp()
+    except ValueError:
+        age = 0
+    stale = f' <span class="warn">(last status {_ago(age)}: daemon down?)</span>' if age > 300 else ""
+    return f"daemon: {_e(daemon['text'])}{stale}"
+
+
+def render(status, title):
+    now = status["generated"]
+    db = "" if status["targets_db"] else " &middot; <span class=warn>target database unavailable, names from file headers</span>"
+    out = [f"<!doctype html><html lang=en><head><meta charset=utf-8>"
+           f"<meta name=viewport content='width=device-width,initial-scale=1'>"
+           f"<meta http-equiv=refresh content=60><title>{_e(title)}</title><style>{CSS}</style></head>"
+           f"<body><main><h1>{_e(title)}</h1>"
+           f"<p class=meta>Updated {_utc(now)} UTC &middot; {_daemon_line(status['daemon'], now)}{db}</p>"]
+
+    g = status["latest_grb"]
+    out.append("<h2>Latest GRB observation</h2>")
+    if g:
+        pos = (f" &middot; trigger position {_e(g['grb_ra'])}, {_e(g['grb_dec'])} "
+               f"(&plusmn;{_e(g['grb_err'])}&deg;)" if g.get("grb_ra") else "")
+        site = f" &middot; <a href='{_e(g['site'])}'>candidate page</a>" if g["site"] else ""
+        out.append(f"<div class='card grb'><strong>{_e(g['object']) or 'obs ' + _e(g['obs_id'])}</strong>"
+                   f"<div class=muted>obs {_e(g['obs_id'])} &middot; target {_e(g['target'])} &middot; "
+                   f"{g['frames']} frames, {_e(g['first_frame'])} &ndash; {_e(g['last_frame'])} UTC{pos} "
+                   f"&middot; {_status(g['status'])}{site}</div>"
+                   f"<p>{g['candidates']} candidates, {g['reliable']} with quality &ge; 1</p>")
+        if g.get("top"):
+            out.append("<div class=scroll><table><tr><th>RA</th><th>Dec</th><th class=num>mag</th>"
+                       "<th class=num>quality</th><th class=num>detections</th><th>type</th></tr>")
+            for c in g["top"]:
+                out.append(f"<tr><td>{_e(c.get('ALPHA_J2000'))}</td><td>{_e(c.get('DELTA_J2000'))}</td>"
+                           f"<td class=num>{_e(c.get('MAG_CALIB'))}</td><td class=num>{c['q']:.2f}</td>"
+                           f"<td class=num>{_e(c.get('n_detections'))}</td><td>{_e(c.get('candidate_type'))}</td></tr>")
+            out.append("</table></div>")
+        out.append("</div>")
+    else:
+        out.append("<p class=muted>No GRB observation found.</p>")
+
+    out.append("<h2>Running now</h2>")
+    if status["running"]:
+        out.append("<ul>")
+        for r in status["running"]:
+            tag = " <span class='tag t-grb'>GRB priority</span>" if r.get("grb") else ""
+            out.append(f"<li>obs {_e(r.get('obs_id'))} &middot; {_e(r.get('object'))} &middot; "
+                       f"{_e(r.get('frame'))} &middot; started {_ago(now - r.get('started', now))}{tag}</li>")
+        out.append("</ul>")
+    else:
+        out.append("<p class=muted>Nothing is being processed.</p>")
+
+    out.append("<h2>Latest observations</h2><div class=scroll><table><tr><th>obs</th><th>target</th>"
+               "<th class=num>frames</th><th>frames (UTC)</th><th class=num>candidates</th>"
+               "<th class=num>q&nbsp;&ge;&nbsp;1</th><th>status</th><th>updated</th></tr>")
+    for o in status["observations"]:
+        obs = f"<a href='{_e(o['site'])}'>{_e(o['obs_id'])}</a>" if o["site"] else _e(o["obs_id"])
+        tag = " <span class='tag t-grb'>GRB</span>" if o["grb"] else ""
+        span = f"{_e(o['first_frame'][5:16])} &ndash; {_e(o['last_frame'][11:16])}" if o["frames"] else ""
+        out.append(f"<tr><td>{obs}</td><td class=obj>{_e(o['object'])}{tag}</td>"
+                   f"<td class=num>{o['frames']}</td><td>{span}</td><td class=num>{o['candidates']}</td>"
+                   f"<td class=num>{o['reliable']}</td><td>{_status(o['status'])}</td>"
+                   f"<td class=muted>{_ago(now - o['updated'])}</td></tr>")
+    out.append("</table></div>")
+
+    if status["failures"]:
+        out.append("<h2>Recent failures</h2><ul>")
+        for f in status["failures"]:
+            out.append(f"<li><span class=muted>{_e(f['time'])}</span> obs {_e(f['obs_id'])}: {_e(f['outcome'])}</li>")
+        out.append("</ul>")
+    out.append("<p class=muted>Archive validation: <a href='../grb_replay_validation/'>GRB replay results</a> "
+               "&middot; <a href='transient_status.json'>status as JSON</a></p></main></body></html>")
+    return "\n".join(out)
+
+
+def _write(path, text):
+    tmp = path.with_name(f".{path.name}.tmp")
+    tmp.write_text(text)
+    os.replace(tmp, path)
+
+
+def generate(data_dir, public_dir, daemon_log, rows=40, title=None, out_dir=None):
+    data_dir, public_dir = Path(data_dir), Path(public_dir)
+    out_dir = Path(out_dir) if out_dir else public_dir / "observations"
+    status = collect(data_dir, public_dir, Path(daemon_log), rows)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    _write(out_dir / "index.html",
+           render(status, title or f"Transient pipeline on {socket.gethostname()}"))
+    _write(out_dir / "transient_status.json", json.dumps(status, indent=1, default=str))
+    return status
+
+
+def main(argv=None):
+    home = Path.home()
+    ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
+    ap.add_argument("--data-dir", default=os.environ.get("PYRT_STATUS_DATA_DIR", home / "transient_work"))
+    ap.add_argument("--public-dir", default=os.environ.get("PYRT_STATUS_PUBLIC_DIR", home / "public_html"))
+    ap.add_argument("--out-dir", default=os.environ.get("PYRT_STATUS_OUT_DIR"))
+    ap.add_argument("--daemon-log", default=os.environ.get("PYRT_STATUS_DAEMON_LOG",
+                                                           home / "logs" / "transient_daemon.log"))
+    ap.add_argument("--rows", type=int, default=40)
+    ap.add_argument("--title")
+    args = ap.parse_args(argv)
+
+    data_dir = Path(args.data_dir)
+    data_dir.mkdir(parents=True, exist_ok=True)
+    lock_path, again = data_dir / ".status_page.lock", data_dir / ".status_page.again"
+    with open(lock_path, "w") as lock:
+        try:
+            fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except BlockingIOError:
+            again.touch()  # the run in progress will go once more
+            return
+        while True:
+            again.unlink(missing_ok=True)
+            generate(data_dir, args.public_dir, args.daemon_log, args.rows, args.title, args.out_dir)
+            if not again.exists():
+                break
+
+
+if __name__ == "__main__":
+    main()
