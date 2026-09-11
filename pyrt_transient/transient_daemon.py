@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-# /home/fnovotny/bin/transient_daemon.py
 """
 Asynchronous transient detection daemon.
 Receives requests via Unix socket, copies files, responds immediately,
@@ -8,11 +7,24 @@ then processes transients in background with process limiting.
 Debounce: when images arrive in rapid succession for the same observation,
 the daemon waits DEBOUNCE_SECONDS after the last arrival before launching
 the pipeline.  This collapses N rapid-fire invocations into a single run.
+
+Configuration is by environment variable (all optional):
+
+  PYRT_TRANSIENT_SOCKET      Unix socket path      (default ~/transient_daemon.sock)
+  PYRT_TRANSIENT_WORK_DIR    staging directory     (default ~/transient_work)
+  PYRT_TRANSIENT_LOG_DIR     log directory         (default ~/logs)
+  PYRT_TRANSIENT_PIPELINE    pipeline command      (default: the installed
+                             `pyrt-transient-pipeline` entry point)
+  PYRT_TRANSIENT_PIPELINE_ARGS  extra args appended to every pipeline call,
+                             e.g. "--config=/etc/pyrt/transient.yaml"
+  PYRT_TRANSIENT_MAX_PARALLEL   concurrent pipeline runs (default 4)
+  PYRT_TRANSIENT_DEBOUNCE_S     debounce window, seconds (default 30)
 """
 
 import socket
 import os
 import json
+import shlex
 import shutil
 import subprocess
 import logging
@@ -23,18 +35,36 @@ import sys
 from pathlib import Path
 from datetime import datetime
 from concurrent.futures import ThreadPoolExecutor
-from queue import Queue
 
-# Configuration
-SOCKET_PATH = "/home/fnovotny/transient_daemon.sock"
-WORK_DIR = Path("/home/fnovotny/transient_work")
-LOG_DIR = Path("/home/fnovotny/logs")
-MAX_PARALLEL_PROCESSES = 4  # Limit concurrent transient detections
-PIPELINE_SCRIPT = "/home/fnovotny/bin/pipeline_magic.py"
-DEBOUNCE_SECONDS = 30  # Wait this long after last image before launching pipeline
+_HOME = Path.home()
+SOCKET_PATH = os.environ.get("PYRT_TRANSIENT_SOCKET", str(_HOME / "transient_daemon.sock"))
+WORK_DIR = Path(os.environ.get("PYRT_TRANSIENT_WORK_DIR", _HOME / "transient_work"))
+LOG_DIR = Path(os.environ.get("PYRT_TRANSIENT_LOG_DIR", _HOME / "logs"))
+MAX_PARALLEL_PROCESSES = int(os.environ.get("PYRT_TRANSIENT_MAX_PARALLEL", "4"))
+DEBOUNCE_SECONDS = float(os.environ.get("PYRT_TRANSIENT_DEBOUNCE_S", "30"))
+PIPELINE_TIMEOUT_S = 900
+
+
+def resolve_pipeline_command():
+    """The command that runs one epoch through the pipeline.
+
+    The installed console script (`pyrt-transient-pipeline`, see
+    pyproject.toml) by default; PYRT_TRANSIENT_PIPELINE overrides it with
+    any executable or `python -m ...` string. Previously this was a
+    hard-coded path into one user's home directory.
+    """
+    override = os.environ.get("PYRT_TRANSIENT_PIPELINE")
+    if override:
+        cmd = shlex.split(override)
+    else:
+        entry = shutil.which("pyrt-transient-pipeline")
+        cmd = [entry] if entry else [sys.executable, "-m", "pyrt_transient.pipeline_magic"]
+    cmd += shlex.split(os.environ.get("PYRT_TRANSIENT_PIPELINE_ARGS", ""))
+    return cmd
+
 
 # Setup logging
-LOG_DIR.mkdir(exist_ok=True)
+LOG_DIR.mkdir(parents=True, exist_ok=True)
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s: %(message)s',
@@ -45,25 +75,44 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
+
+def _recv_json(conn, max_bytes=1 << 20):
+    """Read one JSON request: the client may send it in several segments,
+    so read until the socket is closed for writing or the buffer parses."""
+    chunks = []
+    total = 0
+    while total < max_bytes:
+        data = conn.recv(4096)
+        if not data:
+            break
+        chunks.append(data)
+        total += len(data)
+        try:
+            return json.loads(b"".join(chunks).decode())
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            continue  # incomplete so far
+    if not chunks:
+        return None
+    return json.loads(b"".join(chunks).decode())  # raises on genuinely bad JSON
+
+
 class TransientDaemon:
     def __init__(self):
         self.work_dir = WORK_DIR
-        self.work_dir.mkdir(exist_ok=True)
+        self.work_dir.mkdir(parents=True, exist_ok=True)
+        self.pipeline_cmd = resolve_pipeline_command()
 
         # Thread pool for background processing
         self.executor = ThreadPoolExecutor(max_workers=MAX_PARALLEL_PROCESSES)
         self.active_jobs = 0
-        self.jobs_lock = threading.Lock()
-
-        # Job queue and statistics
-        self.job_queue = Queue()
         self.processed_count = 0
         self.failed_count = 0
+        self.jobs_lock = threading.Lock()  # guards the three counters above
 
-        # Debounce state: obs_dir -> {timer, files}
+        # Debounce state: obs_key -> {timer, files}
         self._debounce_lock = threading.Lock()
-        self._debounce_timers = {}  # obs_dir_str -> threading.Timer
-        self._debounce_files = {}   # obs_dir_str -> [(ecsv, fits, job_dir), ...]
+        self._debounce_timers = {}  # obs_key -> threading.Timer
+        self._debounce_files = {}   # obs_key -> [(ecsv, fits, job_dir), ...]
 
         # Setup signal handlers
         signal.signal(signal.SIGTERM, self._signal_handler)
@@ -74,10 +123,16 @@ class TransientDaemon:
         """Handle shutdown signals."""
         logger.info(f"Received signal {signum}, shutting down...")
         self.running = False
-        # Fire all pending debounce timers immediately
+        # Fire all pending debounce batches now rather than waiting out
+        # their timers -- cancelling them (as this used to) silently dropped
+        # every image received in the last DEBOUNCE_SECONDS and leaked its
+        # job directory.
         with self._debounce_lock:
             for timer in self._debounce_timers.values():
                 timer.cancel()
+            pending_keys = list(self._debounce_timers)
+        for obs_key in pending_keys:
+            self._debounce_fire(obs_key)
         self.executor.shutdown(wait=True)
         try:
             os.unlink(SOCKET_PATH)
@@ -87,37 +142,26 @@ class TransientDaemon:
 
     def _generate_work_id(self) -> str:
         """Generate unique work ID for this job."""
-        timestamp = datetime.now().strftime("%Y%m%d%H%M%S")
+        timestamp = datetime.now().strftime("%Y%m%d%H%M%S%f")
         return f"job_{timestamp}_{os.getpid()}"
 
-    def _get_obs_dir(self, ecsv_path: str) -> str:
-        """Derive observation group key from ecsv path.
-
-        The pipeline groups files by observation ID (from ECSV metadata)
-        into obs_<id> dirs.  We read the same metadata here so that all
-        images for the same observation share a single debounce key.
-
-        Falls back to the full filename stem if reading metadata fails
-        (each image gets its own key — the fcntl lock still ensures
-        correctness, just without the debounce benefit).
+    def _get_obs_key(self, ecsv_path: str) -> str:
+        """Debounce key for an incoming file: the same observation ID the
+        pipeline itself derives (io.observation_store.extract_observation_id),
+        so every image of one observation shares one key. Falls back to the
+        filename stem if the metadata can't be read -- each image then gets
+        its own key (no debounce benefit; the pipeline's own lock still
+        serialises correctly).
         """
         try:
-            from astropy.table import Table
-            t = Table.read(ecsv_path, format='ascii.ecsv')
-            if t.meta:
-                for field in ('OBSID', 'OBS_ID', 'OBSERVATION_ID', 'FIELD_ID'):
-                    if field in t.meta:
-                        obs_id = str(t.meta[field]).split('.')[0].strip()
-                        if obs_id:
-                            logger.info(f"Debounce key from metadata {field}={obs_id}: {Path(ecsv_path).name}")
-                            return obs_id
+            from pyrt_transient.io.observation_store import extract_observation_id
+            obs_id = extract_observation_id(ecsv_path)
+            logger.info(f"Debounce key {obs_id}: {Path(ecsv_path).name}")
+            return obs_id
         except Exception as e:
-            logger.warning(f"Could not read ECSV metadata for debounce key: {e}")
-
-        # Fallback: each file gets its own key (no debounce grouping,
-        # but fcntl lock still serialises correctly)
+            logger.warning(f"Could not derive observation ID for debounce key: {e}")
         stem = Path(ecsv_path).stem
-        logger.warning(f"No observation ID in metadata, using filename as debounce key: {stem}")
+        logger.warning(f"Using filename as debounce key: {stem}")
         return stem
 
     def copy_files_for_processing(self, ecsv_path: str, fits_path: str) -> tuple:
@@ -136,12 +180,11 @@ class TransientDaemon:
             return str(ecsv_copy), str(fits_copy), job_dir
         except Exception as e:
             logger.error(f"Failed to copy files for job {work_id}: {e}")
-            # Clean up on failure
             shutil.rmtree(job_dir, ignore_errors=True)
             raise
 
     def _debounce_fire(self, obs_key: str):
-        """Called when the debounce timer expires — launch pipeline for all batched files.
+        """Called when the debounce timer expires -- launch pipeline for all batched files.
 
         Each file must be passed through the pipeline so it gets copied to
         the observation directory and registered in metadata.  The fcntl lock
@@ -161,12 +204,7 @@ class TransientDaemon:
         self.executor.submit(self._process_batch, obs_key, pending_files)
 
     def _process_batch(self, obs_key: str, file_list: list):
-        """Process a batch of files sequentially in a single thread.
-
-        Each file is passed through the pipeline (which copies it to the
-        obs dir, registers it, and runs incremental analysis).  The
-        fcntl lock ensures only one pipeline runs at a time per obs dir.
-        """
+        """Process a batch of files sequentially in a single thread."""
         with self.jobs_lock:
             self.active_jobs += 1
 
@@ -176,37 +214,34 @@ class TransientDaemon:
                 job_id = job_dir.name
                 logger.info(f"Batch {obs_key} [{i+1}/{len(file_list)}]: "
                             f"processing {Path(ecsv_path).name}")
+                ok = False
                 try:
                     result = subprocess.run(
-                        [PIPELINE_SCRIPT, ecsv_path, fits_path],
+                        self.pipeline_cmd + [ecsv_path, fits_path],
                         cwd=str(job_dir),
                         capture_output=True,
                         text=True,
-                        timeout=900,
+                        timeout=PIPELINE_TIMEOUT_S,
                     )
-
                     if result.returncode == 0:
-                        logger.info(f"Batch {obs_key} [{i+1}/{len(file_list)}]: "
-                                    f"job {job_id} succeeded")
-                        self.processed_count += 1
+                        logger.info(f"Batch {obs_key} [{i+1}/{len(file_list)}]: job {job_id} succeeded")
+                        ok = True
                     else:
                         logger.error(f"Batch {obs_key} [{i+1}/{len(file_list)}]: "
                                      f"job {job_id} failed (exit {result.returncode})")
                         if result.stderr:
-                            logger.error(f"Stderr: {result.stderr}")
-                        self.failed_count += 1
-
+                            logger.error(f"Stderr: {result.stderr[-2000:]}")
                 except subprocess.TimeoutExpired:
                     logger.error(f"Batch {obs_key}: job {job_id} timed out")
-                    self.failed_count += 1
                 except Exception as e:
                     logger.error(f"Batch {obs_key}: job {job_id} failed: {e}")
-                    self.failed_count += 1
                 finally:
-                    try:
-                        shutil.rmtree(job_dir, ignore_errors=True)
-                    except Exception:
-                        pass
+                    with self.jobs_lock:
+                        if ok:
+                            self.processed_count += 1
+                        else:
+                            self.failed_count += 1
+                    shutil.rmtree(job_dir, ignore_errors=True)
 
             elapsed = time.time() - start_time
             logger.info(f"Batch {obs_key} complete: {len(file_list)} files in {elapsed:.1f}s")
@@ -219,12 +254,9 @@ class TransientDaemon:
     def handle_request(self, conn):
         """Handle incoming socket request with debounce."""
         try:
-            # Receive request
-            data = conn.recv(4096).decode()
-            if not data:
+            request = _recv_json(conn)
+            if not request:
                 return
-
-            request = json.loads(data)
             ecsv_path = request['ecsv_path']
             fits_path = request['fits_path']
 
@@ -233,38 +265,30 @@ class TransientDaemon:
             # Copy files immediately (so source can be removed)
             try:
                 ecsv_copy, fits_copy, job_dir = self.copy_files_for_processing(ecsv_path, fits_path)
-                logger.info(f"Files copied successfully for job {job_dir.name}")
             except Exception as e:
                 logger.error(f"File copy failed: {e}")
-                response = {'success': False, 'error': f'File copy failed: {str(e)}'}
-                conn.send(json.dumps(response).encode())
+                conn.send(json.dumps({'success': False, 'error': f'File copy failed: {e}'}).encode())
                 return
 
-            # Respond immediately that files are copied
-            response = {
+            conn.send(json.dumps({
                 'success': True,
-                'message': f'Files copied, pipeline will launch after {DEBOUNCE_SECONDS}s debounce',
+                'message': f'Files copied, pipeline will launch after {DEBOUNCE_SECONDS:g}s debounce',
                 'job_id': job_dir.name
-            }
-            conn.send(json.dumps(response).encode())
+            }).encode())
 
-            # Debounce: group by observation and reset timer
-            obs_key = self._get_obs_dir(ecsv_path)
+            # Debounce: group by observation and reset timer. Keyed on the
+            # local copy so the source can be removed right away.
+            obs_key = self._get_obs_key(ecsv_copy)
 
             with self._debounce_lock:
-                # Cancel existing timer for this observation
                 existing_timer = self._debounce_timers.get(obs_key)
                 if existing_timer is not None:
                     existing_timer.cancel()
                     logger.info(f"Debounce: reset timer for {obs_key} "
                                 f"({len(self._debounce_files.get(obs_key, []))+1} images pending)")
 
-                # Accumulate files
-                if obs_key not in self._debounce_files:
-                    self._debounce_files[obs_key] = []
-                self._debounce_files[obs_key].append((ecsv_copy, fits_copy, job_dir))
+                self._debounce_files.setdefault(obs_key, []).append((ecsv_copy, fits_copy, job_dir))
 
-                # Start new timer
                 timer = threading.Timer(DEBOUNCE_SECONDS, self._debounce_fire, args=[obs_key])
                 timer.daemon = True
                 timer.start()
@@ -272,50 +296,47 @@ class TransientDaemon:
 
         except json.JSONDecodeError as e:
             logger.error(f"Invalid JSON request: {e}")
-            error_response = {'success': False, 'error': 'Invalid JSON'}
             try:
-                conn.send(json.dumps(error_response).encode())
+                conn.send(json.dumps({'success': False, 'error': 'Invalid JSON'}).encode())
             except Exception:
-                pass  # Connection may be closed
+                pass
         except Exception as e:
             logger.error(f"Error handling request: {e}")
-            error_response = {'success': False, 'error': str(e)}
             try:
-                conn.send(json.dumps(error_response).encode())
+                conn.send(json.dumps({'success': False, 'error': str(e)}).encode())
             except Exception:
-                pass  # Connection may be closed
+                pass
 
     def print_status(self):
         """Print periodic status information."""
         while self.running:
-            time.sleep(60)  # Status every minute
-            with self.jobs_lock:
+            time.sleep(60)
+            with self._debounce_lock:
                 pending = sum(len(v) for v in self._debounce_files.values())
+            with self.jobs_lock:
                 logger.info(f"Status: {self.active_jobs} active jobs, "
-                           f"{pending} pending (debounce), "
-                           f"{self.processed_count} completed, {self.failed_count} failed")
+                            f"{pending} pending (debounce), "
+                            f"{self.processed_count} completed, {self.failed_count} failed")
 
     def run(self):
         """Main daemon loop."""
-        # Remove old socket
         try:
             os.unlink(SOCKET_PATH)
         except FileNotFoundError:
             pass
 
-        # Create socket
         sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
         sock.bind(SOCKET_PATH)
         os.chmod(SOCKET_PATH, 0o666)  # Allow other users to connect
         sock.listen(5)
 
-        logger.info(f"Transient daemon started")
+        logger.info("Transient daemon started")
         logger.info(f"Listening on {SOCKET_PATH}")
+        logger.info(f"Pipeline command: {' '.join(self.pipeline_cmd)}")
         logger.info(f"Max parallel processes: {MAX_PARALLEL_PROCESSES}")
-        logger.info(f"Debounce window: {DEBOUNCE_SECONDS}s")
+        logger.info(f"Debounce window: {DEBOUNCE_SECONDS:g}s")
         logger.info(f"Work directory: {self.work_dir}")
 
-        # Start status thread
         status_thread = threading.Thread(target=self.print_status, daemon=True)
         status_thread.start()
 
@@ -324,13 +345,10 @@ class TransientDaemon:
                 try:
                     sock.settimeout(1.0)  # Allow checking self.running
                     conn, addr = sock.accept()
-
-                    # Handle request in main thread to avoid socket issues
-                    self.handle_request(conn)
-
-                    # Close connection after starting handler
-                    conn.close()
-
+                    try:
+                        self.handle_request(conn)
+                    finally:
+                        conn.close()
                 except socket.timeout:
                     continue
                 except Exception as e:

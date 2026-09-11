@@ -8,33 +8,45 @@ Compares sources extracted by pyrt against multi-catalog reference data (Gaia, A
 
 ## Requirements
 
-- **pyrt** must be installed first — it provides the base `Catalog` class, photometric calibration, and produces the ECSV detection files this package consumes.
-- **[stdpipe](https://github.com/karpov-sv/stdpipe)** — used for coordinate matching (`stdpipe.astrometry`) and VSX/SkyBoT candidate filtering (`stdpipe.pipeline.filter_transient_candidates`). Pin to a specific commit rather than "latest" — stdpipe is under active development and its API has moved (e.g. `stdpipe.artefacts` didn't exist a few months prior to this being written).
+- **pyrt** must be installed first — it provides the base `Catalog` class, photometric calibration, and produces the ECSV detection files this package consumes. **PyPI's `pyrt` package is an unrelated ray-tracer (`pip install pyrt` there gets you a rendering library, not this) — install the real one from its actual source** (https://github.com/mates14/pyrt, or a local checkout: `pip install -e /path/to/pyrt`).
+- **[stdpipe](https://github.com/karpov-sv/stdpipe)** — used for coordinate matching (`stdpipe.astrometry`) and VSX/SkyBoT candidate filtering (`stdpipe.pipeline.filter_transient_candidates`). Tested against PyPI's `0.4.1` (`pip install stdpipe`) — see "stdpipe version compatibility" below for the two version-specific workarounds this package carries; both are guarded/self-selecting, so an older stdpipe build (this project was originally developed against an older checkout with a different API in a few places) still works too.
+- **sep-x** comes in as stdpipe's own dependency (its `photometry` module does `import sep_x as sep`, falling back to plain `sep` on older checkouts); nothing here imports it directly. `detection/subtraction/extraction.py`'s `_patch_sep_sum_circle_clip_kwargs` reads `stdpipe.photometry`'s own `sep` attribute so it patches whichever module stdpipe actually bound.
 - Python ≥ 3.10 (stdpipe uses PEP 604 union-type syntax internally; tested on 3.11).
+
+### stdpipe version compatibility
+
+This package carries two workarounds for real bugs found in some `stdpipe` builds, both self-guarding so they're safe to run against any stdpipe version (old or new) without picking one at install time:
+
+- **`_patch_sep_sum_circle_clip_kwargs`** (`detection/subtraction/extraction.py`) — some stdpipe builds' `get_objects_sep` unconditionally passes `clip_sigma`/`clip_iters` to a plain `sep.sum_circle()` call that has never accepted them, crashing every SEP detection. Patched to retry once without those kwargs on exactly that `TypeError`; a `sep`/`sep_x` version that *does* accept them is unaffected (the first call just succeeds, so the retry path never runs).
+- **`_patch_normalize_ps1_skycell`** (`detection/subtraction/templates.py`) — an older stdpipe's `normalize_ps1_skycell(filename, outname=None, verbose=False)` crashes on real PS1 skycell downloads (`ValueError` inside astropy's compressed-tile decompression of certain BLANK-valued masks); worked around with a `fitsio`-based reimplementation. Verified against `0.4.1` that this signature changed to an in-memory `normalize_ps1_skycell(image, header, verbose=False)`, where the bug is apparently already fixed upstream — applying the old patch there unconditionally would break every PS1 call, so it now inspects the installed function's parameter names first and only patches the old `filename`-based form, using stdpipe's own implementation otherwise.
 
 Optional, only needed for the subtraction strategy (see "SN search" below):
 
 - **[HOTPANTS](https://github.com/acbecker/hotpants)** — `subtraction_engine: hotpants` (the default), via `stdpipe.subtraction.run_hotpants`.
 - **[PyZOGY](https://github.com/dguevel/PyZOGY)** — `subtraction_engine: zogy`.
 - **SWarp** — reprojecting an external-survey template (`template_source: ps1`/`legacysurvey`) onto the science WCS, via `stdpipe.templates`. Not needed for `template_source: own_epoch`.
-- **[fitsio](https://github.com/esheldon/fitsio)** — optional; works around a real bug in some `stdpipe` builds' PS1 skycell normalization (`normalize_ps1_skycell` raises on certain BLANK-valued compressed masks). Without it, some PS1 template fetches may fail where they would otherwise succeed.
+- **[fitsio](https://github.com/esheldon/fitsio)** (`pip install pyrt-transient[ps1]`) — optional; enables `_patch_normalize_ps1_skycell` above. Without it, some PS1 template fetches may fail on an older stdpipe build where they would otherwise succeed (a no-op on a newer one that's already fixed upstream).
 
 ---
 
 ## Installation
 
 ```bash
-# Install pyrt first
-pip install pyrt
+# Install pyrt first -- NOT `pip install pyrt` (that's an unrelated PyPI
+# ray-tracer package). Install the real one from source instead:
+pip install -e /path/to/pyrt   # or: pip install git+https://github.com/mates14/pyrt
 
-# Install stdpipe (pin a known-good commit)
-pip install git+https://github.com/karpov-sv/stdpipe.git@<commit>
+# Install stdpipe (tested against 0.4.1)
+pip install stdpipe
 
 # Install the transient detection package
 pip install pyrt-transient
 
 # With optional frontend (cutout images + HTML candidate browser)
 pip install pyrt-transient[frontend]
+
+# With the PS1-skycell fitsio workaround (see "stdpipe version compatibility" above)
+pip install pyrt-transient[ps1]
 ```
 
 ---
@@ -85,7 +97,7 @@ pyrt-transient-pipeline image.ecsv image.fits --config=config.yaml
 pyrt-transient-daemon
 ```
 
-The daemon listens on a Unix socket, receives ECSV + FITS paths, and launches `pipeline_magic.py` as a subprocess automatically (up to `MAX_PARALLEL_PROCESSES` concurrent runs). It applies a debounce window so a burst of images from the same observation is processed as one batch rather than N overlapping runs — concurrent invocations for the *same* observation directory still serialize on `ObservationStore`'s file lock, so parallelism across observations is what actually helps throughput, not parallelism within one.
+The daemon listens on a Unix socket, receives ECSV + FITS paths, and launches `pyrt-transient-pipeline` as a subprocess automatically (up to `PYRT_TRANSIENT_MAX_PARALLEL` concurrent runs). Socket, work/log directories, the pipeline command and its extra arguments (e.g. `--config=`) are set by `PYRT_TRANSIENT_*` environment variables -- see the module docstring of `transient_daemon.py`. It applies a debounce window so a burst of images from the same observation is processed as one batch rather than N overlapping runs — concurrent invocations for the *same* observation directory still serialize on `ObservationStore`'s file lock, so parallelism across observations is what actually helps throughput, not parallelism within one.
 
 ### Real-time deployment alongside pyrt
 
@@ -152,6 +164,200 @@ detection:
 
 `MAGLIM` for the stack is measured empirically from its own actually-detected sources (checked against the stack's own directly-measured background noise, not the per-source flux-error model `get_objects_sep` uses — that model assumes single-exposure statistics that don't hold once frames have been combined), not derived from a formula or borrowed from any single input epoch.
 
+### Stack-only candidates
+
+The stack is a single epoch for the clustering, so a source that the stack detects but single
+frames mostly miss can never collect `min_n_detections` detections. For such stack-only
+candidates, `detection/blind_multicatalog/forced.py` measures aperture photometry at the
+candidate's position in the frames the stack was built from. It admits the candidate when this
+forced lightcurve shows a persistent source:
+
+- SNR ≥ `stack_forced_snr` in at least `stack_forced_min_fraction` of those frames, and
+- no single frame carrying more than `stack_forced_max_flux_fraction` of the positive flux.
+
+The second test rejects cosmic rays, hot pixels and satellite glints that were averaged into
+the stack (`pyrt-combine` has no per-pixel rejection), because all their flux is in one frame.
+The stack ECSV lists its input frames in `STACK_INPUTS`, so the forced measurements use
+exactly those frames.
+
+An admitted candidate gets its forced points (`FORCED = True`) as its lightcurve, is scored
+like any other candidate, and is marked `admission = stack+forced`. Forced points are never
+clustered into new candidates, so the step cannot feed back into itself. It costs about
+25 ms per frame, almost all of it reading the image and estimating the background.
+
+On GRB 190919B (`tests/190919B`), the 20-frame stack's afterglow reaches SNR > 3 in 24 of 40
+frames and is admitted, while the three single-frame flashes in the same stack reach it in 1
+of 40 each and are rejected.
+
+```yaml
+detection:
+  stack_forced_admission: true        # default
+  stack_forced_snr: 3.0
+  stack_forced_min_fraction: 0.3
+  stack_forced_max_flux_fraction: 0.5
+  stack_forced_min_frames: 5
+  stack_forced_max_candidates: 50     # stack-only candidates measured per run, by quality
+  stack_forced_lc_snr: 2.0            # forced points at or above this form the lightcurve
+  stack_forced_aperture_fwhm: 1.0     # aperture radius in units of the frame FWHM
+```
+
+---
+
+## Follow-up exposure recommendation
+
+After detection, `pipeline_magic.py` answers "how long does the next frame need to be?" for the candidates it just found, using the conditions of the epoch it just processed — the sky background, seeing, zeropoint and exposure time of that real frame, scaled to a different exposure time via an empirically calibrated noise model (`followup/exposure.py`, RMS 0.047 dex in log(magerror); verified against every measured source in `tests/210619B` at median +0.01 dex, rms 0.031).
+
+Every candidate row gains `followup_mag` (the magnitude planned against) and `followup_exptime_s`. The highest-scoring candidate additionally gets `followup_exposure.json` in the observation directory, with the reference conditions used, the predicted SNR/magerror actually achieved at the recommended time, the limiting magnitude that exposure reaches, and an `exptime_range_s` reflecting the planning magnitude's own uncertainty.
+
+The planning magnitude is the source's *latest* lightcurve point (not its best epoch) when that point is well measured (`max_planning_magerr`); a noisier one — admission goes down to `new_source_siglim`, i.e. ~0.7 mag — is averaged with the preceding points instead, since exposure time scales roughly as 10^(0.8·Δm). Only points from epochs in the reference frame's filter are used when any exist; otherwise the report flags `filter_mismatch` rather than silently mixing bands.
+
+```yaml
+followup:
+  exposure_enabled: true      # default
+  target_snr: 10.0            # what the recommended exposure aims for
+  max_planning_magerr: 0.2    # a latest point noisier than this is averaged, not trusted alone
+  readout_noise_e: 8.0        # camera-specific; the model's calibration value
+  min_exptime_s: 1.0          # the answer is clamped here for very bright candidates
+  max_exptime_s: 3600.0       # beyond this the report says "unreachable", not a number
+```
+
+This is enrichment, not detection: it runs *on* a strategy's `(candidates, lightcurves)` output, so it never influences what is found, and it cannot abort the run that produced them (`run_enrichment` never raises). Anything it can't do is reported explicitly — a report always carries a `status` of `ok`/`skipped`/`error` plus a reason, so "couldn't plan an exposure" never reads like "no exposure needed". The reference epoch is the most recently *observed* real frame (by mid-exposure time, not file order); stack epochs are skipped, since a co-add's exposure time isn't one a telescope can re-take and its background sits below the readout floor the model needs.
+
+The model's constants are a fit to one instrument, so every run also checks it against the reference frame's own measured photometric errors and records the result as `model_check` (`rms_dex` over the frame's sources; a warning is logged above 0.1 dex). On another camera that number, not a crash, is what tells you the recommendation can't be trusted.
+
+Only exposure time is computed. Filter choice, EMCCD on/off, and the time-since-trigger term of the original "telescope strategy suggester" idea remain deferred (see `FUTURE_IDEAS.md`).
+
+---
+
+## Validation: injection-recovery and replay
+
+`pyrt_transient/validation/` plus two CLIs regenerate the completeness,
+latency and purity numbers for a field from its shipped catalogues:
+
+```bash
+# Inject synthetic fading point sources into every epoch's catalogue and
+# replay the blind-multicatalog strategy one epoch at a time
+python tools/inject_recover.py tests/210619B --out local_test_output/inject \
+    --realisations 8 --sources 40 --mag-min 14 --mag-max 20 --alphas 0 0.5 1
+
+# Replay a real field and track a known target (default: GRB_RA/GRB_DEC in the meta)
+python tools/replay_driver.py tests/210619B --out local_test_output/replay_210619B
+```
+
+Injection is at the catalogue level (`validation/injection.py`): positions go
+through the frame's own WCS (SIP or ZPN included), scattered by the frame's
+astrometric residual (pyrt's ASTSCATT, or ASTSIGMA from pyrt before
+mates14/pyrt 97101a7, converted from pixels to arcsec), magnitudes
+follow `m(t) = m0 + 2.5 alpha log10(t/t1)` since a trigger `t0`, noise is
+Gaussian in flux with the error the `followup.exposure` model predicts for
+that frame, every other column is copied from a real, unflagged, point-like
+star of the same brightness in the same frame, and a source below the frame's
+faintest-detection limit (`MAGLIMIT`) is absent from the catalogue. It tests
+the pipeline's recall and latency *given* a detection — not SExtractor, not
+blending, not pixel-level artefacts.
+
+Outputs per run: `recovery.ecsv` (one row per injected source: peak magnitude
+relative to `MAGLIM`, epochs detected, recovered or not, first epoch and
+seconds-since-`t0` at which it was reported, final score and rank),
+`spurious.ecsv` (candidates matching neither an injected source nor a known
+real target, vs. epoch count), `completeness.pdf`, `latency.pdf`,
+`spurious.pdf`, `summary.json`.
+
+### Constant sources and the vetting configuration
+
+With the default configuration a *constant* new source — however bright — is
+never reported: the final score multiplies in the light-curve magnitude range
+twice, so a light curve whose only variation is noise scores ~0.01 and is
+removed by `min_quality`. The injection run that found this also found why
+the term is load-bearing: two upstream defects were producing ~180
+persistent "new" candidates per field, and the magnitude-range term was the
+only thing hiding them.
+
+- `pyrt`'s Gaia query keeps only calibrator-quality stars (`ruwe < 1.4`,
+  BP/RP present, ...). Right for photometric calibration, wrong for vetting:
+  ~9% of real 12–17 mag stars are absent, and each one is a persistent "new"
+  source. `catalogs: [gaia_full, ...]` uses the same query without the cuts.
+- USNO-B carries no Sloan bands, so none of its stars has "valid" photometry
+  and every match was reported as `new` — USNO-B contributed nothing to the
+  unanimity rule. `unphotometered_match_is_new: false` reports such a match
+  as matched-with-unknown-photometry (not a candidate) instead — unless the
+  detection is brighter than the brightest plate/broad-band magnitude of
+  the matched entries by more than
+  `unphotometered_veto_max_brightening_mag` (default 2.0), in which case it
+  is a `brightening` candidate: a 19.7 mag USNO-B star 2" away cannot be a
+  14.9 mag afterglow (GRB 250813B was lost to exactly that veto).
+
+Recommended vetting configuration (validated in `FUTURE_IDEAS.md`,
+"Constant new sources"):
+
+```yaml
+detection:
+  # atlas@vizier when there is no local ATLAS; usno is the galaxy veto that
+  # takes over south of Dec -30 where Pan-STARRS reports "unavailable"
+  catalogs: [gaia_full, atlas@localhost, panstarrs@vizier, usno]
+  unphotometered_match_is_new: false    # a USNO-B match is a star, not a "new" source
+  unphotometered_veto_max_brightening_mag: 2.0   # ... unless the detection is >2 mag brighter than it
+  catalog_match_floor_arcsec: {gaia: 3.0, atlas: 3.0, panstarrs: 3.0, usno: 3.0}   # D50 vs catalogue scatter: p99 ~2.5"
+  new_source_variability_floor: true    # constancy never penalises a "new" source
+  isolation_max_mag_margin: 0.5         # isolation counts only catalogue stars brighter than MAGLIMIT + 0.5
+  score_probability_intercept: 0.840    # p_real = sigmoid(0.840 + 0.843 ln quality_score), fitted for this
+  score_probability_slope: 0.843        # catalogue set on the 15-field replay (historical gaia+usno: -2.539, 1.101)
+```
+
+Measured on the 210619B field with catalogue-level injection (4 x 40
+sources, 14-20 mag, constant/fading), default vs. this configuration:
+recovered fraction of sources detectable in >=3 epochs 68% -> 94%, constant
+sources 14% -> 93%, fading sources 96% -> 95%, spurious candidates per field
+0 -> 0, real afterglow score 56.5 -> 57.6, median latency 3 epochs both.
+
+Which catalogues (measured on the same field, see `FUTURE_IDEAS.md`): Gaia
+(`gaia_full`) and ATLAS refcat2 are each complete to the D50 single-frame
+depth with usable photometry, and together give 113/118 recovery — but
+both are *point-source* catalogues, and four 18th-mag galaxies in the field
+then survive as persistent low-score (0.35–0.65) candidates. USNO-B has
+them (photographic plates include extended objects), so keeping `usno` as a
+purely positional veto (it can only veto once `unphotometered_match_is_new`
+is false) brings the spurious count back to 0 at no cost in recovery. Do not
+use USNO-B for photometry (0.85 mag scatter against D50).
+
+Pan-STARRS is the better galaxy-inclusive veto north of Dec −30: with
+`[gaia_full, atlas@vizier, panstarrs@vizier]` the same injection gives
+113/118 detectable sources recovered (constant 40/42) and 0 spurious
+candidates in every realisation — the best of every combination measured. Two
+catalogue names are provided: `panstarrs@vizier` (PS1 DR1 mean photometry
+from VizieR II/349/ps1 — a 0.3° box in ~1 s, cached, includes galaxies,
+`Sloan_*` columns) and `panstarrs` (PS1 DR2 from MAST, deeper and slower;
+this package overrides `pyrt`'s implementation, whose MAST criteria syntax
+the current API rejects). Both return "unavailable" south of Dec −30
+without querying.
+
+### Catalogues without coverage: the pipeline works everywhere
+
+A reference catalogue that has no coverage of the field (Pan-STARRS south
+of −30, SDSS and Legacy Survey off-footprint), returned no rows, or failed
+to download is now **excluded from the agreement requirement** for that
+field, with a warning naming it. Previously such a catalogue was inserted
+as an empty candidate table, and because `min_catalogs_fraction: 1.0`
+counts every listed catalogue, it vetoed every source: a field outside any
+one catalogue's footprint silently produced zero candidates. A catalogue
+that *was* searched and flagged nothing still participates (that is a real
+veto). If no catalogue at all is available the run logs an error and
+produces no candidates. So a catalogue list like
+`[gaia_full, atlas@localhost, panstarrs@vizier, usno]` is safe at any
+declination: south of −30 it degrades to the other three.
+
+All four default to the historical behaviour, so the regression baseline is
+unchanged unless you opt in. Enable `new_source_variability_floor` only
+together with the other three: on its own it turns every star missing from
+a quality-cut catalogue into a high-scoring candidate.
+
+## Archive validation
+
+`tools/replay_archive.py` replays every burst of a target list over the
+fixed-OBSID ECSV archive and writes the validation website (`index.html` +
+per-burst `track.png`, `snapshots.json`, `summary.json`); `--resume` skips
+bursts already done.
+
 ---
 
 ## Python API
@@ -199,7 +405,7 @@ Remote catalogs (all except `atlas@localhost`) are cached to disk via `setup_cat
 
 ## Configuration
 
-Detection behaviour is controlled by `DetectionConfig` — see `pyrt_transient/config_trans.py` for the full list of fields and defaults (matching radii, adaptive-radius parameters, trail/moving-object thresholds, quality-score weights, which catalogs to query). A YAML config file can be passed via `--config=`:
+Detection behaviour is controlled by `DetectionConfig` (post-detection enrichment by `FollowupConfig`) — see `pyrt_transient/config_trans.py` for the full list of fields and defaults (matching radii, adaptive-radius parameters, trail/moving-object thresholds, quality-score weights, which catalogs to query). A YAML config file can be passed via `--config=`:
 
 ```yaml
 detection:
@@ -254,6 +460,10 @@ pyrt_transient/
 │       ├── extraction.py          SEP-based detection + science-image-calibrated photometry
 │       ├── candidates.py          Diff-detection -> Candidate table, science-meta borrowing
 │       └── artifact_filters.py    Morphology/magnitude filters + dipole-artifact rejection
+│
+├── followup/                Candidate enrichment, run on a strategy's output
+│   ├── exposure.py             Empirical exposure-time/noise model (magnitude <-> SNR <-> exptime)
+│   └── enrichment.py            Annotates candidates + reports on the top one -- see above
 │
 ├── web/                     Frontend generation
 │   ├── orchestration.py        generate_frontend() entry point

@@ -204,7 +204,9 @@ def compute_trail_score(
         trail_features: Dictionary from compute_trail_features
         config: Optional PipelineConfig for trail parameters (defaults used if None)
         logger: Optional logger for debug messages
-        astsigma: Per-frame WCS astrometric error in arcsec (ASTSIGMA from header).
+        astsigma: Per-frame astrometric scatter in arcsec (pyrt's ASTSCATT, or
+                  ASTSIGMA from older pyrt, converted from pixels -- see
+                  core.radii.astrometric_scatter_arcsec).
                   When > 0, enables a physics-based "displacement vs WCS error" trail
                   criterion that flags sources whose total displacement exceeds
                   trail_astsigma_displacement_threshold × ASTSIGMA, independently of

@@ -73,7 +73,13 @@ def apply_vsx_filter(candidates, match_radius_arcsec=2.5):
 def apply_skybot_filter(candidates, time, match_radius_arcsec=2.5):
     """Reject candidates matching known SkyBoT solar-system objects at the
     given observation time. Time-dependent -- call once per epoch, on that
-    epoch's catalogs already combined. Returns (filtered_candidates, n_removed).
+    epoch's catalogs already combined.
+
+    Returns (filtered_candidates, n_removed, ok). `ok` is False when the
+    cross-match could not be performed at all (service outage, no time):
+    the candidates come back unfiltered, and the caller must not treat that
+    epoch as a finished result -- "nothing rejected" and "could not ask"
+    are the same table but not the same fact.
 
     stdpipe.catalogs.xmatch_skybot (as installed here) crashes with
     `KeyError: 'RA'` whenever SkyBoT genuinely finds zero solar-system
@@ -88,8 +94,10 @@ def apply_skybot_filter(candidates, time, match_radius_arcsec=2.5):
     (missing swarp/hotpants binaries, PS1 skycell bugs, etc.) rather than
     crashing the whole epoch.
     """
-    if len(candidates) == 0 or time is None:
-        return candidates, 0
+    if len(candidates) == 0:
+        return candidates, 0, True
+    if time is None:
+        return candidates, 0, False
 
     obj = _to_stdpipe_columns(candidates)
     try:
@@ -104,8 +112,17 @@ def apply_skybot_filter(candidates, time, match_radius_arcsec=2.5):
             get_candidates=False,
         )
     except KeyError as e:
-        logger.warning(f"SkyBoT cross-match failed ({e!r}), treating as no matches "
-                        f"(a known stdpipe bug on genuinely empty SkyBoT results)")
-        return candidates, 0
+        # stdpipe's own bug on an empty SkyBoT result (see the docstring):
+        # the service answered, and the answer was "no solar-system objects
+        # here". That is a real, complete cross-match.
+        logger.debug(f"SkyBoT returned no solar-system objects ({e!r})")
+        return candidates, 0, True
+    except Exception as e:  # service down / error page / timeout: astroquery raises
+        # ValueError("No table found"), requests exceptions, etc. An asteroid
+        # cross-match that cannot run must not abort the epoch (it did, for
+        # every burst of the 2026-09-04 archive replay while SkyBoT was down)
+        # -- but it must not pass for a finished one either.
+        logger.warning(f"SkyBoT cross-match unavailable ({e!r}); asteroids not rejected this epoch")
+        return candidates, 0, False
     n_removed = int(np.sum(~mask))
-    return candidates[mask], n_removed
+    return candidates[mask], n_removed, True

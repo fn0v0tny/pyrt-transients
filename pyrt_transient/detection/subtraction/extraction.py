@@ -74,13 +74,22 @@ def _patch_sep_sum_circle_clip_kwargs() -> None:
     aperture photometry" without the optimal path's clipping). Sep
     versions that *do* accept these kwargs are entirely unaffected: the
     first call always succeeds for them, so the except branch never runs.
+
+    Patched via `stdpipe.photometry`'s own `sep` attribute rather than a
+    fresh top-level `import sep`: older stdpipe builds do `import sep` (the
+    plain `sep` package), but a newer one (verified against 0.4.1) does
+    `import sep_x as sep` instead (sep-x is stdpipe's own declared
+    dependency, not this package's). get_objects_sep calls whichever one
+    stdpipe.photometry bound its local `sep` name to, so patching that same
+    attribute is correct regardless of which package backs it.
     """
     global _sep_sum_circle_patch_applied
     if _sep_sum_circle_patch_applied:
         return
     try:
-        import sep
-    except ImportError:
+        from stdpipe import photometry as stdpipe_photometry
+        sep = stdpipe_photometry.sep
+    except (ImportError, AttributeError):
         return
 
     original_sum_circle = sep.sum_circle
@@ -125,6 +134,11 @@ def _resolve_fwhm_px(header, default: float = 3.0) -> float:
     if not np.isfinite(fwhm_px) or fwhm_px <= 0:
         return default
     return fwhm_px
+
+
+# All-sky reference catalogues (stdpipe.catalogs names) tried, in order, when
+# the configured photometric catalogue has no rows for a field.
+_ALLSKY_FALLBACK_CATALOGS = ("atlas",)
 
 
 def calibrate_science_zeropoint(
@@ -177,16 +191,32 @@ def calibrate_science_zeropoint(
     field_deg = float(header.get("FIELD", max(image.shape) * pixscale_deg * 1.1))
     sr0 = field_deg / 2.0 * 1.1
 
-    cat_mag_col, cat_mag_err_col = {
-        "ps1": ("rmag", "e_rmag"),
-        "gaiaedr3": ("Gmag", "e_Gmag"),
-    }.get(photometric_catalog, ("rmag", "e_rmag"))
+    # Pan-STARRS (the default) stops at Dec -30, so a southern frame -- and
+    # every stack of one, see detection/stacking.py -- used to come back
+    # uncalibrated and was discarded (tests/190919B, Dec -45: "no ps1
+    # catalog stars in field"). ATLAS-RefCat2 is all-sky and carries the
+    # same rmag/e_rmag columns, so it is tried whenever the configured
+    # catalogue has no rows for the field.
+    catalogs_to_try = [photometric_catalog] + [
+        c for c in _ALLSKY_FALLBACK_CATALOGS if c != photometric_catalog
+    ]
 
     try:
-        cat = stdpipe_catalogs.get_cat_vizier(ra0, dec0, sr0, catalog=photometric_catalog, verbose=False)
+        cat = None
+        for catalog_name in catalogs_to_try:
+            cat = stdpipe_catalogs.get_cat_vizier(ra0, dec0, sr0, catalog=catalog_name, verbose=False)
+            if cat is not None and len(cat) > 0:
+                break
+            logger.warning(f"{science_fits_path}: no {catalog_name} catalog stars in field")
         if cat is None or len(cat) == 0:
-            logger.warning(f"{science_fits_path}: no {photometric_catalog} catalog stars in field")
             return np.nan, np.nan
+        if catalog_name != photometric_catalog:
+            logger.info(f"{science_fits_path}: calibrating against {catalog_name} instead")
+
+        cat_mag_col, cat_mag_err_col = {
+            "ps1": ("rmag", "e_rmag"),
+            "gaiaedr3": ("Gmag", "e_Gmag"),
+        }.get(catalog_name, ("rmag", "e_rmag"))
 
         zp_result = stdpipe_pipeline.calibrate_photometry(
             obj, cat, pixscale=pixscale_deg, order=0,
@@ -331,5 +361,20 @@ def _adapt_to_ecsv_schema(obj: Table, header, zp_value: float, zp_err: float,
     for key in ("OBSID", "CTIME", "EXPTIME", "JD", "MJD-OBS", "TEMPLATE", "OBJECT", "TARGET"):
         if key in header:
             out.meta[key] = header[key]
+
+    # The frame's WCS, which the catalogue matcher projects reference stars
+    # through onto X_IMAGE/Y_IMAGE. Without it the matcher built a default
+    # WCS, put every catalogue star ~860 px away and flagged 560 of the 571
+    # detections on the tests/190919B 20-frame stack as "new".
+    wcs_prefixes = ("WCSAXES", "CTYPE", "CUNIT", "CRPIX", "CRVAL", "CDELT", "CROTA",
+                    "CD1_", "CD2_", "PC1_", "PC2_", "PV", "A_", "B_", "AP_", "BP_",
+                    "LONPOLE", "LATPOLE", "EQUINOX", "RADESYS")
+    for key, value in header.items():
+        if key.startswith(wcs_prefixes):
+            out.meta[key] = value
+    for axis, size_key in (("1", "IMAGEW"), ("2", "IMAGEH")):
+        if f"NAXIS{axis}" in header:
+            out.meta[f"NAXIS{axis}"] = header[f"NAXIS{axis}"]
+            out.meta.setdefault(size_key, header[f"NAXIS{axis}"])
 
     return out

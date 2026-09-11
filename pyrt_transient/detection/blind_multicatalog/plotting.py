@@ -4,10 +4,14 @@ create_lightcurve_summary, create_summary_grid_plot. self.lightcurve_dir/
 self.config/self.logger are explicit parameters rather than instance state.
 """
 
+import logging
 from typing import Dict
 
 import numpy as np
-import matplotlib.pyplot as plt
+try:
+    import matplotlib.pyplot as plt
+except ImportError:  # the optional [frontend] extra -- plots are skipped, detection still runs
+    plt = None
 from astropy.table import Table
 
 
@@ -43,6 +47,10 @@ def analyze_and_plot_lightcurves(lightcurves: Dict, lightcurve_dir, config=None,
 
 def plot_individual_lightcurve(transient_id: str, lightcurve: Table, lightcurve_dir):
     """Create detailed lightcurve plot."""
+    if plt is None:
+        logging.getLogger("detection.plotting").warning(
+            "matplotlib not installed (pip install pyrt-transient[frontend]); skipping lightcurve plots")
+        return
     fig, ax = plt.subplots(1, 1, figsize=(12, 8))
 
     times = lightcurve['obs_time']
@@ -118,6 +126,10 @@ def create_summary_grid_plot(lightcurves: Dict, final_candidates, lightcurve_dir
     """
     Enhanced grid plot with color coding for different candidate types.
     """
+    if plt is None:
+        logging.getLogger("detection.plotting").warning(
+            "matplotlib not installed (pip install pyrt-transient[frontend]); skipping lightcurve plots")
+        return
 
     n_plots = min(len(lightcurves), max_plots)
     if n_plots == 0:

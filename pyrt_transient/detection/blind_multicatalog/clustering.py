@@ -28,13 +28,14 @@ from sklearn.neighbors import KDTree
 from pyrt_transient.config_trans import DetectionConfig
 from pyrt_transient.core.union_find import UnionFind
 from pyrt_transient.core.matching import match_radius
-from pyrt_transient.core.scoring import apply_lightcurve_score_factor
+from pyrt_transient.core.scoring import add_score_probability, apply_lightcurve_score_factor
 from pyrt_transient.detection.blind_multicatalog.stdpipe_filters import (
     apply_skybot_filter,
     apply_vsx_filter,
 )
 from pyrt_transient.detection.blind_multicatalog.lightcurve import (
     build_lightcurve_for_group,
+    estimate_magnitude_error_floor,
     update_candidate_with_lightcurve_stats,
 )
 
@@ -145,8 +146,17 @@ def combine_results(
         time: Observation time for this epoch (for SkyBoT cross-matching); None skips it
 
     Returns:
-        Combined table of reliable transient candidates
+        Combined table of reliable transient candidates. `meta['DEGRADED']`
+        is set when an external filter could not run (SkyBoT outage), so the
+        caller can decline to cache this epoch as a finished result.
     """
+    degraded = None
+
+    def _out(table: Table) -> Table:
+        if degraded:
+            table.meta['DEGRADED'] = degraded
+        return table
+
     if not transients:
         return Table()
 
@@ -163,15 +173,22 @@ def combine_results(
     # SkyBoT: once per epoch, right after this epoch's catalogs are combined
     # (time-dependent, so it can't defer to the final-candidate stage like
     # VSX does -- see stdpipe_filters.py).
+    # `time is None` means this epoch's header carries no observation time at
+    # all -- a permanent property of the data, not a transient failure, so it
+    # is not marked degraded (that would make the epoch recompute forever).
     if config and config.detection.vsx_filter_enabled and time is not None:
-        all_candidates, n_removed = apply_skybot_filter(
+        all_candidates, n_removed, skybot_ok = apply_skybot_filter(
             all_candidates, time=time,
             match_radius_arcsec=config.detection.vsx_match_radius_arcsec,
         )
         if n_removed > 0:
             logging.info(f"SkyBoT filter removed {n_removed} candidates for this epoch")
+        if not skybot_ok:
+            degraded = ("SkyBoT cross-match could not run for this epoch "
+                        "(service unavailable, or the epoch carries no observation time)")
+            logging.warning(f"Epoch marked degraded: {degraded}")
         if len(all_candidates) == 0:
-            return Table()
+            return _out(Table())
 
     n_candidates = len(all_candidates)
 
@@ -312,14 +329,14 @@ def combine_results(
                             magdiff_overrides.append(type_rows['magnitude_difference'][best_md_idx])
 
     if not best_indices:
-        return Table()
+        return _out(Table())
 
     result = all_candidates[best_indices]
     if has_candidate_type:
         result['candidate_type'] = type_overrides
         if has_magdiff:
             result['magnitude_difference'] = magdiff_overrides
-    return result
+    return _out(result)
 
 
 def split_component_by_epoch(
@@ -341,6 +358,17 @@ def split_component_by_epoch(
     """
     if len(component_indices) <= 1:
         return [component_indices]
+
+    # Nothing to enforce when every member is from a different epoch: the
+    # component already satisfies the constraint, and the greedy split below
+    # would only re-validate distances against a centroid grown from the
+    # highest-scoring row -- which, when that row is a junk blob 2" off the
+    # source, strands the real rows in a second subcluster below
+    # min_n_detections (GRB 220403B at epoch 42, 2026-09-04).
+    if 'epoch_id' in detections.colnames:
+        epochs = [detections['epoch_id'][i] for i in component_indices]
+        if len(set(epochs)) == len(epochs):
+            return [list(component_indices)]
 
     # Get component data
     component_data = detections[component_indices]
@@ -414,8 +442,17 @@ def save_epoch_results(
     data_dir,
     config: Optional = None,
     logger=None,
+    degraded_reason: Optional[str] = None,
 ) -> None:
-    """Save results for this epoch using combine_results."""
+    """Save results for this epoch using combine_results.
+
+    `degraded_reason` records that this epoch was produced with less than
+    its full input (a reference catalogue that failed to download, say). It
+    is stamped into the cached table's `meta['DEGRADED']`, which `epoch_is
+    _cached` treats as "recompute next run": the result is still written, so
+    this run's lightcurves are complete, but a transient outage does not
+    become a permanent property of the observation.
+    """
     from pyrt_transient.io.naming import get_base_filename
 
     base_filename = get_base_filename(det_table, epoch_index)
@@ -423,7 +460,7 @@ def save_epoch_results(
     ecsv_path = data_dir / ecsv_table
 
     if not ecsv_path.exists():
-        obs_time = _detections_time(det_table)
+        obs_time = detections_time(det_table)
         reliable = combine_results(
             transients,
             min_catalogs_fraction=min_catalogs,
@@ -433,20 +470,62 @@ def save_epoch_results(
             config=config,
             time=obs_time,
         )
+        reasons = [r for r in (degraded_reason, reliable.meta.get('DEGRADED')) if r]
+        if reasons:
+            reliable.meta['DEGRADED'] = "; ".join(reasons)
         reliable.write(str(ecsv_path), overwrite=True)
         if logger:
             logger.debug(f"Saved {len(reliable)} candidates to {ecsv_table}")
+            if reasons:
+                logger.warning(f"{ecsv_table} written but marked degraded ({reliable.meta['DEGRADED']}); "
+                               f"it will be recomputed on the next run")
 
 
-def _detections_time(detections) -> Optional[Time]:
-    """Observation time (astropy Time) for SkyBoT cross-matching, derived the
-    same way as core/epochs.py's mid-exposure time (CTIME + EXPTIME/2)."""
+def epoch_is_cached(ecsv_path) -> bool:
+    """Whether a per-epoch `<base>_transients.ecsv` counts as a finished
+    result. A file stamped `DEGRADED` by save_epoch_results does not: it was
+    produced while a catalogue or SkyBoT was unreachable, and re-running must
+    get another chance at the full input rather than inheriting the outage
+    forever. Only the ECSV's YAML header is read, not the table."""
+    from pathlib import Path
+    path = Path(ecsv_path)
+    if not path.exists():
+        return False
     try:
-        ctime = detections.meta.get('CTIME', 0)
-        exptime = detections.meta.get('EXPTIME', 0)
-        return Time(ctime + exptime / 2.0, format='unix')
+        with open(path) as fh:
+            for line in fh:
+                if not line.startswith("#"):
+                    break
+                if "DEGRADED" in line:
+                    return False
+    except OSError:
+        return False
+    return True
+
+
+def detections_time(detections) -> Optional[Time]:
+    """Observation time (astropy Time) for SkyBoT cross-matching, derived the
+    same way as core/epochs.py's mid-exposure time (CTIME + EXPTIME/2), or
+    from JD / MJD-OBS for tables that carry those instead (the subtraction
+    pipeline's difference epochs do).
+
+    None when the epoch carries no time at all. It used to default a missing
+    CTIME to 0, i.e. query SkyBoT at 1970-01-01 -- a valid-looking Time that
+    silently rejected nothing while the caller believed the epoch had been
+    cross-matched.
+    """
+    meta = getattr(detections, "meta", None) or {}
+    try:
+        if meta.get('CTIME') is not None:
+            exptime = float(meta.get('EXPTIME', 0.0) or 0.0)
+            return Time(float(meta['CTIME']) + exptime / 2.0, format='unix')
+        if meta.get('JD') is not None:
+            return Time(float(meta['JD']), format='jd')
+        if meta.get('MJD-OBS') is not None:
+            return Time(float(meta['MJD-OBS']), format='mjd')
     except Exception:
         return None
+    return None
 
 
 def combine_with_lightcurves(
@@ -456,7 +535,6 @@ def combine_with_lightcurves(
     position_match_radius: float = 2.0,
     min_n_detections: int = 3,
     config: Optional = None,
-    add_strategy_fields_fn=None,
 ) -> Tuple[Table, Dict]:
     """Combine candidates and build lightcurves (same logic as before)."""
     from pyrt_transient.io.naming import get_base_filename
@@ -569,43 +647,61 @@ def combine_with_lightcurves(
     components = uf.get_components()
     logging.debug(f"Pass 1: Found {len(components)} initial components")
 
-    # Pass 2: Optional merging of components within base radius (with epoch check)
-    component_centroids = {}
-    component_epochs = {}
+    # Pass 2: merge components whose *members* come within the base radius
+    # (single linkage), subject to the one-detection-per-epoch constraint
+    # evaluated against the components as they are at that moment.
+    #
+    # This used to compare component CENTROIDS at the base radius. A single
+    # outlying member -- e.g. a 14-px blob from a bad frame with zero
+    # centroid errors, hence a wide adaptive radius -- linked in pass 1 to
+    # one epoch's row drags that pair's centroid ~2" off the source, the
+    # centroid test then fails, and a source with 30 real detections ends
+    # as two 2-member components, both below min_n_detections (GRB 220403B
+    # under the vetting catalogues, lost at epoch 42 of 57; 2026-09-04).
+    # Pair separations from the pass-1 query already cover the base radius
+    # (max_radius_arcsec >= position_match_radius), so no new matching.
+    comp_epochs = {root: set(candidate_sources[i] for i in idx)
+                   for root, idx in components.items()}
+    order = np.argsort(dist_arcsec)  # closest pairs first
+    for p in order:
+        i, j = int(idx_a[p]), int(idx_b[p])
+        if j <= i or dist_arcsec[p] > position_match_radius:
+            continue
+        ri, rj = uf.find(i), uf.find(j)
+        if ri == rj:
+            continue
+        if comp_epochs[ri] & comp_epochs[rj]:
+            continue  # two detections in one epoch cannot be one source
+        uf.union(i, j)
+        merged = comp_epochs[ri] | comp_epochs[rj]
+        comp_epochs[ri] = merged
+        comp_epochs[rj] = merged
+        comp_epochs[uf.find(i)] = merged
 
-    for root, indices in components.items():
-        component_data = stacked_candidates[indices]
-        centroid_ra = np.mean(component_data['ALPHA_J2000'])
-        centroid_dec = np.mean(component_data['DELTA_J2000'])
-        component_centroids[root] = (centroid_ra, centroid_dec)
-        component_epochs[root] = set(candidate_sources[i] for i in indices)
-
-    # Check for mergeable components using match_radius on centroids (O(N log N))
-    component_roots = list(components.keys())
-    if len(component_roots) > 1:
-        centroid_coords = np.column_stack((
-            np.array([component_centroids[r][0] for r in component_roots]),
-            np.array([component_centroids[r][1] for r in component_roots]),
-        ))
-        c_idx_a, c_idx_b, _ = match_radius(
-            centroid_coords, centroid_coords, position_match_radius, coord_system="sky"
-        )
-
-        for i, j in zip(c_idx_a, c_idx_b):
+    # Pass 2b: the original centroid test, on centroids weighted by the
+    # inverse square of each member's positional radius, so a member with
+    # a wide radius (the blob case above) barely moves the centroid.
+    components = uf.get_components()
+    comp_epochs = {root: set(candidate_sources[i] for i in idx) for root, idx in components.items()}
+    roots = list(components.keys())
+    if len(roots) > 1:
+        cents = []
+        for root in roots:
+            idx = np.asarray(components[root])
+            w = 1.0 / np.maximum(per_det_radii[idx], 1e-3) ** 2
+            cents.append((float(np.sum(radec[idx, 0] * w) / np.sum(w)),
+                          float(np.sum(radec[idx, 1] * w) / np.sum(w))))
+        cents = np.asarray(cents)
+        c_a, c_b, _ = match_radius(cents, cents, position_match_radius, coord_system="sky")
+        for i, j in zip(c_a, c_b):
             if j <= i:
                 continue
-            root_i = component_roots[i]
-            root_j = component_roots[j]
-
-            # Skip if already merged
-            if uf.find(root_i) == uf.find(root_j):
+            ri, rj = uf.find(roots[i]), uf.find(roots[j])
+            if ri == rj or (comp_epochs[ri] & comp_epochs[rj]):
                 continue
-
-            # No epoch conflicts check
-            epochs_i = component_epochs[root_i]
-            epochs_j = component_epochs[root_j]
-            if not (epochs_i & epochs_j):
-                uf.union(root_i, root_j)
+            uf.union(roots[i], roots[j])
+            merged = comp_epochs[ri] | comp_epochs[rj]
+            comp_epochs[ri] = comp_epochs[rj] = comp_epochs[uf.find(roots[i])] = merged
 
     # Get final components after merging
     final_components = uf.get_components()
@@ -636,6 +732,22 @@ def combine_with_lightcurves(
         except Exception:
             epoch_kdtrees.append(None)
     logging.debug(f"Pre-built {len(epoch_kdtrees)} epoch KDTrees for lightcurve lookup")
+
+    # Campaign-level magnitude-error floor for the variability statistics
+    # (lightcurve.estimate_magnitude_error_floor): measured from the bright
+    # constant stars of these very epochs when enabled, else the configured
+    # value; 0 disables it.
+    magerr_floor = 0.0
+    if config is not None:
+        magerr_floor = float(getattr(config.detection, "magerr_floor_mag", 0.0) or 0.0)
+        if getattr(config.detection, "magerr_floor_auto", False):
+            est, n_stars = estimate_magnitude_error_floor(all_epoch_detections, epoch_kdtrees)
+            if np.isfinite(est):
+                logging.info(f"Magnitude-error floor {est:.3f} mag from {n_stars} bright constant stars")
+                magerr_floor = est
+            else:
+                logging.info(f"Magnitude-error floor: too few constant stars ({n_stars}); "
+                             f"using configured {magerr_floor:.3f} mag")
 
     # Process each component with epoch constraint enforcement
     final_candidates = []
@@ -698,7 +810,7 @@ def combine_with_lightcurves(
                     # Update with lightcurve statistics
                     update_candidate_with_lightcurve_stats(
                         best_candidate, lightcurve_data, config=config,
-                        add_strategy_fields_fn=add_strategy_fields_fn,
+                        magerr_floor=magerr_floor,
                     )
 
                     # Fold in the lightcurve-stage quality_score factor (stages
@@ -762,13 +874,24 @@ def combine_with_lightcurves(
         # VSX: once, on the final clustered candidates (purely positional --
         # see stdpipe_filters.py for why this runs here rather than per-epoch).
         if config and config.detection.vsx_filter_enabled:
-            result_table, n_removed = apply_vsx_filter(
-                result_table, match_radius_arcsec=config.detection.vsx_match_radius_arcsec
-            )
+            try:
+                result_table, n_removed = apply_vsx_filter(
+                    result_table, match_radius_arcsec=config.detection.vsx_match_radius_arcsec
+                )
+            except Exception as e:
+                # VizieR is a network dependency at the very last step of a
+                # run; an outage here must not discard everything computed
+                # above (the caller exits non-zero before save_results).
+                logging.warning(f"VSX filter failed ({e!r}); keeping all "
+                                f"{len(result_table)} candidates unfiltered")
+                n_removed = 0
             if n_removed > 0:
                 logging.info(f"VSX filter removed {n_removed} final candidates")
                 surviving_ids = set(str(t) for t in result_table['transient_id'])
                 lightcurves = {k: v for k, v in lightcurves.items() if k in surviving_ids}
+
+        if config:
+            add_score_probability(result_table, config.detection)
 
         # Final quality gate, on the fully-computed score (base_score *
         # lightcurve_score_factor, including the n_detections consistency
@@ -781,7 +904,10 @@ def combine_with_lightcurves(
         # confidence rather than a hard per-epoch or per-count cutoff.
         if config:
             min_quality_final = config.detection.min_quality
-            quality_keep = result_table['quality_score'] >= min_quality_final
+            # A masked/NaN score never passes (and must not crash the int()
+            # below -- seen on GRB 210312B with the vetting catalogues).
+            scores = np.ma.filled(np.ma.asarray(result_table['quality_score'], dtype=float), np.nan)
+            quality_keep = np.isfinite(scores) & (scores >= min_quality_final)
             n_dropped = int(np.sum(~quality_keep))
             if n_dropped > 0:
                 logging.info(

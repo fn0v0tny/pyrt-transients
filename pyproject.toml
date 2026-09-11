@@ -21,9 +21,15 @@ classifiers = [
     "Topic :: Scientific/Engineering :: Astronomy",
 ]
 
-# pyrt must be installed separately (pip install pyrt)
+# pyrt must be installed separately, from source -- NOT `pip install pyrt`,
+# which is an unrelated PyPI ray-tracer package that this "pyrt" entry can't
+# distinguish from the real one. See README.md's "Requirements" section.
 dependencies = [
     "pyrt",
+    # stdpipe declares sep-x itself (its photometry does `import sep_x as
+    # sep`); nothing in this package imports it directly, so it isn't
+    # listed here -- extraction.py's _patch_sep_sum_circle_clip_kwargs
+    # patches whichever module stdpipe.photometry actually bound.
     "stdpipe>=0.3.0",
     "numpy>=1.20.0",
     "astropy>=5.0",
@@ -42,6 +48,13 @@ frontend = [
 dev = [
     "pytest>=7.0.0",
     "pytest-cov>=3.0.0",
+]
+# Works around a real bug in some stdpipe builds' PS1 skycell normalization
+# (see detection/subtraction/templates.py::_patch_normalize_ps1_skycell).
+# Not required otherwise -- without it, some PS1 template fetches may fail
+# where they would otherwise succeed.
+ps1 = [
+    "fitsio",
 ]
 
 [project.scripts]

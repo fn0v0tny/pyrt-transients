@@ -42,7 +42,7 @@ from astropy.io import fits
 from astropy.table import Table
 
 from pyrt_transient.detection.subtraction import extraction as sub_extraction
-from pyrt_transient.transients import open_ecsv_file
+from pyrt_transient.io.ecsv import open_ecsv_file
 
 logger = logging.getLogger("detection.stacking")
 
@@ -94,6 +94,14 @@ def combine_epochs(
     convention as templates.py/differencing.py's missing swarp/hotpants
     handling: callers should treat this exactly like a missing template
     (skip this feature this run, don't crash the pipeline).
+
+    `output_path` is a fixed filename that gets rebuilt repeatedly as more
+    epochs come in (see _attempt_rebuild), but pyrt-combine refuses to
+    write to a path that already exists (a "critical safety check" in its
+    CLI, and there's no -f/--force to bypass it) -- so we always point it
+    at a fresh temp path and atomically replace `output_path` only once a
+    combine actually succeeds. That also keeps the previous good stack in
+    place if this attempt fails, matching _attempt_rebuild's contract.
     """
     binary = shutil.which("pyrt-combine")
     if binary is None:
@@ -105,28 +113,51 @@ def combine_epochs(
         return None
 
     output_path = Path(output_path)
-    cmd = [binary, "-o", str(output_path)]
+    # The temp name must still end in ".fits": pyrt-combine hands `-o` to
+    # Montage's mAdd, which strips a trailing ".fits" and re-appends it, so
+    # "stack.fits.tmp" came back as "stack.fits.tmp.fits" (plus an
+    # "_area.fits" companion) and pyrt-combine's own header update then
+    # failed to find the file it had just written -- every real build
+    # failed while a literal-minded test stub passed.
+    tmp_output_path = output_path.with_name(f"{output_path.stem}.tmp.fits")
+    tmp_area_path = tmp_output_path.with_name(f"{tmp_output_path.stem}_area.fits")
+    tmp_output_path.unlink(missing_ok=True)
+    tmp_area_path.unlink(missing_ok=True)
+
+    cmd = [binary, "-o", str(tmp_output_path)]
     if uniform:
         cmd.append("-u")
     cmd.extend(str(p) for p in fits_paths)
+
+    def _cleanup_tmp():
+        # Partial output (timeout, crash, non-zero exit) must not be left
+        # behind: frontend_generator globs "*.fits" in obs_dir as epochs.
+        tmp_output_path.unlink(missing_ok=True)
+        tmp_area_path.unlink(missing_ok=True)
 
     try:
         result = subprocess.run(cmd, capture_output=True, text=True, timeout=1800)
     except subprocess.TimeoutExpired:
         logger.warning("pyrt-combine: timed out")
+        _cleanup_tmp()
         return None
     except OSError as e:
         logger.warning(f"pyrt-combine: could not launch subprocess: {e}")
+        _cleanup_tmp()
         return None
 
     if result.returncode != 0:
         logger.warning(f"pyrt-combine: exited {result.returncode}: {result.stderr.strip()[-500:]}")
+        _cleanup_tmp()
         return None
 
-    if not output_path.exists():
-        logger.warning(f"pyrt-combine: exited 0 but {output_path} was not created")
+    if not tmp_output_path.exists():
+        logger.warning(f"pyrt-combine: exited 0 but {tmp_output_path} was not created")
+        _cleanup_tmp()
         return None
 
+    tmp_area_path.unlink(missing_ok=True)
+    tmp_output_path.replace(output_path)
     logger.info(f"pyrt-combine: combined {len(fits_paths)} epochs -> {output_path}")
     return output_path
 
@@ -137,6 +168,7 @@ def build_stack_ecsv(
     photometric_catalog: str = "ps1",
     detect_thresh: float = 5.0,
     n_combined: Optional[int] = None,
+    input_files: Optional[List[Path]] = None,
 ) -> Optional[Path]:
     """Detect+calibrate sources directly on the stacked image and write an
     ECSV in the schema BlindMulticatalogStrategy expects.
@@ -169,6 +201,12 @@ def build_stack_ecsv(
     table.meta["IS_STACK"] = True
     if n_combined is not None:
         table.meta["NCOMBINE"] = int(n_combined)
+    if input_files:
+        # Which frames went in, so a stack-only candidate's forced lightcurve
+        # (blind_multicatalog/forced.py) uses exactly those. A comma-separated
+        # string, not a list: much of the code treats meta as a FITS header,
+        # and a list value made the catalogue matcher's WCS fail.
+        table.meta["STACK_INPUTS"] = ",".join(Path(p).name for p in input_files)
 
     empirical_maglim = _empirical_maglim(table, stack_fits_path)
     if empirical_maglim is not None:
@@ -425,21 +463,45 @@ def _attempt_rebuild(obs_dir: Path, real_tables: List[Table], det_cfg, n_real_ep
     fits_paths = [p for _, p in pairs]
 
     stack_fits_path = obs_dir / _STACK_FITS_NAME
+    stack_ecsv_path = obs_dir / _STACK_ECSV_NAME
+
+    # Build the new stack.fits *and* its stack.ecsv under staging names and
+    # only then move both into place. Replacing stack.fits as soon as
+    # pyrt-combine succeeded left a new N-epoch image paired with the old
+    # M-epoch catalogue (NCOMBINE/MAGLIM/EXPTIME describing a different
+    # image) whenever build_stack_ecsv then failed, with nothing logging the
+    # mismatch and no rollback until a later rebuild happened to succeed.
+    staged_fits_path = obs_dir / f"{stack_fits_path.stem}.new.fits"
+    staged_ecsv_path = obs_dir / f"{stack_ecsv_path.stem}.new.ecsv"
+    staged_fits_path.unlink(missing_ok=True)
+    staged_ecsv_path.unlink(missing_ok=True)
+
     combined = combine_epochs(
-        fits_paths, stack_fits_path, uniform=det_cfg.stacking_uniform_weighting,
+        fits_paths, staged_fits_path, uniform=det_cfg.stacking_uniform_weighting,
     )
     if combined is None:
         return
 
-    stack_ecsv_path = obs_dir / _STACK_ECSV_NAME
     built = build_stack_ecsv(
-        combined, output_path=stack_ecsv_path,
+        combined, output_path=staged_ecsv_path,
         photometric_catalog=det_cfg.photometric_catalog,
         detect_thresh=det_cfg.stacking_detect_thresh,
         n_combined=len(fits_paths),
+        input_files=fits_paths,
     )
     if built is None:
+        log.warning("Stacking: combined image built but its catalogue could not be; "
+                    "keeping the previous stack (if any) and discarding the new image")
+        staged_fits_path.unlink(missing_ok=True)
+        staged_ecsv_path.unlink(missing_ok=True)
         return
+
+    # Both halves exist and describe the same image -- install them
+    # together. Two renames aren't jointly atomic, but the window is two
+    # syscalls wide and only a crash in between can leave them mismatched
+    # (versus any calibration failure before this change).
+    staged_fits_path.replace(stack_fits_path)
+    staged_ecsv_path.replace(stack_ecsv_path)
 
     # Invalidate BlindMulticatalogStrategy's Step-1 per-epoch cache so the
     # refreshed (deeper) stack actually gets reprocessed instead of being

@@ -45,5 +45,5 @@ def generate_frontend(obs_dir, observation_id, config):
         return success
 
     except Exception as e:
-        logging.info(f"ERROR: Frontend generation failed: {e}")
+        logging.error(f"Frontend generation failed: {e}", exc_info=True)
         return False

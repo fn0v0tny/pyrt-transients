@@ -4,9 +4,10 @@ from astropy.time import Time
 
 
 def unix_to_mjd(unix_time):
-    """Convert Unix timestamp to Modified Julian Date."""
+    """Convert Unix timestamp to Modified Julian Date; NaN if the input
+    isn't a valid timestamp (previously the raw unix time was returned,
+    i.e. a wrong number in MJD's place rather than a visibly missing one)."""
     try:
-        t = Time(unix_time, format='unix')
-        return t.mjd
-    except:
-        return unix_time
+        return Time(unix_time, format='unix').mjd
+    except (ValueError, TypeError):
+        return float("nan")

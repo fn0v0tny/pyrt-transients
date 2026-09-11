@@ -46,8 +46,23 @@ written.
 import numpy as np
 from astropy.table import Table
 
+from pyrt_transient.catalog import CatalogNoCoverageError
 from pyrt_transient.config_trans import DetectionConfig
+from pyrt_transient.core.color_model import has_colour_terms
+from pyrt_transient.core.radii import _plate_scale_arcsec_per_px
 from pyrt_transient.core.scoring import add_base_quality_scores
+
+
+def _match_floor_px(config, cat_name, detections):
+    """config.detection.catalog_match_floor_arcsec entry for this catalogue
+    (substring match on the name), in pixels; None if there is none."""
+    floors = getattr(config.detection, "catalog_match_floor_arcsec", None) or {}
+    name = str(cat_name).lower()
+    arcsec = max((v for k, v in floors.items() if k.lower() in name), default=None)
+    if arcsec is None:
+        return None
+    scale = _plate_scale_arcsec_per_px(detections, config.detection.default_plate_scale_arcsec_per_px)
+    return float(arcsec) / float(scale)
 
 
 def _add_detection_features(candidates):
@@ -103,8 +118,32 @@ def find_transients_multicatalog(
     filter_pattern=None,
     mag_change_threshold=1.0,
 ):
-    """Enhanced version with better error handling."""
+    """Enhanced version with better error handling.
+
+    Returns (results, failed): `results` maps catalogue name -> candidate
+    table for every catalogue that could be searched, `failed` maps
+    catalogue name -> error string for those that raised (a download
+    failure, a timeout). A catalogue that was searched and legitimately has
+    no coverage or no rows appears in neither -- that is a permanent
+    property of the field, while `failed` is this run's bad luck and the
+    caller must not cache the epoch as finished because of it.
+    """
     results = {}
+    _warn_if_band_uncorrected(detections, logger)
+    # Catalogues that could not be used for this field: no coverage, no
+    # rows, download failure. They are NOT put into `results` as empty
+    # tables -- combine_results counts len(results) as the agreement
+    # denominator, so an empty entry would veto every source under
+    # min_catalogs_fraction=1.0 and the field would silently yield zero
+    # candidates (e.g. any field south of Dec -30 with Pan-STARRS in the
+    # list). A catalogue that WAS searched and found nothing is different
+    # and does stay in (see _empty_candidates_table below).
+    #
+    # The two are kept apart: `no_coverage` is a fact about the field that
+    # will be just as true next run, `failed` is a download that blew up and
+    # may well work next time.
+    no_coverage = {}
+    failed = {}
 
     for cat_name in catalogs:
         try:
@@ -112,7 +151,15 @@ def find_transients_multicatalog(
 
             # Load catalog once — let download failures propagate immediately
             # to the outer except so a timed-out catalog is not retried.
+            # Note the load is eager: pyrt's Catalog.__init__ runs the query,
+            # so an empty field surfaces as CatalogNoCoverageError below
+            # rather than as a None/empty return here.
             catalog = catalog_loader.get_optimized_catalog(cat_name, params)
+            if catalog is None or len(catalog) == 0:
+                no_coverage[cat_name] = "no coverage / no rows for this field"
+                logger.warning(f"Catalog {cat_name} unavailable for this field (no rows); "
+                               f"excluded from the agreement requirement")
+                continue
 
             # Try optimized detection path, fall back to standard on failure.
             try:
@@ -126,7 +173,11 @@ def find_transients_multicatalog(
                     det_for_analysis.meta['adaptive_idlimit_enabled'] = True
                     det_for_analysis.meta['adaptive_nsigma'] = config.detection.adaptive_nsigma
                     det_for_analysis.meta['adaptive_percentile'] = config.detection.adaptive_percentile
-                    det_for_analysis.meta['idlimit_min_px'] = config.detection.idlimit_min_px
+                    min_px = config.detection.idlimit_min_px
+                    floor_px = _match_floor_px(config, cat_name, det_for_analysis)
+                    if floor_px is not None:
+                        min_px = max(min_px, floor_px)
+                    det_for_analysis.meta['idlimit_min_px'] = min_px
                     det_for_analysis.meta['idlimit_max_px'] = config.detection.idlimit_max_px
                     det_for_analysis.meta['use_astvar'] = config.detection.use_astvar
 
@@ -140,6 +191,11 @@ def find_transients_multicatalog(
                     mag_change_threshold=mag_change_threshold,
                     siglim=config.detection.siglim if config else 5.0,
                     new_source_siglim=config.detection.new_source_siglim if config else None,
+                    unphotometered_match_is_new=(
+                        config.detection.unphotometered_match_is_new if config else True),
+                    unphotometered_veto_max_brightening=(
+                        getattr(config.detection, "unphotometered_veto_max_brightening_mag", None)
+                        if config else None),
                     frame=10.0
                 )
                 logger.info(f"✅ Used optimized detection for {cat_name}")
@@ -204,9 +260,17 @@ def find_transients_multicatalog(
 
             results[cat_name] = candidates
 
+        except CatalogNoCoverageError as e:
+            no_coverage[cat_name] = str(e)
+            logger.warning(f"Catalog {cat_name} unavailable for this field ({e}); "
+                           f"excluded from the agreement requirement")
+            continue
+
         except Exception as e:
             logger.error(f"Failed to process catalog {cat_name}: {str(e)}")
-            results[cat_name] = _empty_candidates_table()
+            failed[cat_name] = str(e)
+            logger.warning(f"Catalog {cat_name} failed for this field ({e}); "
+                           f"excluded from the agreement requirement")
             continue
 
     # VSX/SkyBoT filtering does NOT happen here -- see stdpipe_filters.py.
@@ -221,7 +285,33 @@ def find_transients_multicatalog(
     # clustering.py's combine_results, right after catalogs are vstacked
     # together for that epoch.
 
-    return results
+    unavailable = {**no_coverage, **failed}
+    if unavailable:
+        logger.warning(f"{len(unavailable)}/{len(catalogs)} catalogs unavailable for this field: "
+                       f"{sorted(unavailable)}; agreement required among the {len(results)} available")
+    if not results:
+        logger.error("No reference catalog available for this field -- no candidates can be produced")
+    return results, failed
+
+
+def _warn_if_band_uncorrected(detections, logger) -> None:
+    """catalog.py compares MAG_CALIB against the catalogue's Sloan r
+    (`magnitudes[idx, 1]`), corrected to the frame's system only through
+    the colour terms in RESPONSE. A non-r frame whose RESPONSE has no colour
+    term is therefore compared against plain r -- every red/blue star then
+    carries a colour-dependent offset that can read as a magnitude change.
+    """
+    meta = getattr(detections, "meta", None) or {}
+    band = str(meta.get("PHFILTER", meta.get("FILTER", "")) or "")
+    if not band or "r" in band.lower():
+        return
+    if has_colour_terms(meta.get("RESPONSE")):
+        return
+    logger.warning(
+        f"{meta.get('filename', 'this epoch')}: band {band!r} is compared against catalogue "
+        f"Sloan r with no colour term in RESPONSE={meta.get('RESPONSE')!r} -- colour-dependent "
+        f"offsets can be mistaken for magnitude changes"
+    )
 
 
 def _add_catalog_context_safe(candidates, catalog, radius, config, logger, filter_pattern=None, image_id=None):
@@ -233,6 +323,16 @@ def _add_catalog_context_safe(candidates, catalog, radius, config, logger, filte
     if config and hasattr(config.detection, 'radius_check'):
         radius = config.detection.radius_check
 
+    max_mag = None
+    margin = getattr(config.detection, "isolation_max_mag_margin", None) if config else None
+    if margin is not None:
+        meta = getattr(candidates, "meta", None) or {}
+        limit = meta.get("MAGLIMIT", meta.get("MAGLIM"))
+        try:
+            max_mag = float(limit) + float(margin)
+        except (TypeError, ValueError):
+            max_mag = None
+
     try:
         # Try optimized method first
         positions = np.column_stack((candidates["X_IMAGE"], candidates["Y_IMAGE"]))
@@ -240,7 +340,8 @@ def _add_catalog_context_safe(candidates, catalog, radius, config, logger, filte
             positions=positions,
             radius=radius,
             filter_pattern=filter_pattern,
-            image_id=image_id
+            image_id=image_id,
+            max_mag=max_mag,
         )
 
         for stat_name, values in stats.items():

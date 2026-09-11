@@ -24,6 +24,7 @@ website directory (cleanup_old_files/enforce_disk_budget_strict), rather
 than inventing a second cleanup mechanism.
 """
 
+import inspect
 import logging
 from pathlib import Path
 from typing import List, Optional, Tuple
@@ -56,6 +57,25 @@ def _patch_normalize_ps1_skycell() -> None:
     importable (falls back to stdpipe's own, occasionally-crashing version
     otherwise, since a monkeypatch attempt without fitsio would just be a
     different way of doing nothing).
+
+    The "older checkout" part of that is load-bearing: this patch was
+    written against a `normalize_ps1_skycell(filename, outname=None,
+    verbose=False)` that reopens a file from disk. A newer stdpipe (verified
+    against 0.4.1 from PyPI) changed the signature to
+    `normalize_ps1_skycell(image, header, verbose=False)` -- pure in-memory
+    array/header normalization, called internally with the already-decoded
+    skycell data, no reopening involved. Applying this patch unconditionally
+    against that newer signature doesn't restore the old bug -- it breaks
+    every PS1 call outright, binding the in-memory `image` array to this
+    function's `filename` parameter and crashing when astropy tries to treat
+    a numpy array as a path. Directly verified against 0.4.1 on a real
+    field: with this patch *not* applied, stdpipe's own current
+    normalize_ps1_skycell handles real skycells (including BLANK-valued
+    masks) without the original decompression error, so the bug this patch
+    targets is apparently already fixed upstream in 0.4.1. So: guard on the
+    installed function's parameter names before patching, and fall back to
+    stdpipe's own (here, working) implementation if they don't match the
+    old `filename`-based form this patch targets.
     """
     global _ps1_patch_applied
     if _ps1_patch_applied:
@@ -64,8 +84,36 @@ def _patch_normalize_ps1_skycell() -> None:
         import fitsio
         import stdpipe.templates as _stdpipe_templates
     except ImportError:
+        # No fitsio: the replacement below cannot run (it reads the skycell
+        # with fitsio), so stdpipe's own implementation stays. That decision
+        # is final for this process -- set the flag, or every PS1 call
+        # re-attempts the import and re-inspects the signature.
+        _ps1_patch_applied = True
         logger.debug("PS1 template: fitsio not available, using stdpipe's own "
                       "normalize_ps1_skycell (may fail on some real skycells)")
+        return
+
+    # Missing symbol / unintrospectable callable: same class of problem as the
+    # ImportError above, and this function is called from outside the caller's
+    # own try (get_template), so anything raised here kills the detection run
+    # rather than degrading to "no template".
+    original = getattr(_stdpipe_templates, "normalize_ps1_skycell", None)
+    try:
+        original_params = list(inspect.signature(original).parameters)
+    except (TypeError, ValueError):
+        _ps1_patch_applied = True
+        logger.debug("PS1 template: this stdpipe build has no introspectable "
+                     "normalize_ps1_skycell, leaving it alone")
+        return
+
+    if original_params[:1] != ["filename"]:
+        _ps1_patch_applied = True
+        logger.debug(
+            "PS1 template: installed stdpipe's normalize_ps1_skycell has a "
+            f"different signature ({original_params}) than the old "
+            "filename-based one this patch targets -- assuming a newer "
+            "stdpipe that already fixed the bug, using its own implementation"
+        )
         return
 
     def _normalize_ps1_skycell_fixed(filename, outname=None, verbose=False):
