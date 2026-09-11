@@ -176,6 +176,14 @@ def classify(facts, targets):
     return (target["name"] if target else facts["object"]), pipeline_entry.is_grb(meta, target)
 
 
+def _mtime(path):
+    """st_mtime, or 0 for a directory that is gone (cleaned up meanwhile)."""
+    try:
+        return os.stat(path).st_mtime
+    except OSError:
+        return 0
+
+
 def describe(obs_dir, facts, targets, with_candidates=0):
     name, grb = classify(facts, targets)
     try:
@@ -190,7 +198,7 @@ def describe(obs_dir, facts, targets, with_candidates=0):
                "grb_ra": facts.get("grb_ra"), "grb_dec": facts.get("grb_dec"), "grb_err": facts.get("grb_err"),
                "frames": len(frames), "first_frame": _frame_time(frames[0]) if frames else "",
                "last_frame": _frame_time(frames[-1]) if frames else "",
-               "updated": obs_dir.stat().st_mtime,
+               "updated": _mtime(obs_dir),
                "candidates": len(rows), "reliable": sum(r["q"] >= 1 for r in rows)}
     if with_candidates:
         summary["top"] = sorted(rows, key=lambda r: -r["q"])[:with_candidates]
@@ -205,11 +213,11 @@ def collect(data_dir, public_dir, daemon_log, rows):
         cache = {}
     try:
         with os.scandir(data_dir) as it:
-            obs_dirs = [(e.stat().st_mtime, Path(e.path)) for e in it
+            obs_dirs = [(_mtime(e.path), Path(e.path)) for e in it
                         if e.name.startswith("obs_") and e.is_dir()]
     except OSError:
         obs_dirs = []
-    obs_dirs = [p for _, p in sorted(obs_dirs, reverse=True)]
+    obs_dirs = [p for m, p in sorted(obs_dirs, reverse=True) if m]
 
     targets = {}
 
@@ -220,12 +228,12 @@ def collect(data_dir, public_dir, daemon_log, rows):
         return facts
 
     shown = obs_dirs[:rows]
-    latest = [describe(d, f, targets) for d, f in zip(shown, facts_for(shown))]
+    latest = [describe(d, f, targets) for d, f in zip(shown, facts_for(shown)) if d.is_dir()]
     latest_grb = None
     for start in range(0, len(obs_dirs), GRB_SEARCH_CHUNK):  # newest first
         chunk = obs_dirs[start:start + GRB_SEARCH_CHUNK]
         for d, f in zip(chunk, facts_for(chunk)):
-            if classify(f, targets)[1]:
+            if classify(f, targets)[1] and d.is_dir():
                 latest_grb = describe(d, f, targets, with_candidates=5)
                 break
         if latest_grb:
@@ -397,9 +405,16 @@ def main(argv=None):
         except BlockingIOError:
             again.touch()  # the run in progress will go once more
             return
+        error = data_dir / ".status_page.error"
         while True:
             again.unlink(missing_ok=True)
-            generate(data_dir, args.public_dir, args.daemon_log, args.rows, args.title, args.out_dir)
+            try:
+                generate(data_dir, args.public_dir, args.daemon_log, args.rows, args.title, args.out_dir)
+                error.unlink(missing_ok=True)
+            except Exception:  # runs detached from the pipeline: keep the reason somewhere
+                import traceback
+                error.write_text(f"{datetime.now(timezone.utc):%Y-%m-%d %H:%M:%S} UTC\n"
+                                 + traceback.format_exc())
             if not again.exists():
                 break
 

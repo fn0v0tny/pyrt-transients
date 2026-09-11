@@ -150,3 +150,32 @@ def test_main_collapses_overlapping_runs(tmp_path, monkeypatch):
     status_page.main(["--data-dir", str(data), "--public-dir", str(public), "--daemon-log", str(log)])
 
     assert len(calls) == 2 and not (data / ".status_page.again").exists()
+
+
+def test_an_observation_deleted_while_the_page_is_built_is_left_out(tmp_path, targets_db, monkeypatch):
+    # lascaux50, 2026-09-11: a cleanup removed obs dirs while the page ran.
+    import shutil
+    data, public, log = _setup(tmp_path)
+    real = status_page.header_facts
+
+    def vanishing(obs_dir, cache):
+        if obs_dir.name == "obs_104210" and obs_dir.exists():
+            shutil.rmtree(obs_dir)
+        return real(obs_dir, cache)
+
+    monkeypatch.setattr(status_page, "header_facts", vanishing)
+    status = status_page.generate(data, public, log)
+
+    assert [o["obs_id"] for o in status["observations"]] == ["104215", "99995"]
+
+
+def test_an_error_is_recorded_not_lost(tmp_path, monkeypatch):
+    data, public, log = _setup(tmp_path)
+
+    def broken(*args, **kw):
+        raise RuntimeError("boom")
+
+    monkeypatch.setattr(status_page, "generate", broken)
+    status_page.main(["--data-dir", str(data), "--public-dir", str(public), "--daemon-log", str(log)])
+
+    assert "boom" in (data / ".status_page.error").read_text()
