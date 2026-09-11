@@ -96,6 +96,8 @@ class CatalogCache:
     # Pointings within CACHE_GRID_DEG share one cache entry.  The query box
     # is padded by this amount so the cached data always covers the footprint.
     CACHE_GRID_DEG = 1.0
+    # Entries older than this are refreshed (see load_from_cache).
+    MAX_AGE_DAYS = 30.0
 
     def __init__(self, cache_dir: str = "./catalog_cache") -> None:
         self.cache_dir = Path(cache_dir)
@@ -140,8 +142,17 @@ class CatalogCache:
     # ------------------------------------------------------------------
 
     def load_from_cache(
-        self, catalog_name: str, params: QueryParams
+        self, catalog_name: str, params: QueryParams, allow_stale: bool = False
     ) -> Optional[astropy.table.Table]:
+        """The cached table, or None.
+
+        An entry older than MAX_AGE_DAYS stays on disk: the refresh
+        overwrites it, and if the refresh fails it is still returned with
+        allow_stale. That fallback is used during a catalogue-server outage.
+        Deleting the entry up front meant a field lost its catalogue to an
+        outage (Gaia TAP returning 500 on lascaux50, 2026-09-11) even though
+        month-old star positions would have done.
+        """
         path = self.get_cache_path(catalog_name, params)
         if not path.exists():
             return None
@@ -150,15 +161,21 @@ class CatalogCache:
                 cached = pickle.load(fh)
             if isinstance(cached, dict) and "data" in cached and "timestamp" in cached:
                 age_days = (time.time() - cached["timestamp"]) / 86400
-                if age_days < 30:
+                if age_days < self.MAX_AGE_DAYS:
                     logging.info(
                         f"Loaded {catalog_name} from cache (age: {age_days:.1f} d)"
+                    )
+                    return cached["data"]
+                if allow_stale:
+                    logging.warning(
+                        f"Using the expired {catalog_name} cache ({age_days:.1f} d): "
+                        f"the refresh failed"
                     )
                     return cached["data"]
                 logging.info(
                     f"Cache for {catalog_name} expired ({age_days:.1f} d), refreshing"
                 )
-                path.unlink()
+                return None
         except Exception as exc:
             logging.info(f"Failed to load cache for {catalog_name}: {exc}")
             try:
@@ -737,43 +754,88 @@ class CatTransients(_PyrtCatalog):
     # Override _fetch_catalog_data to add disk caching + Legacy Survey
     # ------------------------------------------------------------------
 
+    # Queries that failed in this process: (catalogue, cache key) -> error.
+    # A run recomputes every epoch still marked degraded. Without this, a
+    # catalogue server that is down (Gaia TAP answering 500 after ~3 min on
+    # lascaux50, 2026-09-11) was asked again for each of those epochs, so
+    # run n cost n timeouts until the daemon's 900 s limit killed it. The
+    # next process tries the server again.
+    _failed_queries: dict = {}
+
+    def _tag_table(self, table, config, **flags):
+        table.meta.update(
+            {
+                "catalog":  self._catalog_name,
+                "astepoch": config["epoch"],
+                "filters":  list(config["filters"].keys()),
+                **flags,
+            }
+        )
+        return table
+
+    def _stale_cache(self, params, config):
+        """The field's expired disk-cache entry, or None."""
+        if not config.get("cacheable", False):
+            return None
+        stale = self.get_cache().load_from_cache(self._catalog_name, params, allow_stale=True)
+        return None if stale is None else self._tag_table(stale, config, cached=True, stale=True)
+
     def _fetch_catalog_data(self) -> Optional[astropy.table.Table]:  # type: ignore[override]
-        """Fetch catalog data, adding disk caching and Legacy Survey support."""
+        """Fetch catalog data, adding disk caching and Legacy Survey support.
+
+        A query that fails, as opposed to one that finds no coverage, falls
+        back to the field's expired cache entry if there is one. A query
+        that already failed in this process is not sent again (see
+        _failed_queries).
+        """
         if self._catalog_name not in self.KNOWN_CATALOGS:
             raise ValueError(f"Unknown catalog: {self._catalog_name}")
 
         config = self.KNOWN_CATALOGS[self._catalog_name]
         cacheable = config.get("cacheable", False)
+        # A copy: _widen_query_for_cache widens self._query_params in place,
+        # and the disk cache is keyed on the caller's box.
+        params = QueryParams(**{k: getattr(self._query_params, k)
+                                for k in QueryParams.__dataclass_fields__})
+        failure_key = (self._catalog_name, params.ra, params.dec,
+                       params.width, params.height, params.mlim)
 
         # Try disk cache first
         if cacheable:
-            cached = self.get_cache().load_from_cache(
-                self._catalog_name, self._query_params
-            )
+            cached = self.get_cache().load_from_cache(self._catalog_name, params)
             if cached is not None:
-                cached.meta.update(
-                    {
-                        "catalog":  self._catalog_name,
-                        "astepoch": config["epoch"],
-                        "filters":  list(config["filters"].keys()),
-                        "cached":   True,
-                    }
-                )
-                return cached
+                return self._tag_table(cached, config, cached=True)
 
+        if failure_key in self._failed_queries:
+            stale = self._stale_cache(params, config)
+            if stale is not None:
+                return stale
+            raise RuntimeError(f"{self._catalog_name} query already failed in this run: "
+                               f"{self._failed_queries[failure_key]}")
+
+        if cacheable:
             # Widen the query so nearby pointings get a cache hit
             self._widen_query_for_cache()
 
         try:
-            if self._catalog_name == self.LEGACYSURVEY:
-                result = self._get_legacysurvey_data()
-            elif self._catalog_name == self.GAIA_FULL:
-                result = self._get_gaia_full_data()
-            elif self._catalog_name == self.PANSTARRS_VIZIER:
-                result = self._get_panstarrs_vizier_data()
-            else:
-                # Parent handles ATLAS, PANSTARRS, GAIA, USNOB, SDSS, MAKAK
-                result = super()._fetch_catalog_data()
+            try:
+                if self._catalog_name == self.LEGACYSURVEY:
+                    result = self._get_legacysurvey_data()
+                elif self._catalog_name == self.GAIA_FULL:
+                    result = self._get_gaia_full_data()
+                elif self._catalog_name == self.PANSTARRS_VIZIER:
+                    result = self._get_panstarrs_vizier_data()
+                else:
+                    # Parent handles ATLAS, PANSTARRS, GAIA, USNOB, SDSS, MAKAK
+                    result = super()._fetch_catalog_data()
+            except CatalogNoCoverageError:
+                raise
+            except Exception as exc:
+                self._failed_queries[failure_key] = str(exc)
+                stale = self._stale_cache(params, config)
+                if stale is not None:
+                    return stale
+                raise
 
             if result is None:
                 # Every path that returns None here means "the query ran and
@@ -783,14 +845,7 @@ class CatTransients(_PyrtCatalog):
                 raise CatalogNoCoverageError(
                     f"No data retrieved from {self._catalog_name}")
 
-            result.meta.update(
-                {
-                    "catalog":  self._catalog_name,
-                    "astepoch": config["epoch"],
-                    "filters":  list(config["filters"].keys()),
-                    "cached":   False,
-                }
-            )
+            self._tag_table(result, config, cached=False)
 
             if cacheable and len(result) > 0:
                 # Save under the original (pre-widening) params so that future
