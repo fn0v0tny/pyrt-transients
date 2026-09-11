@@ -111,22 +111,30 @@ def astrometric_error_model(meta):
     pyrt from mates14/pyrt 97101a7 on fits sigma_total^2 = ASTSIGMA^2 +
     (ERRX2+ERRY2)*ASTVAR: ASTSIGMA is the systematic WCS floor (px) and
     ASTVAR the centroid scale factor; those ECSVs also carry ASTSCATT, the
-    plain residual scatter. Older pyrt wrote ASTSIGMA as that scatter and
-    ASTVAR as a pure multiplier with no floor, which is what is assumed
-    when ASTSCATT is absent -- so ECSVs of either vintage keep working.
+    plain residual scatter.
+
+    Older pyrt (no ASTSCATT) wrote ASTSIGMA as that residual scatter and
+    ASTVAR as a pure multiplier. The scatter is used as the floor for them
+    too. Without it, a bright star's radius is its tiny centroid error
+    clipped to idlimit_min_px (1 px), below the frame's own astrometric
+    scatter. On the D50 archive (ASTSIGMA 0.4-0.5 px) edge stars 0.6-0.9 px
+    from Gaia then lost their match in enough epochs to become persistent
+    "new" candidates. Replaying GRB 211024B and 220403B at the final epoch
+    gave 13/14 of them against 4/5 with the floor, afterglow still
+    recovered.
     """
     meta = meta or {}
     astvar = _finite_meta(meta, "ASTVAR")
+    astsigma = _finite_meta(meta, "ASTSIGMA")
+    floor = astsigma ** 2 if astsigma is not None and astsigma > 0 else 0.0
     if "ASTSCATT" in meta:
-        astsigma = _finite_meta(meta, "ASTSIGMA")
-        floor = astsigma ** 2 if astsigma is not None else 0.0
         return floor, (astvar if astvar is not None and astvar >= 0 else 1.0)
-    return 0.0, (astvar if astvar is not None and astvar > 0 else 1.0)
+    return floor, (astvar if astvar is not None and astvar > 0 else 1.0)
 
 
 def scaled_position_error(pos_err, meta):
     """Centroid error (px) -> total positional error (px) under the frame's
-    astrometric error model; for older ECSVs this is pos_err*sqrt(ASTVAR)."""
+    astrometric error model: sqrt(ASTSIGMA^2 + pos_err^2 * ASTVAR)."""
     floor, scale = astrometric_error_model(meta)
     return np.sqrt(floor + np.asarray(pos_err, dtype=float) ** 2 * scale)
 

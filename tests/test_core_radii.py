@@ -165,9 +165,9 @@ if __name__ == "__main__":
 # --- pyrt's astrometric error model (mates14/pyrt 97101a7) -----------------
 
 def test_new_pyrt_error_model_adds_the_wcs_floor():
-    """ECSVs from pyrt >= 97101a7 carry ASTSCATT, and there
-    sigma_total^2 = ASTSIGMA^2 + (ERRX2+ERRY2)*ASTVAR; older ones keep the
-    plain sqrt(ASTVAR) scaling with no floor."""
+    """sigma_total^2 = ASTSIGMA^2 + (ERRX2+ERRY2)*ASTVAR. With pyrt >= 97101a7
+    (ASTSCATT present) ASTSIGMA is the fitted WCS floor; with older pyrt it
+    is the residual scatter, used as the floor all the same."""
     import numpy as np
     import pytest
     from pyrt_transient.core.radii import scaled_position_error
@@ -177,8 +177,30 @@ def test_new_pyrt_error_model_adds_the_wcs_floor():
     # SC = 0 is a valid fit: the floor alone.
     assert scaled_position_error(0.1, dict(new, ASTVAR=0.0)) == pytest.approx(0.3)
     old = {"ASTSIGMA": 0.3, "ASTVAR": 2.0}
-    assert scaled_position_error(0.1, old) == pytest.approx(0.1 * np.sqrt(2.0))
+    assert scaled_position_error(0.1, old) == pytest.approx(np.sqrt(0.3**2 + 0.1**2 * 2.0))
+    assert scaled_position_error(0.1, {"ASTVAR": 2.0}) == pytest.approx(0.1 * np.sqrt(2.0))
     assert scaled_position_error(0.1, {}) == pytest.approx(0.1)
+
+
+def test_bright_star_radius_is_not_below_the_frames_astrometric_scatter():
+    """D50 archive frames (older pyrt: ASTSIGMA 0.45 px, ASTVAR 8.7). A bright
+    star's centroid error is tiny, so without the ASTSIGMA floor its radius
+    was the 1 px minimum. Edge stars 0.6-0.9 px from Gaia then missed their
+    match in enough epochs to become persistent "new" candidates (GRB 211024B:
+    13 at the final epoch against 4 with the floor)."""
+    import numpy as np
+    import pytest
+    from astropy.table import Table
+    from pyrt_transient.catalog import CatTransients
+
+    det = Table({"ERRX2_IMAGE": [1e-4], "ERRY2_IMAGE": [1e-4]})
+    det.meta.update({"ASTSIGMA": 0.45, "ASTVAR": 8.7})
+
+    radius = CatTransients._compute_adaptive_radii(None, det, nsigma=3.0,
+                                                   idlimit_min_px=1.0, idlimit_max_px=8.0)
+
+    assert np.asarray(radius)[0] == pytest.approx(3.0 * np.sqrt(0.45**2 + 2e-4 * 8.7))
+    assert np.asarray(radius)[0] > 1.3
 
 
 def test_both_radius_implementations_use_the_new_error_model():

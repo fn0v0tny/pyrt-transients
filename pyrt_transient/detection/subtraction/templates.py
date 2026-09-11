@@ -150,6 +150,160 @@ def _patch_normalize_ps1_skycell() -> None:
     logger.debug("PS1 template: applied fitsio-based normalize_ps1_skycell patch")
 
 
+_get_skycells_patch_applied = False
+
+
+def _patch_get_skycells() -> None:
+    """stdpipe.templates.get_skycells (as installed here) crashes on some
+    real PS1 skycell *downloads* -- not the same bug/site as
+    normalize_ps1_skycell above. This one is in astropy's own tiled-
+    compression decompression itself: `hdu[1].data` on the freshly
+    downloaded CompImageHDU raises `ValueError: cannot convert float NaN to
+    integer` inside decompress_image_data_section, for skycells whose
+    BLANK-valued tiles it tries to NaN-fill into an integer-typed array.
+    Verified directly against a real download for this campaign's field
+    (rings.v3.skycell.2011.080.stk.r.unconv.fits) -- reading the exact same
+    cached file via fitsio instead of astropy's `.data` property works
+    fine, matching the precedent above: swap readers for the one call site
+    astropy can't handle, don't touch anything else.
+
+    get_skycells does a lot around this one line (caching, PS1/LS
+    normalization, invvar masking, downscaling) that has to keep working
+    identically, so this reimplements the whole function rather than
+    patching just the read -- only the `hdu[1].data` line actually differs
+    from stdpipe's original (see the "fitsio fallback" comment below).
+    Only applied once per process, and only if `fitsio` is importable, same
+    guard as the patch above.
+    """
+    global _get_skycells_patch_applied
+    if _get_skycells_patch_applied:
+        return
+    try:
+        import fitsio
+        import stdpipe.templates as _stdpipe_templates
+    except ImportError:
+        logger.debug("PS1 template: fitsio not available, using stdpipe's own "
+                      "get_skycells (may fail on some real skycells)")
+        return
+
+    import os
+    import tempfile
+    from astropy.io import fits as _fits
+
+    def _get_skycells_fixed(
+        ra0, dec0, sr0, band='r', ext='image', survey='ps1', normalize=True,
+        overwrite=False, wcs=None, width=None, height=None, _cachedir=None,
+        _cache_downscale=1, _tmpdir=None, verbose=False,
+    ):
+        log = (verbose if callable(verbose) else print) if verbose else lambda *a, **k: None
+
+        if _cachedir is not None:
+            _cachedir = os.path.expanduser(_cachedir)
+            log('Cache location is', _cachedir)
+        else:
+            if _tmpdir is None:
+                _tmpdir = tempfile.gettempdir()
+            _cachedir = os.path.join(_tmpdir, survey)
+            log('Cache location not specified, falling back to %s' % _cachedir)
+
+        try:
+            os.makedirs(_cachedir)
+        except OSError:
+            pass
+
+        filenames = []
+        cells = _stdpipe_templates.find_skycells(
+            ra0, dec0, sr0, band=band, ext=ext, survey=survey, wcs=wcs,
+            width=width, height=height,
+        )
+
+        for cell in cells:
+            cellname = os.path.basename(cell)
+            filename = os.path.join(_cachedir, cellname)
+
+            if survey == 'ls' and filename.endswith('.fz'):
+                filename = os.path.splitext(filename)[0]
+
+            if _cache_downscale > 1:
+                filename, fext = os.path.splitext(filename)
+                filename = filename + ('.x%d' % _cache_downscale) + fext
+
+            if os.path.exists(filename) and not overwrite:
+                log('%s already downloaded' % os.path.split(filename)[-1])
+            else:
+                log('Downloading %s' % cellname)
+
+                hdu = _stdpipe_templates.fits_open_remote(cell)
+                if hdu is not None:
+                    try:
+                        image, header = hdu[1].data, hdu[1].header
+                    except ValueError:
+                        # fitsio fallback: astropy's compressed-tile decompression
+                        # can't handle this skycell's BLANK-into-integer tiles --
+                        # read the exact same cached local file with fitsio instead.
+                        local_path = hdu.filename()
+                        log('astropy decompression failed for %s, retrying with fitsio' % cellname)
+                        image = fitsio.read(local_path, ext=1)
+                        header = _fits.getheader(local_path, ext=1)
+
+                    if normalize:
+                        if survey == 'ps1':
+                            # Not _stdpipe_templates.normalize_ps1_skycell here:
+                            # _patch_normalize_ps1_skycell above replaces that name
+                            # with a *file-based* fixed version (filename, outname)
+                            # -- a different calling convention than the
+                            # (image, header) -> (image, header) one get_skycells
+                            # actually uses at this call site. Calling the patched
+                            # name here would pass `image` positionally where it
+                            # expects a filename (verified directly: raises
+                            # "truth value of an array is ambiguous" inside
+                            # fits.getheader). Inlined here instead, straight from
+                            # stdpipe's original array-based normalize_ps1_skycell
+                            # body, so this call site never touches that patch.
+                            if 'RADESYS' not in header and 'PC001001' in header:
+                                header = header.copy()
+                                header['RADESYS'] = 'FK5'
+                                header.rename_keyword('PC001001', 'PC1_1')
+                                header.rename_keyword('PC001002', 'PC1_2')
+                                header.rename_keyword('PC002001', 'PC2_1')
+                                header.rename_keyword('PC002002', 'PC2_2')
+                                if 'BSOFTEN' in header and 'BOFFSET' in header:
+                                    x = image * 0.4 * np.log(10)
+                                    image = header['BOFFSET'] + header['BSOFTEN'] * (np.exp(x) - np.exp(-x))
+                                    image /= header['EXPTIME']
+                                    for kw in ['BSOFTEN', 'BOFFSET', 'BLANK']:
+                                        header.remove(kw, ignore_missing=True)
+
+                        if survey == 'ls' and ext == 'image':
+                            try:
+                                ihdu = _stdpipe_templates.fits_open_remote(cell.replace('-image-', '-invvar-'))
+                                if ihdu is not None:
+                                    invvar = ihdu[1].data
+                                    image[invvar == 0] = np.nan
+                                    ihdu.close()
+                            except Exception:
+                                pass
+
+                    if _cache_downscale > 1:
+                        image, header = _stdpipe_templates.cutouts.downscale_image(
+                            image, header=header, scale=_cache_downscale,
+                            mode='or' if ext == 'mask' else 'sum',
+                        )
+                        log("Downscaling the image and storing it as", os.path.split(filename)[-1])
+
+                    _fits.writeto(filename, image, header, overwrite=True)
+                    hdu.close()
+
+            if os.path.exists(filename):
+                filenames.append(filename)
+
+        return filenames
+
+    _stdpipe_templates.get_skycells = _get_skycells_fixed
+    _get_skycells_patch_applied = True
+    logger.debug("PS1 template: applied fitsio-based get_skycells patch")
+
+
 def _field_cache_key(ra: float, dec: float, band: str, grid_deg: float = 0.02) -> str:
     """Filesystem-safe cache key for a field/band template, rounded to a
     coarse grid (0.02 deg ~= 1.2 arcmin) so slightly different pointings of
@@ -295,6 +449,7 @@ def _get_survey_template(
 
     if survey == "ps1":
         _patch_normalize_ps1_skycell()
+        _patch_get_skycells()
 
     try:
         image, mask = fetch_fn(band=band, header=header, verbose=verbose)
