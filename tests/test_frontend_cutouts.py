@@ -51,7 +51,7 @@ def test_lightcurve_positions_land_on_the_0_based_frame_pixel():
 
     positions = _lightcurve_pixel_positions(lightcurve)
 
-    assert len(positions) == 5
+    assert set(wcs_by_stem) <= set(positions)
     for row in lightcurve:
         path = Path(row["source_file"])
         x0, y0 = wcs_by_stem[path.stem].all_world2pix(row["ALPHA_J2000"], row["DELTA_J2000"], 0)
@@ -60,6 +60,19 @@ def test_lightcurve_positions_land_on_the_0_based_frame_pixel():
         # off-by-one position is 1 px out.
         assert x == pytest.approx(float(x0), abs=0.3)
         assert y == pytest.approx(float(y0), abs=0.3)
+
+
+def test_lightcurve_positions_also_key_the_astrometry_solved_dft_stem():
+    # D50 production: the epoch row points at the "-df" catalog, the
+    # cutout is read from the WCS-solved "-dft" image.
+    lightcurve = Table(rows=[("/obs/20250813-a-df.ecsv", 11.0, 21.0),
+                             ("/obs/20250813-b-df.ecsv", 31.0, 41.0)],
+                       names=("source_file", "X_IMAGE", "Y_IMAGE"))
+
+    positions = _lightcurve_pixel_positions(lightcurve)
+
+    assert positions["20250813-a-dft"] == positions["20250813-a-df"] == (10.0, 20.0)
+    assert positions["20250813-b-dft"] == (30.0, 40.0)
 
 
 def test_corner_cutout_keeps_its_size_and_registers_to_the_frame():

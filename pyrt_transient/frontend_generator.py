@@ -132,12 +132,19 @@ def _lightcurve_pixel_positions(lightcurve):
     (on tests/190919B, X_IMAGE minus the frame WCS's 0-based pixel is
     +1.000 for every row), while _read_padded_cutout and save_cutout_plot
     index 0-based -- used raw, every cutout was centred one pixel off.
+
+    Keyed by both the ecsv stem and the stem + "t": on the D50 production
+    data source_file is the "...-df.ecsv" catalog, while the WCS-solved
+    image the cutouts are read from is "...-dft.fits" (the astrometry step
+    appends the "t"). Without the second key the lookup missed and every
+    epoch reused one fixed position on differently pointed frames.
     """
     positions = {}
     for row in lightcurve:
-        # source_file stores the full path to the per-epoch ecsv; stem matches fits stem
         stem = Path(str(row['source_file'])).stem
-        positions[stem] = (float(row['X_IMAGE']) - 1, float(row['Y_IMAGE']) - 1)
+        pos = (float(row['X_IMAGE']) - 1, float(row['Y_IMAGE']) - 1)
+        positions[stem] = pos
+        positions.setdefault(stem + 't', pos)
     return positions
 
 
