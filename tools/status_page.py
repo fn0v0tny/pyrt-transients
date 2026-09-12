@@ -124,7 +124,15 @@ def running_frames(data_dir):
             entry = json.loads(marker.read_text())
             os.kill(int(entry["pid"]), 0)
         except (OSError, ValueError, KeyError):
-            continue  # finished, or a marker left by a killed run
+            # Finished, or left behind by a frame the daemon killed at its
+            # timeout (SIGKILL leaves the marker). Remove it: without that,
+            # one killed frame sits in .running/ for ever and shows as
+            # "running" on every page until something else refreshes.
+            try:
+                marker.unlink()
+            except OSError:
+                pass
+            continue
         frames.append(entry)
     return sorted(frames, key=lambda e: e.get("started", 0))
 
@@ -347,8 +355,14 @@ function renderStatus(s, now) {
     out.push("<p class='muted'>No GRB observation found.</p>");
   }
 
+  const stale = now - s.generated > 900;   // no frame has refreshed the data for a while
+  if (stale) out.push("<p class='warn'>This data is " + ago(now - s.generated) +
+    ". The page is refreshed while frames are being processed, so it stands still when the telescope is idle.</p>");
+
   out.push("<h2>Running now</h2>");
-  if (s.running.length) {
+  if (stale) {
+    out.push("<p class='muted'>Nothing has been processed since " + utc(s.generated) + " UTC.</p>");
+  } else if (s.running.length) {
     out.push("<ul>");
     for (const r of s.running)
       out.push("<li>obs " + esc(r.obs_id) + " &middot; " + esc(r.object) + " &middot; " + esc(r.frame) +

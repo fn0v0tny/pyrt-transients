@@ -236,3 +236,36 @@ def test_the_page_script_renders_the_json_escaped(tmp_path, targets_db):
     assert "../obs_104210/index.html" in out
     assert "(1 min ago)" in out
     assert "s-failed" in out and "Recent failures" in out
+
+
+def test_a_marker_left_by_a_killed_frame_is_removed(tmp_path, targets_db):
+    # The daemon kills a frame at its timeout, so the marker stays behind and
+    # the observation showed as "running" until something else refreshed.
+    data, public, log = _setup(tmp_path)
+    (data / ".running").mkdir()
+    dead = data / ".running" / "999.json"
+    dead.write_text(json.dumps({"pid": 2 ** 22 + 4242, "obs_id": "104215"}))
+
+    status = status_page.generate(data, public, log)
+
+    assert status["running"] == [] and not dead.exists()
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
+def test_stale_data_is_flagged_and_running_is_not_shown(tmp_path, targets_db):
+    _, public, _, _ = _generate(tmp_path, title="D50 test")
+    page = (public / "observations" / "index.html").read_text()
+    script = tmp_path / "page.js"
+    script.write_text(page.split("<script>", 1)[1].split("</script>", 1)[0])
+    status_json = public / "observations" / "transient_status.json"
+
+    out = subprocess.run(
+        ["node", "-e", "const {renderStatus} = require(process.argv[1]);"
+                       "const s = JSON.parse(require('fs').readFileSync(process.argv[2]));"
+                       "s.running = [{obs_id: '104215', object: 'x', frame: 'f.ecsv', started: s.generated}];"
+                       "process.stdout.write(renderStatus(s, s.generated + 3 * 3600));",
+         str(script), str(status_json)],
+        capture_output=True, text=True, check=True).stdout
+
+    assert "This data is 3 h ago" in out and "Nothing has been processed since" in out
+    assert "obs 104215 &middot; x" not in out
