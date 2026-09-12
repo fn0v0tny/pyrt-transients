@@ -242,7 +242,10 @@ that, and redraws in place. It shows:
 
 - daemon health;
 - the frames being processed now;
-- the latest GRB observation and its best candidates;
+- the latest GRB observation and its best candidates, each with the
+  follow-up exposure the pipeline recommends (`followup_exptime_s`, for the
+  target SNR of `FollowupConfig`; an em dash for observations processed
+  before that existed);
 - the latest observations: frames, candidates, and the last job result;
 - recent failures.
 

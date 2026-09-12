@@ -269,3 +269,52 @@ def test_stale_data_is_flagged_and_running_is_not_shown(tmp_path, targets_db):
 
     assert "This data is 3 h ago" in out and "Nothing has been processed since" in out
     assert "obs 104215 &middot; x" not in out
+
+
+def _obs_with_followup(data, public, obs_id, target, age_h):
+    """An observation whose candidates carry the follow-up recommendation."""
+    d = _obs(data, public, obs_id, target, "GRB 260228.871 (SVOM)", age_h)
+    Table(rows=[(237.44, 26.03, 16.2, 3.5, 12, "new", 42.5, 16.3),
+                (237.47, 26.05, 18.9, 0.6, 4, "variable", float("nan"), float("nan"))],
+          names=("ALPHA_J2000", "DELTA_J2000", "MAG_CALIB", "quality_score", "n_detections",
+                 "candidate_type", "followup_exptime_s", "followup_mag")
+          ).write(d / "candidates.tbl", format="ascii.ipac", overwrite=True)
+    return d
+
+
+def test_the_follow_up_exposure_reaches_the_page(tmp_path, targets_db):
+    data, public = tmp_path / "work", tmp_path / "public"
+    data.mkdir(), public.mkdir()
+    _obs_with_followup(data, public, "99995", 53278, age_h=1)
+    log = tmp_path / "transient_daemon.log"
+    log.write_text("2026-09-11 20:38:32,000 - INFO: Status: 0 active jobs, 0 pending (debounce), 1 completed, 0 failed\n")
+
+    status = status_page.generate(data, public, log)
+
+    top = status["latest_grb"]["top"]
+    assert top[0]["followup_exptime_s"] == "42.5" and top[0]["followup_mag"] == "16.3"
+    assert top[1]["followup_exptime_s"] in ("nan", "null", "")   # not computed for this one
+
+
+@pytest.mark.skipif(shutil.which("node") is None, reason="node not installed")
+def test_the_page_shows_the_follow_up_column(tmp_path, targets_db):
+    data, public = tmp_path / "work", tmp_path / "public"
+    data.mkdir(), public.mkdir()
+    _obs_with_followup(data, public, "99995", 53278, age_h=1)
+    log = tmp_path / "transient_daemon.log"
+    log.write_text("2026-09-11 20:38:32,000 - INFO: Status: 0 active jobs, 0 pending, 1 completed, 0 failed\n")
+    status_page.generate(data, public, log)
+    page = (public / "observations" / "index.html").read_text()
+    script = tmp_path / "page.js"
+    script.write_text(page.split("<script>", 1)[1].split("</script>", 1)[0])
+
+    out = subprocess.run(
+        ["node", "-e", "const {renderStatus} = require(process.argv[1]);"
+                       "const s = JSON.parse(require('fs').readFileSync(process.argv[2]));"
+                       "process.stdout.write(renderStatus(s, s.generated + 10));",
+         str(script), str(public / "observations" / "transient_status.json")],
+        capture_output=True, text=True, check=True).stdout
+
+    assert "<th class='num'>follow-up</th>" in out
+    assert "43 s" in out and "for mag 16.30" in out     # rounded for display
+    assert "&mdash;" in out                             # the candidate without one

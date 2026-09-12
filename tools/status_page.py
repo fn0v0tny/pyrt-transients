@@ -58,7 +58,12 @@ STATUS_RE = re.compile(_TS + r" - INFO: Status: (.*)$")
 JOB_RE = re.compile(_TS + r" - (?:INFO|ERROR): Batch (\S+?)(?: \[\d+/\d+\])?: job \S+ "
                     r"(succeeded|failed \(exit -?\d+\)|timed out|failed: .*)$")
 CANDIDATE_COLUMNS = ("ALPHA_J2000", "DELTA_J2000", "MAG_CALIB", "quality_score",
-                     "n_detections", "candidate_type")
+                     "n_detections", "candidate_type",
+                     # The follow-up exposure recommendation the pipeline
+                     # writes (followup/enrichment.py): how long to integrate
+                     # for its target SNR, and the magnitude it planned for.
+                     # Absent in observations processed before that existed.
+                     "followup_exptime_s", "followup_mag")
 
 
 def _quality(value):
@@ -342,12 +347,22 @@ function renderStatus(s, now) {
       " &middot; " + status(g.status) + site + "</div>" +
       "<p>" + esc(g.candidates) + " candidates, " + esc(g.reliable) + " with quality &ge; 1</p>");
     if (g.top && g.top.length) {
+      // "follow-up": how long the pipeline says to integrate for its target
+      // SNR, and the magnitude it planned for. Older observations have none.
       out.push("<div class='scroll'><table><tr><th>RA</th><th>Dec</th><th class='num'>mag</th>" +
-               "<th class='num'>quality</th><th class='num'>detections</th><th>type</th></tr>");
-      for (const c of g.top)
+               "<th class='num'>quality</th><th class='num'>detections</th><th>type</th>" +
+               "<th class='num'>follow-up</th></tr>");
+      for (const c of g.top) {
+        const secs = Number(c.followup_exptime_s);
+        const planned = Number(c.followup_mag);
+        const followup = secs > 0
+          ? esc(secs.toFixed(0)) + " s" + (planned > 0 ? "<span class='when'>for mag " + esc(planned.toFixed(2)) + "</span>" : "")
+          : "<span class='dim'>&mdash;</span>";
         out.push("<tr><td>" + esc(c.ALPHA_J2000) + "</td><td>" + esc(c.DELTA_J2000) + "</td><td class='num'>" +
                  esc(c.MAG_CALIB) + "</td><td class='num'>" + Number(c.q).toFixed(2) + "</td><td class='num'>" +
-                 esc(c.n_detections) + "</td><td>" + esc(c.candidate_type) + "</td></tr>");
+                 esc(c.n_detections) + "</td><td>" + esc(c.candidate_type) + "</td><td class='num'>" +
+                 followup + "</td></tr>");
+      }
       out.push("</table></div>");
     }
     out.push("</div>");
