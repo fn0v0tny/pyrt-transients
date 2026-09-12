@@ -12,7 +12,9 @@ Provides:
 """
 
 import hashlib
+import json
 import logging
+import os
 import pickle
 import time
 import warnings
@@ -780,6 +782,55 @@ class CatTransients(_PyrtCatalog):
         stale = self.get_cache().load_from_cache(self._catalog_name, params, allow_stale=True)
         return None if stale is None else self._tag_table(stale, config, cached=True, stale=True)
 
+    # How long a failed query is remembered on disk, for every process.
+    FAILURE_TTL_S = float(os.environ.get("PYRT_CATALOG_FAILURE_TTL_S", "900"))
+
+    def _failure_path(self, params):
+        cache = self.get_cache()
+        try:
+            key = cache._generate_cache_key(self._catalog_name, params)
+        except AttributeError:   # a cache without keys (a stub in the tests)
+            return None
+        return Path(cache.cache_dir) / ".failed" / self._catalog_name / f"{key}.json"
+
+    def recent_failure(self, params):
+        """Why this field's query failed within FAILURE_TTL_S, or None.
+
+        The answer is a file, so every pipeline process sees it. While a
+        catalogue server is down (Gaia TAP for more than 12 h on
+        2026-09-11/12), each frame otherwise waits out the timeout again --
+        3 min a frame, and twice over 2 h.
+        """
+        path = self._failure_path(params)
+        if path is None or self.FAILURE_TTL_S <= 0:
+            return None
+        try:
+            entry = json.loads(path.read_text())
+            if time.time() - float(entry["time"]) < self.FAILURE_TTL_S:
+                return entry.get("reason", "")
+            path.unlink()
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+        return None
+
+    def _remember_failure(self, params, reason):
+        path = self._failure_path(params)
+        if path is None or self.FAILURE_TTL_S <= 0:
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps({"time": time.time(), "reason": str(reason)[:500]}))
+        except OSError:
+            pass
+
+    def _forget_failure(self, params):
+        path = self._failure_path(params)
+        try:
+            if path is not None:
+                path.unlink()
+        except OSError:
+            pass
+
     def _fetch_catalog_data(self) -> Optional[astropy.table.Table]:  # type: ignore[override]
         """Fetch catalog data, adding disk caching and Legacy Survey support.
 
@@ -806,12 +857,12 @@ class CatTransients(_PyrtCatalog):
             if cached is not None:
                 return self._tag_table(cached, config, cached=True)
 
-        if failure_key in self._failed_queries:
+        recent = self._failed_queries.get(failure_key) or self.recent_failure(params)
+        if recent:
             stale = self._stale_cache(params, config)
             if stale is not None:
                 return stale
-            raise RuntimeError(f"{self._catalog_name} query already failed in this run: "
-                               f"{self._failed_queries[failure_key]}")
+            raise RuntimeError(f"{self._catalog_name} query failed recently: {recent}")
 
         if cacheable:
             # Widen the query so nearby pointings get a cache hit
@@ -832,10 +883,13 @@ class CatTransients(_PyrtCatalog):
                 raise
             except Exception as exc:
                 self._failed_queries[failure_key] = str(exc)
+                self._remember_failure(params, exc)   # for the other processes too
                 stale = self._stale_cache(params, config)
                 if stale is not None:
                     return stale
                 raise
+            else:
+                self._forget_failure(params)          # the server answers again
 
             if result is None:
                 # Every path that returns None here means "the query ran and
