@@ -252,6 +252,10 @@ with `tools/status_page.py`. There is no cron job:
 
 - the entry point asks for a refresh at the start and end of every frame,
   in the background;
+- the daemon refreshes it every `PYRT_STATUS_REFRESH_S` (300 s) as well, so
+  the page does not stand still while the telescope is idle. Without that,
+  it keeps showing the last frame of the night, and a frame killed at its
+  timeout stays listed as running;
 - requests are merged into at most one run per minute
   (`PYRT_STATUS_MIN_INTERVAL`), and a request inside that minute is served
   by one delayed run, so the latest state reaches the page within about a
@@ -492,6 +496,14 @@ have erased them (see section 10).
 - **Status page:** `https://lascaux50.asu.cas.cz/f/observations/`.
   `/var/www/f` links to `~/public_html`; Apache's userdir module is not
   enabled, so the page is not reachable under `~fnovotny`.
+  - The daemon there is the older `~/bin/transient_daemon.py`, which does not
+    refresh the page itself, so `~/bin/status_page_refresher.sh` does it
+    every 5 minutes. It is started with
+    `setsid nohup ~/bin/status_page_refresher.sh &`, holds a lock so it
+    cannot run twice, and logs to `~/logs/status_page_refresher.log`.
+  - It survives logout but **not a reboot**. A crontab entry (outside the
+    home directory) or `loginctl enable-linger` (root) would; moving to the
+    packaged daemon would remove the need for it.
 - **2026-09-11 deploy:**
   - The checkout went from 468c9c1 to 74060f1.
   - Its two uncommitted host edits (templates `_patch_get_skycells`, the
