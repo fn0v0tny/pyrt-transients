@@ -14,7 +14,7 @@ except ImportError:  # the optional [frontend] extra -- plots are skipped, detec
     plt = None
 from astropy.table import Table
 
-from pyrt_transient.core.epochs import bands_of
+from pyrt_transient.core.epochs import band_colour, bands_of
 
 
 def analyze_and_plot_lightcurves(lightcurves: Dict, lightcurve_dir, config=None, logger=None, final_candidates=None):
@@ -72,8 +72,12 @@ def plot_individual_lightcurve(transient_id: str, lightcurve: Table, lightcurve_
     bands = bands_of(lightcurve)
     for band in sorted(set(bands)):
         in_band = bands == band
+        # An explicit colour per band: `fmt='o-'` makes every series the same
+        # blue (the cycle advances per artist, not per call), and the same
+        # palette as the web page keeps the two views consistent.
         ax.errorbar(np.asarray(time_hours)[in_band], np.asarray(mags)[in_band],
-                    yerr=np.asarray(mag_errs)[in_band], fmt='o-', capsize=3, markersize=6,
+                    yerr=np.asarray(mag_errs)[in_band], marker='o', linestyle='-',
+                    color=band_colour(band), ecolor=band_colour(band), capsize=3, markersize=6,
                     label=band or 'unfiltered')
     if len(set(bands)) > 1 or any(bands):
         ax.legend(title='filter', loc='best', fontsize=8)

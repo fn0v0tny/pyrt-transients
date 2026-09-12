@@ -12,7 +12,7 @@ import pytest
 from astropy.table import Table
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from pyrt_transient.core.epochs import prepare_epoch_detections  # noqa: E402
+from pyrt_transient.core.epochs import band_label, bands_of, prepare_epoch_detections  # noqa: E402
 from pyrt_transient.detection.blind_multicatalog import plotting  # noqa: E402
 
 
@@ -25,13 +25,34 @@ def _epoch(filter_meta, n=2):
 def test_the_band_of_each_epoch_reaches_its_detections():
     epochs = prepare_epoch_detections([
         _epoch({"PHFILTER": "Sloan_i", "FILTER": "Sloan_i"}),
-        _epoch({"FILTER": "Sloan_g"}),                 # only FILTER
-        _epoch({"PHFILTER": "Sloan_r", "FILTER": "R"}),  # the photometric band wins
-        _epoch({}),                                     # unfiltered
+        _epoch({"FILTER": "Sloan_g"}),                   # no calibration band recorded
+        _epoch({"PHFILTER": "Sloan_r", "FILTER": "N"}),  # unfiltered, calibrated against r
+        _epoch({}),                                      # neither
     ])
 
-    assert [str(e["filter"][0]) for e in epochs] == ["Sloan_i", "Sloan_g", "Sloan_r", ""]
+    assert [str(e["filter"][0]) for e in epochs] == ["Sloan_i", "Sloan_g", "N", ""]
+    assert [str(e["phot_filter"][0]) for e in epochs] == ["Sloan_i", "", "Sloan_r", ""]
     assert all(len(e["filter"]) == len(e) for e in epochs)
+    assert [str(b) for b in bands_of(epochs[2])][:1] == ["N→Sloan_r"]
+
+
+def test_an_unfiltered_frame_is_never_labelled_as_the_band_it_was_calibrated_against():
+    # A clear (N) frame calibrated against Sloan r is a different measurement
+    # from a real Sloan r frame -- the colour term differs.
+    assert band_label("N", "Sloan_r") == "N→Sloan_r"
+    assert band_label("N", "Sloan_g") == "N→Sloan_g"
+    assert band_label("Sloan_r", "Sloan_r") == "Sloan_r"
+    assert band_label("r", "Sloan_r") == "Sloan_r"      # the same band, named twice
+    assert band_label("Sloan_i", "") == "Sloan_i"
+    assert band_label("", "Sloan_r") == "Sloan_r"
+    assert band_label("", "") == ""
+
+
+def test_an_absent_band_never_becomes_a_number():
+    # An empty column read back from ECSV arrives as "0"; it is not a band.
+    assert band_label("0", "") == "" and band_label("", "0") == ""
+    lc = Table({"filter": ["0"], "phot_filter": ["0"]})
+    assert list(bands_of(lc)) == [""]
 
 
 class _Ax:
