@@ -37,8 +37,11 @@ def open_ecsv_file(arg, verbose=True) -> Optional[astropy.table.Table]:
 # of 1.1-1.9; on D50's obs_104223 the same row carries no magnitude at all.
 #
 # Kept when it is a real measurement (magnitude present and significant),
-# because then it is the target actually being seen; dropped otherwise.
-FORCED_ROW_MIN_SNR = float(os.environ.get("PYRT_FORCED_ROW_MIN_SNR", "3"))
+# because then it is the target actually being seen; dropped otherwise. The
+# cut is SNR 2 (the user's choice): it errs towards keeping a target that was
+# genuinely measured, at the cost of a weak candidate surviving in the
+# minority of frames where the noise happened to be measured that well.
+FORCED_ROW_MIN_SNR = float(os.environ.get("PYRT_FORCED_ROW_MIN_SNR", "2"))
 
 
 def drop_insignificant_forced_row(det, fn=None):

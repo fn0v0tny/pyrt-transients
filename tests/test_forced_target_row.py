@@ -29,8 +29,8 @@ def _frame(mag, magerr, n_other=3):
 
 
 def test_a_noise_measurement_at_the_target_is_not_a_detection():
-    # GRB230818A: mag 19.418 +- 0.420 -> SNR 2.6, in every frame.
-    kept = drop_insignificant_forced_row(_frame(19.418, 0.420))
+    # GRB230818A's median forced row: mag ~20.3 +- 0.954 -> SNR 1.1.
+    kept = drop_insignificant_forced_row(_frame(20.31, 0.954))
 
     assert list(kept["NUMBER"]) == [1, 2, 3]
 
@@ -51,7 +51,8 @@ def test_a_real_measurement_of_the_target_stays():
 
 
 @pytest.mark.parametrize("magerr, snr, kept", [(0.10, 10.9, True), (0.36, 3.0, True),
-                                               (0.40, 2.7, False), (2.358, 0.5, False)])
+                                               (0.40, 2.7, True), (0.54, 2.0, True),
+                                               (0.60, 1.8, False), (2.358, 0.5, False)])
 def test_the_cut_is_on_significance(magerr, snr, kept):
     result = drop_insignificant_forced_row(_frame(19.0, magerr))
 
@@ -69,7 +70,7 @@ def test_tables_without_the_row_or_the_column_are_untouched():
 
 def test_every_frame_read_by_the_pipeline_is_filtered(tmp_path):
     path = tmp_path / "20230818232804-401-N-010-df.ecsv"
-    _frame(19.418, 0.420).write(path, format="ascii.ecsv")
+    _frame(20.31, 0.954).write(path, format="ascii.ecsv")   # SNR 1.1, noise
 
     det = open_ecsv_file(str(path))
 
