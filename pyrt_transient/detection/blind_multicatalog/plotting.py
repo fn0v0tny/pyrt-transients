@@ -14,6 +14,8 @@ except ImportError:  # the optional [frontend] extra -- plots are skipped, detec
     plt = None
 from astropy.table import Table
 
+from pyrt_transient.core.epochs import bands_of
+
 
 def analyze_and_plot_lightcurves(lightcurves: Dict, lightcurve_dir, config=None, logger=None, final_candidates=None):
     """Generate lightcurve plots and analysis.
@@ -67,8 +69,7 @@ def plot_individual_lightcurve(transient_id: str, lightcurve: Table, lightcurve_
 
     # One series per photometric band: D50 cycles g/r/i/z inside a single
     # observation, and a single line joining them is not a lightcurve.
-    bands = (np.asarray(lightcurve['filter'], dtype=str) if 'filter' in lightcurve.colnames
-             else np.full(len(lightcurve), ''))
+    bands = bands_of(lightcurve)
     for band in sorted(set(bands)):
         in_band = bands == band
         ax.errorbar(np.asarray(time_hours)[in_band], np.asarray(mags)[in_band],

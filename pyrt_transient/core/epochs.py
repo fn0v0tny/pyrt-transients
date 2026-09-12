@@ -2,11 +2,33 @@
 driver can reuse it for slicing epochs 1..k.
 """
 
+import re
 from typing import List
 
+import numpy as np
 from astropy.table import Table
 
 from pyrt_transient.core.timeutil import unix_to_mjd
+
+# A frame name like 20260911220031-484-i-005-df.ecsv: sequence, band, exposure.
+_BAND_IN_NAME = re.compile(r"-(?:\d+-)?([ugrizUBVRIN])-\d+-", re.ASCII)
+
+
+def bands_of(lightcurve) -> np.ndarray:
+    """The photometric band of every row, as strings.
+
+    Uses the `filter` column that prepare_epoch_detections writes. Lightcurves
+    built before that column existed keep the band only in `source_file`, so
+    it is read back from the frame name (D50's `...-i-005-df.ecsv`) rather
+    than reprocessing the observation. Rows whose band cannot be told are "".
+    """
+    if "filter" in lightcurve.colnames:
+        return np.asarray(lightcurve["filter"], dtype=str)
+    if "source_file" not in lightcurve.colnames:
+        return np.full(len(lightcurve), "")
+    names = np.asarray(lightcurve["source_file"], dtype=str)
+    found = [_BAND_IN_NAME.search(str(name).split("/")[-1]) for name in names]
+    return np.array([m.group(1) if m else "" for m in found], dtype=str)
 
 
 def prepare_epoch_detections(detection_tables: List[Table]) -> List[Table]:

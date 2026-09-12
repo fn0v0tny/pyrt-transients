@@ -5,6 +5,8 @@ import astropy.io.fits as fits
 from astropy.visualization import ZScaleInterval, ImageNormalize
 from astropy.table import Table
 from astropy.wcs import WCS
+
+from pyrt_transient.core.epochs import bands_of
 import numpy as np
 import json
 from pathlib import Path
@@ -1559,6 +1561,7 @@ class FrontendGenerator:
                 
                 # Build lightcurve points in sorted time order with clean JSON
                 lightcurve_info['points'] = []
+                point_bands = bands_of(valid_lc_table)
                 
                 for i, (t_hr, obs_t, mag, mag_err) in enumerate(zip(time_hours, valid_times, valid_mags, valid_mag_errs)):
                     point = {
@@ -1568,11 +1571,12 @@ class FrontendGenerator:
                     }
                     
                     # The band this point was measured in, so the page can
-                    # separate them instead of drawing one mixed series.
-                    if 'filter' in valid_lc_table.colnames:
-                        band = str(valid_lc_table['filter'][i])
-                        if band:
-                            point['filter'] = band
+                    # separate them instead of drawing one mixed series. For
+                    # lightcurves stored before that column existed it is read
+                    # back from the frame name.
+                    band = str(point_bands[i]) if len(point_bands) > i else ''
+                    if band:
+                        point['filter'] = band
 
                     # Add epoch_id if available
                     if 'epoch_id' in valid_lc_table.colnames:

@@ -114,3 +114,32 @@ def test_the_page_gets_the_band_with_every_point(tmp_path):
     info = gen.process_lightcurve_data(candidate, "cand_1")
 
     assert [p.get("filter") for p in info["points"]] == ["Sloan_i", "Sloan_g", "Sloan_i"]
+
+
+# Lightcurves stored before the `filter` column existed (obs_104223 and every
+# other observation already on lascaux50) keep the band in the frame name.
+from pyrt_transient.core.epochs import bands_of  # noqa: E402
+
+
+def test_the_band_is_read_back_from_the_frame_name():
+    lc = Table({"source_file": [
+        "/home/fnovotny/transient_work/obs_104223/20260911220031-484-i-005-df.ecsv",
+        "20260911220233-890-g-020-df.ecsv",
+        "20260911220400-727-z-005-df.ecsv",
+        "20190919234716-909-N-020-df.ecsv",      # FRAM, unfiltered
+    ]})
+
+    assert list(bands_of(lc)) == ["i", "g", "z", "N"]
+
+
+def test_an_unreadable_name_gives_no_band():
+    lc = Table({"source_file": ["frame_without_a_band.ecsv", "epoch_3"]})
+
+    assert list(bands_of(lc)) == ["", ""]
+    assert list(bands_of(Table({"MAG_CALIB": [15.0]}))) == [""]
+
+
+def test_the_column_wins_over_the_name():
+    lc = Table({"filter": ["Sloan_i"], "source_file": ["20260911220233-890-g-020-df.ecsv"]})
+
+    assert list(bands_of(lc)) == ["Sloan_i"]
