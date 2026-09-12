@@ -25,6 +25,12 @@ def prepare_epoch_detections(detection_tables: List[Table]) -> List[Table]:
         det_table_copy['obs_time'] = mid_time
         det_table_copy['mjd'] = unix_to_mjd(mid_time)
         det_table_copy['source_file'] = det_table.meta.get('filename', f'epoch_{i}')
+        # The photometric band of the frame. It lives in the epoch's meta, so
+        # without this column a lightcurve built from several epochs loses it
+        # and mixes bands into one series: D50 cycles g/r/i/z within a single
+        # observation (obs_104223: 17 i, 12 r, 10 g, 7 z frames).
+        det_table_copy['filter'] = str(
+            det_table.meta.get('PHFILTER') or det_table.meta.get('FILTER') or '')
 
         all_epoch_detections.append(det_table_copy)
 

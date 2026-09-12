@@ -65,7 +65,17 @@ def plot_individual_lightcurve(transient_id: str, lightcurve: Table, lightcurve_
         mag_errs = lightcurve['MAGERR_ISO']
         ax.set_ylabel('Instrumental Magnitude')
 
-    ax.errorbar(time_hours, mags, yerr=mag_errs, fmt='o-', capsize=3, markersize=6)
+    # One series per photometric band: D50 cycles g/r/i/z inside a single
+    # observation, and a single line joining them is not a lightcurve.
+    bands = (np.asarray(lightcurve['filter'], dtype=str) if 'filter' in lightcurve.colnames
+             else np.full(len(lightcurve), ''))
+    for band in sorted(set(bands)):
+        in_band = bands == band
+        ax.errorbar(np.asarray(time_hours)[in_band], np.asarray(mags)[in_band],
+                    yerr=np.asarray(mag_errs)[in_band], fmt='o-', capsize=3, markersize=6,
+                    label=band or 'unfiltered')
+    if len(set(bands)) > 1 or any(bands):
+        ax.legend(title='filter', loc='best', fontsize=8)
     ax.invert_yaxis()
     ax.set_xlabel('Time since first detection (hours)')
     ax.grid(True, alpha=0.3)

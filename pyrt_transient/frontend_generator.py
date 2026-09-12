@@ -655,6 +655,9 @@ class FrontendGenerator:
                     header = hdul[0].header.copy()
                     naxis1 = header.get('NAXIS1', 0)
                     naxis2 = header.get('NAXIS2', 0)
+                    # Shown with the stamp: an observation cycles through
+                    # several bands, so a sequence without them is misleading.
+                    frame_filter = str(header.get('PHFILTER') or header.get('FILTER') or '')
                     if naxis1 == 0 or naxis2 == 0:
                         logger.warning(f"No image dimensions in FITS header {fits_file}")
                         continue
@@ -726,7 +729,8 @@ class FrontendGenerator:
                                 # diff image's pixel grid (HOTPANTS/ZOGY run on
                                 # a reprojected-to-science-WCS template), so the
                                 # same (x, y)/bounds crop directly from each.
-                                entry = {"filename": fits_file.name, "date": date_str}
+                                entry = {"filename": fits_file.name, "date": date_str,
+                                         "filter": frame_filter}
 
                                 diff_fn = f"{candidate_id}_{fits_file.stem}_diff.{image_format}"
                                 diff_out = self.output_dir / "cutouts" / diff_fn
@@ -774,7 +778,8 @@ class FrontendGenerator:
                                 candidates_data[candidate_id]['cutouts'].append({
                                     "path": f"./cutouts/{output_filename}",
                                     "filename": fits_file.name,
-                                    "date": date_str
+                                    "date": date_str,
+                                    "filter": frame_filter
                                 })
                                 continue
 
@@ -790,7 +795,8 @@ class FrontendGenerator:
                             candidates_data[candidate_id]['cutouts'].append({
                                 "path": f"./cutouts/{output_filename}",
                                 "filename": fits_file.name,
-                                "date": date_str
+                                "date": date_str,
+                                "filter": frame_filter
                             })
 
                         except Exception as e:
@@ -1561,6 +1567,13 @@ class FrontendGenerator:
                         'error': float(mag_err)         # Magnitude error
                     }
                     
+                    # The band this point was measured in, so the page can
+                    # separate them instead of drawing one mixed series.
+                    if 'filter' in valid_lc_table.colnames:
+                        band = str(valid_lc_table['filter'][i])
+                        if band:
+                            point['filter'] = band
+
                     # Add epoch_id if available
                     if 'epoch_id' in valid_lc_table.colnames:
                         epoch_id = valid_lc_table['epoch_id'][i]
