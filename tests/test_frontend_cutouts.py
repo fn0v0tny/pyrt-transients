@@ -93,3 +93,38 @@ def test_corner_cutout_keeps_its_size_and_registers_to_the_frame():
     # Frame pixel (px, py) sits at out[py - ymin, px - xmin].
     for px, py in [(0, ny - 1), (7, ny - 5), (x + half - 1, y - half)]:
         assert out[py - ymin, px - xmin] == pytest.approx(float(data[py, px]))
+
+
+from pyrt_transient.frontend_generator import _frame_pixel_positions  # noqa: E402
+
+
+class _FakeWCS:
+    """A frame whose pointing is offset by (dx, dy) from the reference one."""
+
+    def __init__(self, dx=0.0, dy=0.0):
+        self.dx, self.dy = dx, dy
+
+    def all_world2pix(self, coords, origin):
+        return np.array([[c[0] * 10 + self.dx, c[1] * 10 + self.dy] for c in coords])
+
+
+def test_a_frame_without_a_detection_uses_its_own_wcs_not_another_frames_pixel():
+    # The replay pointing moves ~250 px between epochs, so the pixel measured
+    # in the discovery epoch is the wrong centre for any other frame.
+    candidates = {"c": {"ra": 10.0, "dec": 20.0, "x_image": 900.0, "y_image": 700.0}}
+    epochs = {"c": {"frame_a": (100.0, 200.0)}}
+
+    assert _frame_pixel_positions(candidates, epochs, "frame_a", _FakeWCS()) == {"c": (100.0, 200.0)}
+    assert _frame_pixel_positions(candidates, epochs, "frame_b", _FakeWCS(dx=250.0)) == {"c": (350.0, 200.0)}
+
+
+def test_the_stored_pixel_is_the_last_resort():
+    candidates = {"c": {"ra": 10.0, "dec": 20.0, "x_image": 900.0, "y_image": 700.0}}
+    no_sky = {"c": {"ra": None, "dec": None, "x_image": 900.0, "y_image": 700.0}}
+
+    assert _frame_pixel_positions(candidates, {}, "f", None) == {"c": (899.0, 699.0)}
+    assert _frame_pixel_positions(no_sky, {}, "f", _FakeWCS()) == {"c": (899.0, 699.0)}
+
+
+def test_a_candidate_with_nothing_to_go_on_is_left_out():
+    assert _frame_pixel_positions({"c": {}}, {}, "f", None) == {}

@@ -148,6 +148,45 @@ def _lightcurve_pixel_positions(lightcurve):
     return positions
 
 
+def _frame_pixel_positions(candidates_data, epoch_positions, frame_stem, wcs):
+    """{candidate_id: (x, y)}, 0-based, for one frame.
+
+    In order:
+
+    1. the candidate's own detection in this frame (from its lightcurve),
+       which also follows a moving source;
+    2. its sky position through THIS frame's WCS;
+    3. the X_IMAGE/Y_IMAGE stored on the candidate row, only when the frame
+       has no usable WCS.
+
+    The stored pixel was measured in the epoch the candidate was found in.
+    Using it for a frame the candidate was not detected in centres the stamp
+    on another frame's pointing: on the GRB replay the pointing moves by
+    ~250 px between epochs, which is why those cutouts landed off-target and
+    jumped about. A candidate the WCS puts outside the frame is dropped by
+    the bounds check of the caller.
+    """
+    positions = {}
+    needs_wcs, coords = [], []
+    for candidate_id, cand_data in candidates_data.items():
+        ep = epoch_positions.get(candidate_id, {})
+        if frame_stem in ep:
+            positions[candidate_id] = ep[frame_stem]
+            continue
+        ra, dec = cand_data.get('ra'), cand_data.get('dec')
+        if wcs is not None and ra is not None and dec is not None:
+            needs_wcs.append(candidate_id)
+            coords.append([ra, dec])
+            continue
+        xi, yi = cand_data.get('x_image'), cand_data.get('y_image')
+        if xi is not None and yi is not None:
+            positions[candidate_id] = (xi - 1, yi - 1)   # SExtractor is 1-based
+    if coords:
+        for cid, (wx, wy) in zip(needs_wcs, wcs.all_world2pix(np.array(coords), 0)):
+            positions[cid] = (float(wx), float(wy))
+    return positions
+
+
 class FrontendGenerator:
     """Integrated frontend generator that uses templates and creates complete websites."""
     
@@ -640,32 +679,23 @@ class FrontendGenerator:
                         )
 
                     # Build pixel positions for all candidates in this frame.
-                    # Priority 1: per-epoch SExtractor position (from lightcurve ECSV).
-                    # Priority 2: X_IMAGE/Y_IMAGE stored directly on the candidate row.
-                    # Fallback:   WCS conversion from sky position (batch-vectorized).
+                    # Priority 1: this frame's own SExtractor position (from the
+                    #             lightcurve ECSV), which also follows a mover.
+                    # Priority 2: the sky position through THIS frame's WCS.
+                    # Fallback:   X_IMAGE/Y_IMAGE stored on the candidate row --
+                    #             only when the frame has no usable WCS.
+                    #
+                    # That stored pixel was measured in the epoch the candidate
+                    # was found in, so using it for a frame the candidate was
+                    # not detected in centres the stamp on another frame's
+                    # pointing: on the GRB replay the pointing moves by ~250 px
+                    # between epochs, which is the "wrong position / jumping
+                    # cutouts" the replay pages showed. A frame whose WCS puts
+                    # the candidate outside the image is skipped below, instead
+                    # of being stamped at a pixel that means nothing.
                     candidate_ids = list(candidates_data.keys())
-                    pixel_position_map = {}   # candidate_id -> (x, y)
-
-                    needs_wcs = []
-                    needs_wcs_coords = []
-                    for candidate_id in candidate_ids:
-                        ep = epoch_positions.get(candidate_id, {})
-                        if frame_stem in ep:
-                            pixel_position_map[candidate_id] = ep[frame_stem]
-                        else:
-                            cand_data = candidates_data[candidate_id]
-                            xi, yi = cand_data.get('x_image'), cand_data.get('y_image')
-                            if xi is not None and yi is not None:
-                                # SExtractor pixel coords are 1-based; convert to 0-based
-                                pixel_position_map[candidate_id] = (xi - 1, yi - 1)
-                            else:
-                                needs_wcs.append(candidate_id)
-                                needs_wcs_coords.append([cand_data['ra'], cand_data['dec']])
-
-                    if needs_wcs_coords and wcs is not None:
-                        wcs_px = wcs.all_world2pix(np.array(needs_wcs_coords), 0)
-                        for cid, (wx, wy) in zip(needs_wcs, wcs_px):
-                            pixel_position_map[cid] = (wx, wy)
+                    pixel_position_map = _frame_pixel_positions(
+                        candidates_data, epoch_positions, frame_stem, wcs)
 
                     if not pixel_position_map:
                         continue
