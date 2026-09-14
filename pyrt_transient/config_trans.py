@@ -152,6 +152,31 @@ class DetectionConfig:
     # magnitude at all are kept). None = historical behaviour.
     isolation_max_mag_margin: Optional[float] = None
     
+    # Move catalogue positions to the frame's epoch with the catalogue's
+    # proper motions before matching. Gaia and ATLAS positions are for
+    # 2015.5-2016, USNO-B for 2000: a star at 150 mas/yr has moved 2-4
+    # arcsec since, beyond the identification radius, and turned up as a
+    # persistent "new" source in every frame of every night.
+    propagate_proper_motion: bool = True
+
+    # Detections that SExtractor flags as saturated (FLAGS & 4) or that are
+    # brighter than the frame's estimated saturation magnitude (peak pixel
+    # at saturation_adu for a Gaussian star of the header FWHM and MAGZERO)
+    # plus saturation_margin_mag count as "at least as bright as that
+    # limit" when compared with a matched catalogue star, instead of as a
+    # measurement: a catalogue star much fainter than the limit has
+    # brightened (reported with the limit as magnitude difference), one
+    # already brighter is consistent, and fading is never claimed. They are
+    # still reported as new sources when no catalogue star matches, since a
+    # bright GRB or nova saturates as well. The margin stays at 0: on the
+    # 210619B fixture
+    # the Gaussian estimate is 10.98 mag, the first flagged star is at
+    # 11.26 and the afterglow at 11.43. The forced target row (NUMBER 0) is
+    # never masked.
+    reject_saturated: bool = True
+    saturation_adu: float = 60000.0
+    saturation_margin_mag: float = 0.0
+
     # Adaptive identification parameters
     enable_adaptive_idlimit: bool = True
     adaptive_nsigma: float = 3.0

@@ -161,10 +161,19 @@ def find_transients_multicatalog(
                                f"excluded from the agreement requirement")
                 continue
 
+            # The detection table the matcher sees: a copy, so the options
+            # below never reach the caller's epoch table, used by both the
+            # optimized path and the fallback so both run with the same
+            # configuration.
+            det_for_analysis = detections.copy()
+            if config:
+                det_for_analysis.meta['propagate_proper_motion'] = config.detection.propagate_proper_motion
+                det_for_analysis.meta['reject_saturated'] = config.detection.reject_saturated
+                det_for_analysis.meta['saturation_adu'] = config.detection.saturation_adu
+                det_for_analysis.meta['saturation_margin_mag'] = config.detection.saturation_margin_mag
+
             # Try optimized detection path, fall back to standard on failure.
             try:
-                # Prepare detections with magnitude fallback if needed
-                det_for_analysis = detections.copy()
                 if 'MAG_CALIB' not in det_for_analysis.colnames:
                     raise ValueError("No suitable magnitude/error columns available")
 
@@ -205,7 +214,7 @@ def find_transients_multicatalog(
                 logger.info(f"Falling back to standard detection...")
 
                 # Reuse the already-downloaded catalog; do not re-fetch.
-                candidates = catalog.get_transient_candidates(detections, idlimit)
+                candidates = catalog.get_transient_candidates(det_for_analysis, idlimit)
                 logger.info(f"✅ Used standard detection for {cat_name}")
 
             if len(candidates) > 0:
