@@ -12,7 +12,7 @@ import pytest
 from astropy.table import Table
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-from pyrt_transient.core.epochs import band_label, bands_of, prepare_epoch_detections  # noqa: E402
+from pyrt_transient.core.epochs import band_colour, band_label, bands_of, prepare_epoch_detections  # noqa: E402
 from pyrt_transient.detection.blind_multicatalog import plotting  # noqa: E402
 
 
@@ -135,6 +135,22 @@ def test_the_page_gets_the_band_with_every_point(tmp_path):
     info = gen.process_lightcurve_data(candidate, "cand_1")
 
     assert [p.get("filter") for p in info["points"]] == ["Sloan_i", "Sloan_g", "Sloan_i"]
+    assert [p.get("colour") for p in info["points"]] == [
+        band_colour("Sloan_i"), band_colour("Sloan_g"), band_colour("Sloan_i")]
+
+
+@pytest.mark.parametrize("header, label", [
+    ({"FILTER": "N", "PHFILTER": "Sloan_r"}, "N→Sloan_r"),   # unfiltered, calibrated against r
+    ({"FILTER": "Sloan_i", "PHFILTER": "Sloan_i"}, "Sloan_i"),
+    ({"FILTER": "r", "PHFILTER": "Sloan_r"}, "Sloan_r"),
+    ({"PHFILTER": "Sloan_g"}, "Sloan_g"),
+    ({}, ""),
+])
+def test_a_stamp_is_labelled_like_its_lightcurve_point(header, label):
+    pytest.importorskip("matplotlib")
+    from pyrt_transient.frontend_generator import _frame_band
+
+    assert _frame_band(header) == label
 
 
 # Lightcurves stored before the `filter` column existed (obs_104223 and every

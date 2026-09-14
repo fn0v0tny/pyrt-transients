@@ -6,7 +6,7 @@ from astropy.visualization import ZScaleInterval, ImageNormalize
 from astropy.table import Table
 from astropy.wcs import WCS
 
-from pyrt_transient.core.epochs import bands_of
+from pyrt_transient.core.epochs import band_colour, band_label, bands_of
 import numpy as np
 import json
 from pathlib import Path
@@ -148,6 +148,12 @@ def _lightcurve_pixel_positions(lightcurve):
         positions[stem] = pos
         positions.setdefault(stem + 't', pos)
     return positions
+
+
+def _frame_band(header):
+    """The band a frame's stamp is labelled with, as in the lightcurves: an
+    unfiltered frame calibrated against Sloan r is 'N→Sloan_r', not 'Sloan_r'."""
+    return band_label(header.get('FILTER'), header.get('PHFILTER'))
 
 
 def _frame_pixel_positions(candidates_data, epoch_positions, frame_stem, wcs):
@@ -659,7 +665,7 @@ class FrontendGenerator:
                     naxis2 = header.get('NAXIS2', 0)
                     # Shown with the stamp: an observation cycles through
                     # several bands, so a sequence without them is misleading.
-                    frame_filter = str(header.get('PHFILTER') or header.get('FILTER') or '')
+                    frame_filter = _frame_band(header)
                     if naxis1 == 0 or naxis2 == 0:
                         logger.warning(f"No image dimensions in FITS header {fits_file}")
                         continue
@@ -1577,6 +1583,7 @@ class FrontendGenerator:
                     band = str(point_bands[i]) if len(point_bands) > i else ''
                     if band:
                         point['filter'] = band
+                        point['colour'] = band_colour(band)   # the page's palette is the PNG's
 
                     # Add epoch_id if available
                     if 'epoch_id' in valid_lc_table.colnames:
