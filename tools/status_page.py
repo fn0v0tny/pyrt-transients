@@ -199,7 +199,9 @@ def describe(obs_dir, facts, targets, with_candidates=0):
         processed = json.loads((obs_dir / "detection_metadata.json").read_text()).get("processed_files", [])
     except (OSError, ValueError):
         processed = []
-    frames = sorted(processed)
+    # Only timestamped frame names: the stack's catalogue (stack.ecsv) is
+    # marked processed too, and sorting last it blanked the last-frame time.
+    frames = sorted(n for n in processed if _frame_time(n))
     rows = read_ipac(obs_dir / "candidates.tbl")
     for row in rows:
         row["q"] = _quality(row.get("quality_score"))

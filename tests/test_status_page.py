@@ -282,6 +282,19 @@ def _obs_with_followup(data, public, obs_id, target, age_h):
     return d
 
 
+def test_the_stack_catalogue_is_not_counted_as_a_frame(tmp_path):
+    d = tmp_path / "obs_104300"
+    d.mkdir()
+    names = [f"202609110{i}0000-00{i}-r-060-df.ecsv" for i in range(1, 4)]
+    (d / "detection_metadata.json").write_text(json.dumps({"processed_files": names + ["stack.ecsv"]}))
+
+    summary = status_page.describe(d, {"target": None, "object": "GRB 260911A"}, {})
+
+    assert summary["frames"] == 3
+    assert summary["first_frame"] == "2026-09-11 01:00:00"
+    assert summary["last_frame"] == "2026-09-11 03:00:00"
+
+
 def test_the_follow_up_exposure_reaches_the_page(tmp_path, targets_db):
     data, public = tmp_path / "work", tmp_path / "public"
     data.mkdir(), public.mkdir()
