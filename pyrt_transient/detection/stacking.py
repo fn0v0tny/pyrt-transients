@@ -484,33 +484,42 @@ def _attempt_rebuild(obs_dir: Path, real_tables: List[Table], det_cfg, n_real_ep
     for leftover in ("stack.new.fits", "stack.new.ecsv"):  # staged there before
         (obs_dir / leftover).unlink(missing_ok=True)
 
-    combined = combine_epochs(
-        fits_paths, staged_fits_path, uniform=det_cfg.stacking_uniform_weighting,
-    )
-    if combined is None:
-        shutil.rmtree(staging_dir, ignore_errors=True)
-        return
+    try:
+        combined = combine_epochs(
+            fits_paths, staged_fits_path, uniform=det_cfg.stacking_uniform_weighting,
+        )
+        if combined is None:
+            return
 
-    built = build_stack_ecsv(
-        combined, output_path=staged_ecsv_path,
-        photometric_catalog=det_cfg.photometric_catalog,
-        detect_thresh=det_cfg.stacking_detect_thresh,
-        n_combined=len(fits_paths),
-        input_files=fits_paths,
-    )
-    if built is None:
-        log.warning("Stacking: combined image built but its catalogue could not be; "
-                    "keeping the previous stack (if any) and discarding the new image")
-        shutil.rmtree(staging_dir, ignore_errors=True)
-        return
+        built = build_stack_ecsv(
+            combined, output_path=staged_ecsv_path,
+            photometric_catalog=det_cfg.photometric_catalog,
+            detect_thresh=det_cfg.stacking_detect_thresh,
+            n_combined=len(fits_paths),
+            input_files=fits_paths,
+        )
+        if built is None:
+            log.warning("Stacking: combined image built but its catalogue could not be; "
+                        "keeping the previous stack (if any) and discarding the new image")
+            return
 
-    # Both halves exist and describe the same image -- install them
-    # together. Two renames aren't jointly atomic, but the window is two
-    # syscalls wide and only a crash in between can leave them mismatched
-    # (versus any calibration failure before this change).
-    staged_fits_path.replace(stack_fits_path)
-    staged_ecsv_path.replace(stack_ecsv_path)
-    shutil.rmtree(staging_dir, ignore_errors=True)
+        # Both halves exist and describe the same image -- install them
+        # together. If the catalogue cannot follow the image, both go: a
+        # missing stack is rebuilt on a later run (the state is not written),
+        # while a new image beside the old catalogue would be read as one.
+        staged_fits_path.replace(stack_fits_path)
+        try:
+            staged_ecsv_path.replace(stack_ecsv_path)
+        except OSError as exc:
+            stack_fits_path.unlink(missing_ok=True)
+            stack_ecsv_path.unlink(missing_ok=True)
+            log.warning(f"Stacking: could not install the new catalogue ({exc}); "
+                        f"removed the half-installed stack")
+            return
+    finally:
+        # Also on an exception or interrupt. A killed process leaves it to the
+        # next rebuild, which starts by removing it.
+        shutil.rmtree(staging_dir, ignore_errors=True)
 
     # Invalidate BlindMulticatalogStrategy's Step-1 per-epoch cache so the
     # refreshed (deeper) stack actually gets reprocessed instead of being

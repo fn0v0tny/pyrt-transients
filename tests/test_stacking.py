@@ -575,10 +575,45 @@ def test_a_rebuild_killed_mid_build_leaves_no_extra_fits_among_the_frames():
                 raise AssertionError("the fake catalogue build should have been interrupted")
 
             assert sorted(q.name for q in obs_dir.glob("*.fits")) == ["stack.fits"]
+            assert not (obs_dir / stacking._STACK_STAGING_DIR).exists()
             assert (obs_dir / "stack.fits").read_bytes() == b"OLDFITS"
     finally:
         restore()
     print("test_a_rebuild_killed_mid_build_leaves_no_extra_fits_among_the_frames: PASS")
+
+
+def test_a_catalogue_that_cannot_be_installed_takes_the_new_image_with_it():
+    """If stack.ecsv cannot follow the new stack.fits into place, the new
+    image must not stay paired with the previous catalogue."""
+    original_replace = Path.replace
+
+    def replace(self, target):
+        if self.name == "stack.ecsv" and self.parent.name == stacking._STACK_STAGING_DIR:
+            raise OSError("No space left on device")
+        return original_replace(self, target)
+
+    restore = _patch_build_fns(fake_combine=_fake_combine, fake_build_ecsv=_fake_build_stack_ecsv)
+    Path.replace = replace
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            obs_dir = Path(d)
+            (obs_dir / "stack.fits").write_bytes(b"OLDFITS")
+            old = Table({"MAG_CALIB": [17.0]})
+            old.meta.update({"IS_STACK": True, "NCOMBINE": 5})
+            old.write(str(obs_dir / "stack.ecsv"), format="ascii.ecsv")
+            cfg = _make_config(stacking_enabled=True, stacking_min_epochs=1,
+                                stacking_rebuild_interval=1)
+            tables = [_make_detection_table(i, obs_dir) for i in range(8)]
+            stacking._attempt_rebuild(obs_dir, tables, cfg.detection, len(tables), _LOG)
+
+            assert not (obs_dir / "stack.fits").exists()
+            assert not (obs_dir / "stack.ecsv").exists()
+            assert not (obs_dir / stacking._STACK_STAGING_DIR).exists()
+            assert not (obs_dir / "stack_state.json").exists()   # so it is rebuilt
+    finally:
+        Path.replace = original_replace
+        restore()
+    print("test_a_catalogue_that_cannot_be_installed_takes_the_new_image_with_it: PASS")
 
 
 def test_maybe_build_stack_table_below_min_epochs_returns_none():

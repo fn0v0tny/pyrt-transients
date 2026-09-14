@@ -50,6 +50,17 @@ def test_a_real_measurement_of_the_target_stays():
     assert float(kept["MAG_CALIB"][0]) == pytest.approx(16.2)
 
 
+def test_a_row_without_a_calibrated_magnitude_goes_even_with_an_instrumental_one():
+    # Candidates are built from MAG_CALIB, so a valid MAG_AUTO does not make
+    # the forced row usable; falling back to it would bring the no-magnitude
+    # rows of obs_104223 back.
+    frame = _frame(np.nan, np.nan)
+    frame["MAG_AUTO"] = np.array([-8.5] + [-10.0] * 3)
+    frame["MAGERR_AUTO"] = np.array([0.05] + [0.02] * 3)
+
+    assert list(drop_insignificant_forced_row(frame)["NUMBER"]) == [1, 2, 3]
+
+
 @pytest.mark.parametrize("magerr, snr, kept", [(0.10, 10.9, True), (0.36, 3.0, True),
                                                (0.40, 2.7, True), (0.54, 2.0, True),
                                                (0.60, 1.8, False), (2.358, 0.5, False)])

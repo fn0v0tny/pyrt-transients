@@ -1,5 +1,15 @@
 // Simple transient viewer with pre-generated images and lightcurves
 
+// An element built with DOM calls: text from the data (band names and dates
+// from FITS headers) is set as text, never parsed as markup.
+const SVG_NS = 'http://www.w3.org/2000/svg';
+function el(tag, attrs = {}, text = null, ns = null) {
+  const node = ns ? document.createElementNS(ns, tag) : document.createElement(tag);
+  for (const [name, value] of Object.entries(attrs)) node.setAttribute(name, value);
+  if (text !== null) node.textContent = text;
+  return node;
+}
+
 // Helper: recursively sanitize values (replace NaN/Infinity and string 'NaN' with 0.0)
 function deepSanitize(value) {
   if (Array.isArray(value)) {
@@ -284,11 +294,11 @@ const transientViewer = {
     // Update time info
     const timeInfo = document.querySelector('.cutout-time-info');
     if (timeInfo) {
-      timeInfo.innerHTML = `
-        Image ${this.currentCutoutIndex + 1} of ${cutouts.length}
-        <div class="date-display">Date: ${currentCutout.date || 'Unknown'}</div>
-        <div class="date-display">Filter: ${currentCutout.filter || 'unfiltered'}</div>
-      `;
+      timeInfo.replaceChildren(
+        document.createTextNode(`Image ${this.currentCutoutIndex + 1} of ${cutouts.length}`),
+        el('div', {class: 'date-display'}, `Date: ${currentCutout.date || 'Unknown'}`),
+        el('div', {class: 'date-display'}, `Filter: ${currentCutout.filter || 'unfiltered'}`),
+      );
     }
     
     // Update button states
@@ -456,14 +466,17 @@ const transientViewer = {
     // One colour per photometric band, and lines only within a band: D50
     // cycles g/r/i/z inside one observation, so a single joined series mixes
     // filters and looks like variability that is not there.
-    const bandColour = (band) => ({
-      'Sloan_g': '#27ae60', 'Sloan_r': '#e74c3c', 'Sloan_i': '#8e44ad', 'Sloan_z': '#d35400',
-      'Johnson_B': '#2980b9', 'Johnson_V': '#16a085', 'Johnson_R': '#c0392b', 'Johnson_I': '#7f3f00',
-    }[band] || '#3498db');
+    // Each point carries its colour from core.epochs.band_colour, so the page
+    // and the PNG share one palette.
+    const colourOf = (band) => {
+      const point = points.find(p => (p.filter || '') === band && /^#[0-9a-fA-F]{6}$/.test(p.colour || ''));
+      return point ? point.colour : '#3498db';
+    };
     const bands = [...new Set(points.map(p => p.filter || ''))];
+    const svgEl = (tag, attrs, text = null) => svg.appendChild(el(tag, attrs, text, SVG_NS));
 
     bands.forEach((band) => {
-      const colour = bandColour(band);
+      const colour = colourOf(band);
       const inBand = points.filter(p => (p.filter || '') === band);
 
       inBand.forEach((point) => {
@@ -472,33 +485,27 @@ const transientViewer = {
         const errorUp = yPos(point.magnitude - point.error);
         const errorDown = yPos(point.magnitude + point.error);
         const label = band ? `${band}, ` : '';
+        const bar = {stroke: '#666', 'stroke-width': 1};
 
-        svg.innerHTML += `
-          <line x1="${x}" y1="${errorUp}" x2="${x}" y2="${errorDown}" stroke="#666" stroke-width="1"/>
-          <line x1="${x-2}" y1="${errorUp}" x2="${x+2}" y2="${errorUp}" stroke="#666" stroke-width="1"/>
-          <line x1="${x-2}" y1="${errorDown}" x2="${x+2}" y2="${errorDown}" stroke="#666" stroke-width="1"/>
-          <circle cx="${x}" cy="${y}" r="4" fill="${colour}" stroke="${colour}" stroke-width="2">
-            <title>${label}Time: ${point.time.toFixed(2)}h, Mag: ${point.magnitude.toFixed(3)} ± ${point.error.toFixed(3)}</title>
-          </circle>
-        `;
+        svgEl('line', {x1: x, y1: errorUp, x2: x, y2: errorDown, ...bar});
+        svgEl('line', {x1: x - 2, y1: errorUp, x2: x + 2, y2: errorUp, ...bar});
+        svgEl('line', {x1: x - 2, y1: errorDown, x2: x + 2, y2: errorDown, ...bar});
+        svgEl('circle', {cx: x, cy: y, r: 4, fill: colour, stroke: colour, 'stroke-width': 2})
+          .appendChild(el('title', {}, `${label}Time: ${point.time.toFixed(2)}h, Mag: ${point.magnitude.toFixed(3)} ± ${point.error.toFixed(3)}`, SVG_NS));
       });
 
       if (inBand.length > 1) {
-        const pathData = inBand.map((point, i) => {
-          const x = xPos(point.time);
-          const y = yPos(point.magnitude);
-          return (i === 0 ? `M ${x} ${y}` : `L ${x} ${y}`);
-        }).join(' ');
-        svg.innerHTML += `<path d="${pathData}" stroke="${colour}" stroke-width="2" fill="none" opacity="0.7"/>`;
+        const pathData = inBand.map((point, i) => `${i === 0 ? 'M' : 'L'} ${xPos(point.time)} ${yPos(point.magnitude)}`).join(' ');
+        svgEl('path', {d: pathData, stroke: colour, 'stroke-width': 2, fill: 'none', opacity: 0.7});
       }
     });
 
     if (bands.length > 1 || bands[0]) {
-      const entries = bands.map((band, i) => `
-        <circle cx="8" cy="${12 + i * 16}" r="4" fill="${bandColour(band)}"/>
-        <text x="18" y="${16 + i * 16}" font-size="10" fill="#666">${band || 'unfiltered'}</text>
-      `).join('');
-      svg.innerHTML += `<g transform="translate(${width - 90}, 0)">${entries}</g>`;
+      const legend = svgEl('g', {transform: `translate(${width - 90}, 0)`});
+      bands.forEach((band, i) => {
+        legend.appendChild(el('circle', {cx: 8, cy: 12 + i * 16, r: 4, fill: colourOf(band)}, null, SVG_NS));
+        legend.appendChild(el('text', {x: 18, y: 16 + i * 16, 'font-size': 10, fill: '#666'}, band || 'unfiltered', SVG_NS));
+      });
     }
   },
   
