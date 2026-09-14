@@ -31,7 +31,7 @@ def _meta(i, path):
         "CRPIX1": SIZE / 2 + 0.5, "CRPIX2": SIZE / 2 + 0.5,
         "CD1_1": -1.0 / 3600, "CD1_2": 0.0, "CD2_1": 0.0, "CD2_2": 1.0 / 3600,
         "FWHM": 3.0, "GAIN": 1.0, "MAGZERO": ZP, "CTIME": 1_000_000 + 60 * i,
-        "EXPTIME": 30.0, "filename": str(path),
+        "EXPTIME": 30.0, "filename": str(path.with_suffix(".ecsv")),
     }
 
 
@@ -77,7 +77,7 @@ def _stack_epoch(tmp_path, tables):
     persistent source and the flash as candidates."""
     stack = Table({"X_IMAGE": [1.0]})
     stack.meta.update({"IS_STACK": True, "filename": "stack.fits",
-                       "STACK_INPUTS": [Path(t.meta["filename"]).name for t in tables]})
+                       "STACK_INPUTS": [Path(t.meta["filename"]).with_suffix(".fits").name for t in tables]})
     rows = []
     for (x0, y0, _), q, mag in ((PERSISTENT, 1.6, 18.8), (FLASH, 1.5, 17.9)):
         ra, dec = _sky(tables[0].meta, x0, y0)
@@ -165,7 +165,7 @@ def test_real_stack_admits_the_afterglow_and_rejects_the_flashes(tmp_path):
     tables = []
     for p in paths:
         t = Table.read(p, format="ascii.ecsv")
-        t.meta["filename"] = str(p.with_suffix(".fits"))
+        t.meta["filename"] = str(p)
         tables.append(t)
     stack = Table({"X_IMAGE": [1.0]})
     stack.meta.update({"IS_STACK": True, "filename": "stack.fits",
@@ -194,7 +194,7 @@ def test_stack_inputs_string_selects_exactly_those_frames():
     frames = []
     for i in range(4):
         t = Table({"X_IMAGE": [1.0]})
-        t.meta["filename"] = f"/data/obs/frame{i}.fits"
+        t.meta["filename"] = f"/data/obs/frame{i}.ecsv"   # as open_ecsv_file sets it
         frames.append(t)
     stack = Table({"X_IMAGE": [1.0]})
     stack.meta.update({"IS_STACK": True, "STACK_INPUTS": "frame1.fits,frame3.fits"})
@@ -204,3 +204,17 @@ def test_stack_inputs_string_selects_exactly_those_frames():
     assert [i for i, _ in picked] == [1, 3]
     stack.meta.pop("STACK_INPUTS")
     assert [i for i, _ in forced.stack_input_tables(frames + [stack])] == [0, 1, 2, 3]
+
+
+def test_stack_inputs_match_frames_whose_image_has_the_astrometry_suffix():
+    """D50 stacks '...-dft.fits' images of the '...-df.ecsv' epochs."""
+    names = ["20260911010000-001-r-060-df", "20260911020000-002-r-060-df", "20260911030000-003-r-060-df"]
+    frames = []
+    for name in names:
+        t = Table({"X_IMAGE": [1.0]})
+        t.meta["filename"] = f"/data/obs/{name}.ecsv"
+        frames.append(t)
+    stack = Table({"X_IMAGE": [1.0]})
+    stack.meta.update({"IS_STACK": True, "STACK_INPUTS": f"{names[0]}t.fits,{names[2]}t.fits"})
+
+    assert [i for i, _ in forced.stack_input_tables(frames + [stack])] == [0, 2]

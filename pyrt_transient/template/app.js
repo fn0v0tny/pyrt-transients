@@ -287,6 +287,7 @@ const transientViewer = {
       timeInfo.innerHTML = `
         Image ${this.currentCutoutIndex + 1} of ${cutouts.length}
         <div class="date-display">Date: ${currentCutout.date || 'Unknown'}</div>
+        <div class="date-display">Filter: ${currentCutout.filter || 'unfiltered'}</div>
       `;
     }
     
@@ -330,6 +331,8 @@ const transientViewer = {
       content += `
         <div style="display: grid; grid-template-columns: 1fr 1fr; gap: 15px; margin-top: 15px;">
           <div>
+            ${candidate.followup_exptime_s ? `<strong>Suggested follow-up:</strong> ${Number(candidate.followup_exptime_s).toFixed(0)} s` +
+              (candidate.followup_mag ? ` (planned for mag ${Number(candidate.followup_mag).toFixed(2)})` : '') + '<br>' : ''}
             <strong>Data Points:</strong> ${lc.data.n_points}<br>
             <strong>Time Span:</strong> ${lc.data.time_span_hours ? Number(lc.data.time_span_hours).toFixed(2) + ' hours' : 'N/A'}
           </div>
@@ -450,37 +453,52 @@ const transientViewer = {
       `;
     }
     
-    // Draw error bars and points
-    points.forEach((point, i) => {
-      const x = xPos(point.time);
-      const y = yPos(point.magnitude);
-      const errorUp = yPos(point.magnitude - point.error);
-      const errorDown = yPos(point.magnitude + point.error);
-      
-      // Error bar
-      svg.innerHTML += `
-        <line x1="${x}" y1="${errorUp}" x2="${x}" y2="${errorDown}" stroke="#666" stroke-width="1"/>
-        <line x1="${x-2}" y1="${errorUp}" x2="${x+2}" y2="${errorUp}" stroke="#666" stroke-width="1"/>
-        <line x1="${x-2}" y1="${errorDown}" x2="${x+2}" y2="${errorDown}" stroke="#666" stroke-width="1"/>
-      `;
-      
-      // Data point
-      svg.innerHTML += `
-        <circle cx="${x}" cy="${y}" r="4" fill="#3498db" stroke="#2980b9" stroke-width="2">
-          <title>Time: ${point.time.toFixed(2)}h, Mag: ${point.magnitude.toFixed(3)} ± ${point.error.toFixed(3)}</title>
-        </circle>
-      `;
-    });
-    
-    // Connect points with lines
-    if (points.length > 1) {
-      const pathData = points.map((point, i) => {
+    // One colour per photometric band, and lines only within a band: D50
+    // cycles g/r/i/z inside one observation, so a single joined series mixes
+    // filters and looks like variability that is not there.
+    const bandColour = (band) => ({
+      'Sloan_g': '#27ae60', 'Sloan_r': '#e74c3c', 'Sloan_i': '#8e44ad', 'Sloan_z': '#d35400',
+      'Johnson_B': '#2980b9', 'Johnson_V': '#16a085', 'Johnson_R': '#c0392b', 'Johnson_I': '#7f3f00',
+    }[band] || '#3498db');
+    const bands = [...new Set(points.map(p => p.filter || ''))];
+
+    bands.forEach((band) => {
+      const colour = bandColour(band);
+      const inBand = points.filter(p => (p.filter || '') === band);
+
+      inBand.forEach((point) => {
         const x = xPos(point.time);
         const y = yPos(point.magnitude);
-        return (i === 0 ? `M ${x} ${y}` : `L ${x} ${y}`);
-      }).join(' ');
-      
-      svg.innerHTML += `<path d="${pathData}" stroke="#3498db" stroke-width="2" fill="none" opacity="0.7"/>`;
+        const errorUp = yPos(point.magnitude - point.error);
+        const errorDown = yPos(point.magnitude + point.error);
+        const label = band ? `${band}, ` : '';
+
+        svg.innerHTML += `
+          <line x1="${x}" y1="${errorUp}" x2="${x}" y2="${errorDown}" stroke="#666" stroke-width="1"/>
+          <line x1="${x-2}" y1="${errorUp}" x2="${x+2}" y2="${errorUp}" stroke="#666" stroke-width="1"/>
+          <line x1="${x-2}" y1="${errorDown}" x2="${x+2}" y2="${errorDown}" stroke="#666" stroke-width="1"/>
+          <circle cx="${x}" cy="${y}" r="4" fill="${colour}" stroke="${colour}" stroke-width="2">
+            <title>${label}Time: ${point.time.toFixed(2)}h, Mag: ${point.magnitude.toFixed(3)} ± ${point.error.toFixed(3)}</title>
+          </circle>
+        `;
+      });
+
+      if (inBand.length > 1) {
+        const pathData = inBand.map((point, i) => {
+          const x = xPos(point.time);
+          const y = yPos(point.magnitude);
+          return (i === 0 ? `M ${x} ${y}` : `L ${x} ${y}`);
+        }).join(' ');
+        svg.innerHTML += `<path d="${pathData}" stroke="${colour}" stroke-width="2" fill="none" opacity="0.7"/>`;
+      }
+    });
+
+    if (bands.length > 1 || bands[0]) {
+      const entries = bands.map((band, i) => `
+        <circle cx="8" cy="${12 + i * 16}" r="4" fill="${bandColour(band)}"/>
+        <text x="18" y="${16 + i * 16}" font-size="10" fill="#666">${band || 'unfiltered'}</text>
+      `).join('');
+      svg.innerHTML += `<g transform="translate(${width - 90}, 0)">${entries}</g>`;
     }
   },
   

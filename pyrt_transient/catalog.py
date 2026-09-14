@@ -12,7 +12,9 @@ Provides:
 """
 
 import hashlib
+import json
 import logging
+import os
 import pickle
 import time
 import warnings
@@ -780,6 +782,55 @@ class CatTransients(_PyrtCatalog):
         stale = self.get_cache().load_from_cache(self._catalog_name, params, allow_stale=True)
         return None if stale is None else self._tag_table(stale, config, cached=True, stale=True)
 
+    # How long a failed query is remembered on disk, for every process.
+    FAILURE_TTL_S = float(os.environ.get("PYRT_CATALOG_FAILURE_TTL_S", "900"))
+
+    def _failure_path(self, params):
+        cache = self.get_cache()
+        try:
+            key = cache._generate_cache_key(self._catalog_name, params)
+        except AttributeError:   # a cache without keys (a stub in the tests)
+            return None
+        return Path(cache.cache_dir) / ".failed" / self._catalog_name / f"{key}.json"
+
+    def recent_failure(self, params):
+        """Why this field's query failed within FAILURE_TTL_S, or None.
+
+        The answer is a file, so every pipeline process sees it. While a
+        catalogue server is down (Gaia TAP for more than 12 h on
+        2026-09-11/12), each frame otherwise waits out the timeout again --
+        3 min a frame, and twice over 2 h.
+        """
+        path = self._failure_path(params)
+        if path is None or self.FAILURE_TTL_S <= 0:
+            return None
+        try:
+            entry = json.loads(path.read_text())
+            if time.time() - float(entry["time"]) < self.FAILURE_TTL_S:
+                return entry.get("reason", "")
+            path.unlink()
+        except (OSError, ValueError, KeyError, TypeError):
+            pass
+        return None
+
+    def _remember_failure(self, params, reason):
+        path = self._failure_path(params)
+        if path is None or self.FAILURE_TTL_S <= 0:
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(json.dumps({"time": time.time(), "reason": str(reason)[:500]}))
+        except OSError:
+            pass
+
+    def _forget_failure(self, params):
+        path = self._failure_path(params)
+        try:
+            if path is not None:
+                path.unlink()
+        except OSError:
+            pass
+
     def _fetch_catalog_data(self) -> Optional[astropy.table.Table]:  # type: ignore[override]
         """Fetch catalog data, adding disk caching and Legacy Survey support.
 
@@ -806,12 +857,12 @@ class CatTransients(_PyrtCatalog):
             if cached is not None:
                 return self._tag_table(cached, config, cached=True)
 
-        if failure_key in self._failed_queries:
+        recent = self._failed_queries.get(failure_key) or self.recent_failure(params)
+        if recent:
             stale = self._stale_cache(params, config)
             if stale is not None:
                 return stale
-            raise RuntimeError(f"{self._catalog_name} query already failed in this run: "
-                               f"{self._failed_queries[failure_key]}")
+            raise RuntimeError(f"{self._catalog_name} query failed recently: {recent}")
 
         if cacheable:
             # Widen the query so nearby pointings get a cache hit
@@ -832,10 +883,13 @@ class CatTransients(_PyrtCatalog):
                 raise
             except Exception as exc:
                 self._failed_queries[failure_key] = str(exc)
+                self._remember_failure(params, exc)   # for the other processes too
                 stale = self._stale_cache(params, config)
                 if stale is not None:
                     return stale
                 raise
+            else:
+                self._forget_failure(params)          # the server answers again
 
             if result is None:
                 # Every path that returns None here means "the query ran and
@@ -1669,6 +1723,7 @@ class CatTransients(_PyrtCatalog):
         # (USNO-B plate magnitudes, Gaia G without BP/RP, ...).
         rough_mags = getattr(self._photometric_cache, "rough_mags", None)
         unphotometered_rough: List[float] = []
+        predicted: set = set()  # matches with a Sloan prediction in matched_cat_mags
 
         for idx in matches:
             if not self._photometric_cache.valid_stars[idx]:  # type: ignore[union-attr]
@@ -1697,6 +1752,7 @@ class CatTransients(_PyrtCatalog):
                 nsigma = abs(diff) / sigma
                 any_valid = True
                 matched_cat_mags.append(float(cat_mag))
+                predicted.add(int(idx))
 
                 if is_blended:
                     # A blend measures every star under it at once, so a
@@ -1719,13 +1775,33 @@ class CatTransients(_PyrtCatalog):
                 continue
 
         if is_blended and matched_cat_mags:
+            # The blend also holds the matches without a Sloan prediction.
+            # Leaving them out of the sum read every such blend as
+            # "brightening" by exactly their flux, so their rough magnitudes
+            # go in too.
+            blend_mags = list(matched_cat_mags)
+            flux_unknown = False
+            for idx in matches:
+                if int(idx) in predicted:
+                    continue
+                if rough_mags is not None and np.isfinite(rough_mags[idx]):
+                    blend_mags.append(float(rough_mags[idx]))
+                else:
+                    flux_unknown = True
             combined_cat_mag = -2.5 * np.log10(
-                np.sum(10.0 ** (-0.4 * np.asarray(matched_cat_mags)))
+                np.sum(10.0 ** (-0.4 * np.asarray(blend_mags)))
             )
             sigma = np.sqrt(det_mag_err ** 2 + det_sys ** 2 + cat_sys ** 2)
             diff = float(det_mag - combined_cat_mag)
             nsigma = abs(diff) / sigma
-            if abs(diff) >= mag_change_threshold and nsigma > siglim:
+            # A member with no magnitude at all can hide an excess up to the
+            # margin a positional-only match is allowed.
+            explained = (diff < 0 and flux_unknown
+                         and unphotometered_veto_max_brightening is not None
+                         and diff > -abs(unphotometered_veto_max_brightening))
+            if explained:
+                pass
+            elif abs(diff) >= mag_change_threshold and nsigma > siglim:
                 significant.append((diff, "brightening" if diff < 0 else "fading"))
             elif (diff < 0 and abs(diff) >= mag_change_threshold
                     and nsigma > min(new_source_siglim, siglim)):

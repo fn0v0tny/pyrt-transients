@@ -5,6 +5,8 @@ import astropy.io.fits as fits
 from astropy.visualization import ZScaleInterval, ImageNormalize
 from astropy.table import Table
 from astropy.wcs import WCS
+
+from pyrt_transient.core.epochs import bands_of
 import numpy as np
 import json
 from pathlib import Path
@@ -145,6 +147,45 @@ def _lightcurve_pixel_positions(lightcurve):
         pos = (float(row['X_IMAGE']) - 1, float(row['Y_IMAGE']) - 1)
         positions[stem] = pos
         positions.setdefault(stem + 't', pos)
+    return positions
+
+
+def _frame_pixel_positions(candidates_data, epoch_positions, frame_stem, wcs):
+    """{candidate_id: (x, y)}, 0-based, for one frame.
+
+    In order:
+
+    1. the candidate's own detection in this frame (from its lightcurve),
+       which also follows a moving source;
+    2. its sky position through THIS frame's WCS;
+    3. the X_IMAGE/Y_IMAGE stored on the candidate row, only when the frame
+       has no usable WCS.
+
+    The stored pixel was measured in the epoch the candidate was found in.
+    Using it for a frame the candidate was not detected in centres the stamp
+    on another frame's pointing: on the GRB replay the pointing moves by
+    ~250 px between epochs, which is why those cutouts landed off-target and
+    jumped about. A candidate the WCS puts outside the frame is dropped by
+    the bounds check of the caller.
+    """
+    positions = {}
+    needs_wcs, coords = [], []
+    for candidate_id, cand_data in candidates_data.items():
+        ep = epoch_positions.get(candidate_id, {})
+        if frame_stem in ep:
+            positions[candidate_id] = ep[frame_stem]
+            continue
+        ra, dec = cand_data.get('ra'), cand_data.get('dec')
+        if wcs is not None and ra is not None and dec is not None:
+            needs_wcs.append(candidate_id)
+            coords.append([ra, dec])
+            continue
+        xi, yi = cand_data.get('x_image'), cand_data.get('y_image')
+        if xi is not None and yi is not None:
+            positions[candidate_id] = (xi - 1, yi - 1)   # SExtractor is 1-based
+    if coords:
+        for cid, (wx, wy) in zip(needs_wcs, wcs.all_world2pix(np.array(coords), 0)):
+            positions[cid] = (float(wx), float(wy))
     return positions
 
 
@@ -616,6 +657,9 @@ class FrontendGenerator:
                     header = hdul[0].header.copy()
                     naxis1 = header.get('NAXIS1', 0)
                     naxis2 = header.get('NAXIS2', 0)
+                    # Shown with the stamp: an observation cycles through
+                    # several bands, so a sequence without them is misleading.
+                    frame_filter = str(header.get('PHFILTER') or header.get('FILTER') or '')
                     if naxis1 == 0 or naxis2 == 0:
                         logger.warning(f"No image dimensions in FITS header {fits_file}")
                         continue
@@ -640,32 +684,23 @@ class FrontendGenerator:
                         )
 
                     # Build pixel positions for all candidates in this frame.
-                    # Priority 1: per-epoch SExtractor position (from lightcurve ECSV).
-                    # Priority 2: X_IMAGE/Y_IMAGE stored directly on the candidate row.
-                    # Fallback:   WCS conversion from sky position (batch-vectorized).
+                    # Priority 1: this frame's own SExtractor position (from the
+                    #             lightcurve ECSV), which also follows a mover.
+                    # Priority 2: the sky position through THIS frame's WCS.
+                    # Fallback:   X_IMAGE/Y_IMAGE stored on the candidate row --
+                    #             only when the frame has no usable WCS.
+                    #
+                    # That stored pixel was measured in the epoch the candidate
+                    # was found in, so using it for a frame the candidate was
+                    # not detected in centres the stamp on another frame's
+                    # pointing: on the GRB replay the pointing moves by ~250 px
+                    # between epochs, which is the "wrong position / jumping
+                    # cutouts" the replay pages showed. A frame whose WCS puts
+                    # the candidate outside the image is skipped below, instead
+                    # of being stamped at a pixel that means nothing.
                     candidate_ids = list(candidates_data.keys())
-                    pixel_position_map = {}   # candidate_id -> (x, y)
-
-                    needs_wcs = []
-                    needs_wcs_coords = []
-                    for candidate_id in candidate_ids:
-                        ep = epoch_positions.get(candidate_id, {})
-                        if frame_stem in ep:
-                            pixel_position_map[candidate_id] = ep[frame_stem]
-                        else:
-                            cand_data = candidates_data[candidate_id]
-                            xi, yi = cand_data.get('x_image'), cand_data.get('y_image')
-                            if xi is not None and yi is not None:
-                                # SExtractor pixel coords are 1-based; convert to 0-based
-                                pixel_position_map[candidate_id] = (xi - 1, yi - 1)
-                            else:
-                                needs_wcs.append(candidate_id)
-                                needs_wcs_coords.append([cand_data['ra'], cand_data['dec']])
-
-                    if needs_wcs_coords and wcs is not None:
-                        wcs_px = wcs.all_world2pix(np.array(needs_wcs_coords), 0)
-                        for cid, (wx, wy) in zip(needs_wcs, wcs_px):
-                            pixel_position_map[cid] = (wx, wy)
+                    pixel_position_map = _frame_pixel_positions(
+                        candidates_data, epoch_positions, frame_stem, wcs)
 
                     if not pixel_position_map:
                         continue
@@ -696,7 +731,8 @@ class FrontendGenerator:
                                 # diff image's pixel grid (HOTPANTS/ZOGY run on
                                 # a reprojected-to-science-WCS template), so the
                                 # same (x, y)/bounds crop directly from each.
-                                entry = {"filename": fits_file.name, "date": date_str}
+                                entry = {"filename": fits_file.name, "date": date_str,
+                                         "filter": frame_filter}
 
                                 diff_fn = f"{candidate_id}_{fits_file.stem}_diff.{image_format}"
                                 diff_out = self.output_dir / "cutouts" / diff_fn
@@ -744,7 +780,8 @@ class FrontendGenerator:
                                 candidates_data[candidate_id]['cutouts'].append({
                                     "path": f"./cutouts/{output_filename}",
                                     "filename": fits_file.name,
-                                    "date": date_str
+                                    "date": date_str,
+                                    "filter": frame_filter
                                 })
                                 continue
 
@@ -760,7 +797,8 @@ class FrontendGenerator:
                             candidates_data[candidate_id]['cutouts'].append({
                                 "path": f"./cutouts/{output_filename}",
                                 "filename": fits_file.name,
-                                "date": date_str
+                                "date": date_str,
+                                "filter": frame_filter
                             })
 
                         except Exception as e:
@@ -1523,6 +1561,7 @@ class FrontendGenerator:
                 
                 # Build lightcurve points in sorted time order with clean JSON
                 lightcurve_info['points'] = []
+                point_bands = bands_of(valid_lc_table)
                 
                 for i, (t_hr, obs_t, mag, mag_err) in enumerate(zip(time_hours, valid_times, valid_mags, valid_mag_errs)):
                     point = {
@@ -1531,6 +1570,14 @@ class FrontendGenerator:
                         'error': float(mag_err)         # Magnitude error
                     }
                     
+                    # The band this point was measured in, so the page can
+                    # separate them instead of drawing one mixed series. For
+                    # lightcurves stored before that column existed it is read
+                    # back from the frame name.
+                    band = str(point_bands[i]) if len(point_bands) > i else ''
+                    if band:
+                        point['filter'] = band
+
                     # Add epoch_id if available
                     if 'epoch_id' in valid_lc_table.colnames:
                         epoch_id = valid_lc_table['epoch_id'][i]

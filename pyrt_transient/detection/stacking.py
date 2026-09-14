@@ -49,6 +49,7 @@ logger = logging.getLogger("detection.stacking")
 _STACK_STATE_FILENAME = "stack_state.json"
 _STACK_FITS_NAME = "stack.fits"
 _STACK_ECSV_NAME = "stack.ecsv"
+_STACK_STAGING_DIR = ".stack_staging"
 _STACK_TRANSIENTS_CACHE_NAME = "stack_transients.ecsv"
 
 
@@ -471,15 +472,23 @@ def _attempt_rebuild(obs_dir: Path, real_tables: List[Table], det_cfg, n_real_ep
     # M-epoch catalogue (NCOMBINE/MAGLIM/EXPTIME describing a different
     # image) whenever build_stack_ecsv then failed, with nothing logging the
     # mismatch and no rollback until a later rebuild happened to succeed.
-    staged_fits_path = obs_dir / f"{stack_fits_path.stem}.new.fits"
-    staged_ecsv_path = obs_dir / f"{stack_ecsv_path.stem}.new.ecsv"
-    staged_fits_path.unlink(missing_ok=True)
-    staged_ecsv_path.unlink(missing_ok=True)
+    # Staged in a subdirectory, not obs_dir itself: the frontend reads every
+    # obs_dir/*.fits as a frame, and a run killed mid-build left
+    # stack.new.fits there until the next rebuild. Same filesystem, so the
+    # final replace() is still a rename.
+    staging_dir = obs_dir / _STACK_STAGING_DIR
+    shutil.rmtree(staging_dir, ignore_errors=True)
+    staging_dir.mkdir()
+    staged_fits_path = staging_dir / _STACK_FITS_NAME
+    staged_ecsv_path = staging_dir / _STACK_ECSV_NAME
+    for leftover in ("stack.new.fits", "stack.new.ecsv"):  # staged there before
+        (obs_dir / leftover).unlink(missing_ok=True)
 
     combined = combine_epochs(
         fits_paths, staged_fits_path, uniform=det_cfg.stacking_uniform_weighting,
     )
     if combined is None:
+        shutil.rmtree(staging_dir, ignore_errors=True)
         return
 
     built = build_stack_ecsv(
@@ -492,8 +501,7 @@ def _attempt_rebuild(obs_dir: Path, real_tables: List[Table], det_cfg, n_real_ep
     if built is None:
         log.warning("Stacking: combined image built but its catalogue could not be; "
                     "keeping the previous stack (if any) and discarding the new image")
-        staged_fits_path.unlink(missing_ok=True)
-        staged_ecsv_path.unlink(missing_ok=True)
+        shutil.rmtree(staging_dir, ignore_errors=True)
         return
 
     # Both halves exist and describe the same image -- install them
@@ -502,6 +510,7 @@ def _attempt_rebuild(obs_dir: Path, real_tables: List[Table], det_cfg, n_real_ep
     # (versus any calibration failure before this change).
     staged_fits_path.replace(stack_fits_path)
     staged_ecsv_path.replace(stack_ecsv_path)
+    shutil.rmtree(staging_dir, ignore_errors=True)
 
     # Invalidate BlindMulticatalogStrategy's Step-1 per-epoch cache so the
     # refreshed (deeper) stack actually gets reprocessed instead of being

@@ -545,9 +545,40 @@ def test_attempt_rebuild_installs_fits_and_ecsv_together():
             assert (obs_dir / "stack.fits").read_bytes() == b"FAKEFITS"
             assert Table.read(str(obs_dir / "stack.ecsv"), format="ascii.ecsv").meta["NCOMBINE"] == 8
             assert not list(obs_dir.glob("stack.new.*"))
+            assert not (obs_dir / stacking._STACK_STAGING_DIR).exists()
     finally:
         restore()
     print("test_attempt_rebuild_installs_fits_and_ecsv_together: PASS")
+
+
+def test_a_rebuild_killed_mid_build_leaves_no_extra_fits_among_the_frames():
+    """The frontend reads every obs_dir/*.fits as a frame, so the new stack
+    must not be staged there: a run killed while its catalogue was being
+    built left stack.new.fits behind until the next rebuild."""
+    def killed_build(stack_fits_path, output_path=None, **kwargs):
+        raise KeyboardInterrupt   # the daemon's timeout kill
+
+    restore = _patch_build_fns(fake_combine=_fake_combine, fake_build_ecsv=killed_build)
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            obs_dir = Path(d)
+            (obs_dir / "stack.fits").write_bytes(b"OLDFITS")
+            (obs_dir / "stack.new.fits").write_bytes(b"LEFT BY THE PREVIOUS LAYOUT")
+            cfg = _make_config(stacking_enabled=True, stacking_min_epochs=1,
+                                stacking_rebuild_interval=1)
+            tables = [_make_detection_table(i, obs_dir) for i in range(8)]
+            try:
+                stacking._attempt_rebuild(obs_dir, tables, cfg.detection, len(tables), _LOG)
+            except KeyboardInterrupt:
+                pass
+            else:
+                raise AssertionError("the fake catalogue build should have been interrupted")
+
+            assert sorted(q.name for q in obs_dir.glob("*.fits")) == ["stack.fits"]
+            assert (obs_dir / "stack.fits").read_bytes() == b"OLDFITS"
+    finally:
+        restore()
+    print("test_a_rebuild_killed_mid_build_leaves_no_extra_fits_among_the_frames: PASS")
 
 
 def test_maybe_build_stack_table_below_min_epochs_returns_none():

@@ -235,64 +235,68 @@ def _patch_get_skycells() -> None:
 
                 hdu = _stdpipe_templates.fits_open_remote(cell)
                 if hdu is not None:
-                    try:
-                        image, header = hdu[1].data, hdu[1].header
-                    except ValueError:
-                        # fitsio fallback: astropy's compressed-tile decompression
-                        # can't handle this skycell's BLANK-into-integer tiles --
-                        # read the exact same cached local file with fitsio instead.
-                        local_path = hdu.filename()
-                        log('astropy decompression failed for %s, retrying with fitsio' % cellname)
-                        image = fitsio.read(local_path, ext=1)
-                        header = _fits.getheader(local_path, ext=1)
+                    try:  # closed even when the fitsio fallback raises
+                        try:
+                            image, header = hdu[1].data, hdu[1].header
+                        except ValueError:
+                            # fitsio fallback: astropy's compressed-tile decompression
+                            # can't handle this skycell's BLANK-into-integer tiles --
+                            # read the exact same cached local file with fitsio instead.
+                            local_path = hdu.filename()
+                            log('astropy decompression failed for %s, retrying with fitsio' % cellname)
+                            image = fitsio.read(local_path, ext=1)
+                            header = _fits.getheader(local_path, ext=1)
 
-                    if normalize:
-                        if survey == 'ps1':
-                            # Not _stdpipe_templates.normalize_ps1_skycell here:
-                            # _patch_normalize_ps1_skycell above replaces that name
-                            # with a *file-based* fixed version (filename, outname)
-                            # -- a different calling convention than the
-                            # (image, header) -> (image, header) one get_skycells
-                            # actually uses at this call site. Calling the patched
-                            # name here would pass `image` positionally where it
-                            # expects a filename (verified directly: raises
-                            # "truth value of an array is ambiguous" inside
-                            # fits.getheader). Inlined here instead, straight from
-                            # stdpipe's original array-based normalize_ps1_skycell
-                            # body, so this call site never touches that patch.
-                            if 'RADESYS' not in header and 'PC001001' in header:
-                                header = header.copy()
-                                header['RADESYS'] = 'FK5'
-                                header.rename_keyword('PC001001', 'PC1_1')
-                                header.rename_keyword('PC001002', 'PC1_2')
-                                header.rename_keyword('PC002001', 'PC2_1')
-                                header.rename_keyword('PC002002', 'PC2_2')
-                                if 'BSOFTEN' in header and 'BOFFSET' in header:
-                                    x = image * 0.4 * np.log(10)
-                                    image = header['BOFFSET'] + header['BSOFTEN'] * (np.exp(x) - np.exp(-x))
-                                    image /= header['EXPTIME']
-                                    for kw in ['BSOFTEN', 'BOFFSET', 'BLANK']:
-                                        header.remove(kw, ignore_missing=True)
+                        if normalize:
+                            if survey == 'ps1':
+                                # Not _stdpipe_templates.normalize_ps1_skycell here:
+                                # _patch_normalize_ps1_skycell above replaces that name
+                                # with a *file-based* fixed version (filename, outname)
+                                # -- a different calling convention than the
+                                # (image, header) -> (image, header) one get_skycells
+                                # actually uses at this call site. Calling the patched
+                                # name here would pass `image` positionally where it
+                                # expects a filename (verified directly: raises
+                                # "truth value of an array is ambiguous" inside
+                                # fits.getheader). Inlined here instead, straight from
+                                # stdpipe's original array-based normalize_ps1_skycell
+                                # body, so this call site never touches that patch.
+                                if 'RADESYS' not in header and 'PC001001' in header:
+                                    header = header.copy()
+                                    header['RADESYS'] = 'FK5'
+                                    header.rename_keyword('PC001001', 'PC1_1')
+                                    header.rename_keyword('PC001002', 'PC1_2')
+                                    header.rename_keyword('PC002001', 'PC2_1')
+                                    header.rename_keyword('PC002002', 'PC2_2')
+                                    if 'BSOFTEN' in header and 'BOFFSET' in header:
+                                        x = image * 0.4 * np.log(10)
+                                        image = header['BOFFSET'] + header['BSOFTEN'] * (np.exp(x) - np.exp(-x))
+                                        image /= header['EXPTIME']
+                                        for kw in ['BSOFTEN', 'BOFFSET', 'BLANK']:
+                                            header.remove(kw, ignore_missing=True)
 
-                        if survey == 'ls' and ext == 'image':
-                            try:
-                                ihdu = _stdpipe_templates.fits_open_remote(cell.replace('-image-', '-invvar-'))
-                                if ihdu is not None:
-                                    invvar = ihdu[1].data
-                                    image[invvar == 0] = np.nan
-                                    ihdu.close()
-                            except Exception:
-                                pass
+                            if survey == 'ls' and ext == 'image':
+                                try:
+                                    ihdu = _stdpipe_templates.fits_open_remote(cell.replace('-image-', '-invvar-'))
+                                    if ihdu is not None:
+                                        try:
+                                            invvar = ihdu[1].data
+                                            image[invvar == 0] = np.nan
+                                        finally:
+                                            ihdu.close()
+                                except Exception:
+                                    pass
 
-                    if _cache_downscale > 1:
-                        image, header = _stdpipe_templates.cutouts.downscale_image(
-                            image, header=header, scale=_cache_downscale,
-                            mode='or' if ext == 'mask' else 'sum',
-                        )
-                        log("Downscaling the image and storing it as", os.path.split(filename)[-1])
+                        if _cache_downscale > 1:
+                            image, header = _stdpipe_templates.cutouts.downscale_image(
+                                image, header=header, scale=_cache_downscale,
+                                mode='or' if ext == 'mask' else 'sum',
+                            )
+                            log("Downscaling the image and storing it as", os.path.split(filename)[-1])
 
-                    _fits.writeto(filename, image, header, overwrite=True)
-                    hdu.close()
+                        _fits.writeto(filename, image, header, overwrite=True)
+                    finally:
+                        hdu.close()
 
             if os.path.exists(filename):
                 filenames.append(filename)

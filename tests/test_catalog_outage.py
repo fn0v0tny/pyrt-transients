@@ -107,3 +107,45 @@ def test_a_fresh_answer_is_cached_and_the_widened_query_restored(monkeypatch):
     assert cat._query_params == _params()
     assert len(_gaia()._fetch_catalog_data()) == 3   # from the disk cache
     assert calls == ["gaia"]
+
+
+def test_a_failed_query_is_remembered_for_the_next_process(monkeypatch):
+    # Gaia TAP was down for over 12 h on 2026-09-11/12. Without this, every
+    # frame waited out its timeout again: 3 min, and twice over 2 h.
+    _write_entry(age_days=40)
+    calls = _parent_fetch(monkeypatch, RuntimeError("Gaia query failed: 500"))
+
+    assert len(_gaia()._fetch_catalog_data()) == 3            # falls back to the stale entry
+    monkeypatch.setattr(CatTransients, "_failed_queries", {})  # as a new process would start
+    assert len(_gaia()._fetch_catalog_data()) == 3
+
+    assert calls == ["gaia"]                                  # the server was asked once
+    assert "500" in _gaia().recent_failure(_params())
+
+
+def test_the_memory_of_a_failure_expires(monkeypatch):
+    _write_entry(age_days=40)
+    calls = _parent_fetch(monkeypatch, RuntimeError("Gaia query failed: 500"))
+    _gaia()._fetch_catalog_data()
+
+    monkeypatch.setattr(CatTransients, "_failed_queries", {})
+    monkeypatch.setattr(CatTransients, "FAILURE_TTL_S", 0.0)
+    _gaia()._fetch_catalog_data()
+
+    assert calls == ["gaia", "gaia"]
+
+
+def test_a_success_forgets_the_failure(monkeypatch):
+    _write_entry(age_days=40)
+    _parent_fetch(monkeypatch, RuntimeError("boom"))
+    _gaia()._fetch_catalog_data()
+    path = _gaia()._failure_path(_params())
+    assert path.exists() and _gaia().recent_failure(_params())
+
+    # Older than the TTL: the next run asks the server again.
+    path.write_text('{"time": %f, "reason": "boom"}' % (time.time() - 10000))
+    monkeypatch.setattr(CatTransients, "_failed_queries", {})
+    _parent_fetch(monkeypatch, _stars())
+
+    assert len(_gaia()._fetch_catalog_data()) == 3
+    assert not path.exists()

@@ -19,6 +19,8 @@ Configuration is by environment variable (all optional):
                              e.g. "--config=/etc/pyrt/transient.yaml"
   PYRT_TRANSIENT_MAX_PARALLEL   concurrent pipeline runs (default 4)
   PYRT_TRANSIENT_DEBOUNCE_S     debounce window, seconds (default 30)
+  PYRT_STATUS_REFRESH_S         how often the daemon refreshes the status page
+                                (tools/status_page.py; default 300, 0 = never)
 """
 
 import socket
@@ -41,6 +43,9 @@ SOCKET_PATH = os.environ.get("PYRT_TRANSIENT_SOCKET", str(_HOME / "transient_dae
 WORK_DIR = Path(os.environ.get("PYRT_TRANSIENT_WORK_DIR", _HOME / "transient_work"))
 LOG_DIR = Path(os.environ.get("PYRT_TRANSIENT_LOG_DIR", _HOME / "logs"))
 MAX_PARALLEL_PROCESSES = int(os.environ.get("PYRT_TRANSIENT_MAX_PARALLEL", "4"))
+# How often the daemon itself refreshes the status page, so it does not stand
+# still while the telescope is idle. 0 turns it off.
+STATUS_REFRESH_S = float(os.environ.get("PYRT_STATUS_REFRESH_S", "300"))
 DEBOUNCE_SECONDS = float(os.environ.get("PYRT_TRANSIENT_DEBOUNCE_S", "30"))
 PIPELINE_TIMEOUT_S = 900
 
@@ -307,10 +312,34 @@ class TransientDaemon:
             except Exception:
                 pass
 
+    def refresh_status_page(self):
+        """Rewrite the status page's data (tools/status_page.py), in the background.
+
+        Otherwise only a frame going through tools/pipeline_entry.py refreshes
+        it, so the page stands still whenever the telescope is idle: on
+        lascaux50 it showed the same data for eight hours after the last frame
+        of the night, with a frame killed at its timeout still listed as
+        running.
+        """
+        script = Path(__file__).resolve().parent.parent / "tools" / "status_page.py"
+        if not script.exists():
+            return
+        try:
+            subprocess.Popen([sys.executable, str(script)], stdin=subprocess.DEVNULL,
+                             stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                             start_new_session=True)
+        except OSError as exc:
+            logger.debug(f"Status page refresh failed: {exc}")
+
     def print_status(self):
         """Print periodic status information."""
+        last_page = None   # refresh on the first turn, then every interval
         while self.running:
             time.sleep(60)
+            if STATUS_REFRESH_S > 0 and (last_page is None
+                                         or time.time() - last_page >= STATUS_REFRESH_S):
+                last_page = time.time()
+                self.refresh_status_page()
             with self._debounce_lock:
                 pending = sum(len(v) for v in self._debounce_files.values())
             with self.jobs_lock:
