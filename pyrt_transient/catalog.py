@@ -1723,6 +1723,7 @@ class CatTransients(_PyrtCatalog):
         # (USNO-B plate magnitudes, Gaia G without BP/RP, ...).
         rough_mags = getattr(self._photometric_cache, "rough_mags", None)
         unphotometered_rough: List[float] = []
+        predicted: set = set()  # matches with a Sloan prediction in matched_cat_mags
 
         for idx in matches:
             if not self._photometric_cache.valid_stars[idx]:  # type: ignore[union-attr]
@@ -1751,6 +1752,7 @@ class CatTransients(_PyrtCatalog):
                 nsigma = abs(diff) / sigma
                 any_valid = True
                 matched_cat_mags.append(float(cat_mag))
+                predicted.add(int(idx))
 
                 if is_blended:
                     # A blend measures every star under it at once, so a
@@ -1773,13 +1775,33 @@ class CatTransients(_PyrtCatalog):
                 continue
 
         if is_blended and matched_cat_mags:
+            # The blend also holds the matches without a Sloan prediction.
+            # Leaving them out of the sum read every such blend as
+            # "brightening" by exactly their flux, so their rough magnitudes
+            # go in too.
+            blend_mags = list(matched_cat_mags)
+            flux_unknown = False
+            for idx in matches:
+                if int(idx) in predicted:
+                    continue
+                if rough_mags is not None and np.isfinite(rough_mags[idx]):
+                    blend_mags.append(float(rough_mags[idx]))
+                else:
+                    flux_unknown = True
             combined_cat_mag = -2.5 * np.log10(
-                np.sum(10.0 ** (-0.4 * np.asarray(matched_cat_mags)))
+                np.sum(10.0 ** (-0.4 * np.asarray(blend_mags)))
             )
             sigma = np.sqrt(det_mag_err ** 2 + det_sys ** 2 + cat_sys ** 2)
             diff = float(det_mag - combined_cat_mag)
             nsigma = abs(diff) / sigma
-            if abs(diff) >= mag_change_threshold and nsigma > siglim:
+            # A member with no magnitude at all can hide an excess up to the
+            # margin a positional-only match is allowed.
+            explained = (diff < 0 and flux_unknown
+                         and unphotometered_veto_max_brightening is not None
+                         and diff > -abs(unphotometered_veto_max_brightening))
+            if explained:
+                pass
+            elif abs(diff) >= mag_change_threshold and nsigma > siglim:
                 significant.append((diff, "brightening" if diff < 0 else "fading"))
             elif (diff < 0 and abs(diff) >= mag_change_threshold
                     and nsigma > min(new_source_siglim, siglim)):

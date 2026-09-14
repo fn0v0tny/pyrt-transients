@@ -240,6 +240,50 @@ def test_new_source_siglim_above_siglim_does_not_tighten_blended_gate():
     print("test_new_source_siglim_above_siglim_does_not_tighten_blended_gate: PASS")
 
 
+def _make_cat_with_unphotometered_neighbour(rough_mag):
+    """Star 0 has Sloan photometry (15.0); star 1 has none, only a rough
+    magnitude (USNO-B plate, Gaia G without BP/RP, ...) or NaN."""
+    cat = Table.__new__(CatTransients)
+    cat.meta = {"catalog_props": {"catalog_name": "gaia"}}
+    cat._photometric_cache = CatalogOptimizationCache(
+        coordinates=np.zeros((2, 2)),
+        pixel_coordinates={},
+        magnitudes=np.array([[15.0, 15.0], [np.nan, np.nan]]),
+        colors=np.array([[0.5, 0.3, 0.1, 0.2], [np.nan] * 4]),
+        valid_stars=np.array([True, False]),
+        kdtrees={},
+        rough_mags=np.array([15.0, rough_mag]),
+    )
+    return cat
+
+
+def test_blend_prediction_includes_the_unphotometered_star():
+    # Two equally bright 15.0 stars, together 14.25 mag. Predicting from the
+    # photometered one alone read the pair as a 0.75 mag brightening.
+    pair = -2.5 * np.log10(2 * 10 ** (-0.4 * 15.0))
+    cat = _make_cat_with_unphotometered_neighbour(15.0)
+    kw = dict(mag_change_threshold=0.5, siglim=5.0, is_blended=True, new_source_siglim=1.5)
+    is_cand, ctype, _ = cat._check_magnitude_changes_cached(np.array([0, 1]), pair, 0.05, "", **kw)
+    assert is_cand is False and ctype == "none"
+    # ...while a real excess on top of both still counts.
+    is_cand, ctype, mdiff = cat._check_magnitude_changes_cached(np.array([0, 1]), pair - 1.0, 0.05, "", **kw)
+    assert is_cand is True and ctype == "brightening" and abs(mdiff + 1.0) < 1e-6
+    print("test_blend_prediction_includes_the_unphotometered_star: PASS")
+
+
+def test_blend_with_a_star_of_unknown_brightness_needs_the_veto_margin():
+    cat = _make_cat_with_unphotometered_neighbour(np.nan)
+    kw = dict(mag_change_threshold=0.5, siglim=5.0, is_blended=True, new_source_siglim=1.5,
+              unphotometered_veto_max_brightening=2.0)
+    # 0.75 mag above the photometered star: the unmeasured one can explain it.
+    is_cand, ctype, _ = cat._check_magnitude_changes_cached(np.array([0, 1]), 14.25, 0.05, "", **kw)
+    assert is_cand is False and ctype == "none"
+    # 3 mag above: more than any unmeasured neighbour is allowed to hide.
+    is_cand, ctype, mdiff = cat._check_magnitude_changes_cached(np.array([0, 1]), 12.0, 0.05, "", **kw)
+    assert is_cand is True and ctype == "brightening" and abs(mdiff + 3.0) < 1e-6
+    print("test_blend_with_a_star_of_unknown_brightness_needs_the_veto_margin: PASS")
+
+
 if __name__ == "__main__":
     test_blended_excess_flagged_between_new_source_siglim_and_siglim()
     test_same_moderate_excess_not_flagged_when_not_blended()
@@ -250,4 +294,6 @@ if __name__ == "__main__":
     test_process_detections_drops_same_source_when_not_blended()
     test_blended_ordinary_pair_is_not_flagged_as_brightening()
     test_new_source_siglim_above_siglim_does_not_tighten_blended_gate()
+    test_blend_prediction_includes_the_unphotometered_star()
+    test_blend_with_a_star_of_unknown_brightness_needs_the_veto_margin()
     print("All catalog.py blending regression tests passed.")
