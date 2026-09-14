@@ -123,6 +123,18 @@ def test_a_failed_query_is_remembered_for_the_next_process(monkeypatch):
     assert "500" in _gaia().recent_failure(_params())
 
 
+def test_a_failure_without_a_message_is_remembered_too(monkeypatch):
+    _write_entry(age_days=40)
+    calls = _parent_fetch(monkeypatch, RuntimeError())   # str(exc) == ""
+
+    assert len(_gaia()._fetch_catalog_data()) == 3
+    assert len(_gaia()._fetch_catalog_data()) == 3             # the same run
+    monkeypatch.setattr(CatTransients, "_failed_queries", {})  # as a new process would start
+    assert len(_gaia()._fetch_catalog_data()) == 3
+
+    assert calls == ["gaia"]
+
+
 def test_the_memory_of_a_failure_expires(monkeypatch):
     _write_entry(age_days=40)
     calls = _parent_fetch(monkeypatch, RuntimeError("Gaia query failed: 500"))

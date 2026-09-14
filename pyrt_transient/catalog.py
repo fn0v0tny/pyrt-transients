@@ -857,8 +857,11 @@ class CatTransients(_PyrtCatalog):
             if cached is not None:
                 return self._tag_table(cached, config, cached=True)
 
-        recent = self._failed_queries.get(failure_key) or self.recent_failure(params)
-        if recent:
+        # A failure without a message is remembered as "": still a failure.
+        recent = self._failed_queries.get(failure_key)
+        if recent is None:
+            recent = self.recent_failure(params)
+        if recent is not None:
             stale = self._stale_cache(params, config)
             if stale is not None:
                 return stale
