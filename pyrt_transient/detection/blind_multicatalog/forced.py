@@ -129,6 +129,12 @@ def forced_photometry(table: Table, fits_path, ra, dec, aperture_fwhm: float = 1
             "mag": mag, "magerr": magerr, "fwhm": fwhm}
 
 
+def _frame_stem(name) -> str:
+    """'/obs/2026...-df.ecsv' and '2026...-dft.fits' -> '2026...-df'."""
+    stem = Path(str(name).strip()).stem
+    return stem[:-1] if stem.endswith("-dft") else stem
+
+
 def stack_input_tables(detection_tables: List[Table]) -> List[Tuple[int, Table]]:
     """(epoch index, table) of the frames the current stack was built from:
     its STACK_INPUTS meta, else every real (non-stack) epoch."""
@@ -139,8 +145,11 @@ def stack_input_tables(detection_tables: List[Table]) -> List[Tuple[int, Table]]
         names = [n for n in names.split(",") if n.strip()]
     if not names:
         return real
-    wanted = {Path(str(n).strip()).name for n in names}
-    picked = [(i, t) for i, t in real if Path(str(t.meta.get("filename", ""))).name in wanted]
+    # STACK_INPUTS names the FITS images, but an epoch's meta filename is its
+    # ECSV (io/ecsv.py), so frames are matched by stem. Comparing whole names
+    # never matched, and every epoch was silently used instead.
+    wanted = {_frame_stem(n) for n in names}
+    picked = [(i, t) for i, t in real if _frame_stem(t.meta.get("filename", "")) in wanted]
     return picked or real
 
 
