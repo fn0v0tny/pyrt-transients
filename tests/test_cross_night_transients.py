@@ -395,3 +395,40 @@ def test_frame_positions_skip_nan_rows(tmp_path):
     assert xn.frame_positions(f) == [(100.0, 20.0), (100.1, 20.1)]
     assert xn.cell_of(float("nan"), 20.0, 20.0) is None
     assert len(xn.scan_cells(tmp_path, 20.0)) == 2
+
+
+def test_insane_magnitudes_and_bad_frames_are_dropped(tmp_path):
+    lc = tmp_path / "x_lightcurve.ecsv"
+    lc.write_text("# %ECSV 1.0\n# ---\nNUMBER MAG_CALIB MAGERR_CALIB mjd source_file\n"
+                  "1 15.5 0.1 61000.5 a-r-x.ecsv\n2 -28.0 0.1 61000.6 a-r-x.ecsv\n3 15.4 0.9 61000.7 a-r-x.ecsv\n")
+    assert [pt[1] for pt in xn.read_lightcurve(lc, "N")] == [15.5]
+    # Six stars of one field; the frame at mjd 61000.5 is 2 mag off for all of them.
+    clusters = []
+    for k in range(6):
+        pts = [[61000.0 + j / 1440, 15.0 + k, 0.03, "N"] for j in range(6)] + [[61000.5, 17.0 + k, 0.03, "N"]]
+        clusters.append(("F", [{"night": "2026-09-10", "mag": 15.0 + k, "magerr": 0.03, "points": pts}]))
+    bad = xn.frame_offsets(clusters)
+    assert bad[("F", "N", round(61000.5 / xn.FRAME_KEY_DAYS))] == pytest.approx(2.0, abs=0.01)
+    assert sum(xn.drop_bad_frames(d, f, bad) for f, d in clusters) == 6
+    assert all(len(d[0]["points"]) == 6 for _, d in clusters)
+
+
+def test_witness_efficiency_disqualifies_a_blind_observation(tmp_path):
+    # Twelve sources of one field; observation A detected all, observation B none.
+    facts = lambda oid: {"obs_id": oid, "center": [100.0, 20.0], "crpix": [512.0, 512.0],
+                         "cd": [-0.0003, 0.0, 0.0, 0.0003], "size": [1024, 1024], "maglim": 18.0, "n_det": 500,
+                         "nights": ["2026-09-01"], "object": "F", "first": ""}
+    clusters, cells_a = [], set()
+    for k in range(12):
+        ra, dec = 100.0 + 0.01 * k, 20.0 + 0.005 * k
+        cells_a.add(xn.cell_of(ra, dec, 20.0))
+        clusters.append(("F", [{"night": "2026-09-05", "ra": ra, "dec": dec, "q": 1.0, "mag": 15.0, "magerr": 0.03,
+                                "points": [[61000.0 + j / 1440, 15.0, 0.03, "N"] for j in range(4)]}]))
+    xn.save_cells(tmp_path, "obs_A", cells_a)
+    xn.save_cells(tmp_path, "obs_B", set())
+    observations = [{"facts": facts("A")}, {"facts": facts("B")}]
+    eff = xn.witness_efficiency(clusters, observations, tmp_path, {})
+    assert eff["A"] == 1.0 and eff["B"] == 0.0
+    # Fewer than ten testable sources: no verdict.
+    eff = xn.witness_efficiency(clusters[:5], observations, tmp_path, {})
+    assert eff["A"] is None and eff["B"] is None
