@@ -427,8 +427,10 @@ def test_witness_efficiency_disqualifies_a_blind_observation(tmp_path):
     xn.save_cells(tmp_path, "obs_A", cells_a)
     xn.save_cells(tmp_path, "obs_B", set())
     observations = [{"facts": facts("A")}, {"facts": facts("B")}]
-    eff = xn.witness_efficiency(clusters, observations, tmp_path, {})
-    assert eff["A"] == 1.0 and eff["B"] == 0.0
-    # Fewer than ten testable sources: no verdict.
-    eff = xn.witness_efficiency(clusters[:5], observations, tmp_path, {})
-    assert eff["A"] is None and eff["B"] is None
+    w = xn.witness_efficiency(clusters, observations, tmp_path, {})
+    assert all(d for _, d in w["A"]) and not any(d for _, d in w["B"])
+    assert xn.witness_ok(w, "A", 15.0) is True and xn.witness_ok(w, "B", 15.0) is False
+    # No peers within a magnitude (a lone bright star), or fewer than five: no verdict.
+    assert xn.witness_ok(w, "A", 9.0) is None
+    assert xn.witness_ok(xn.witness_efficiency(clusters[:4], observations, tmp_path, {}), "A", 15.0) is None
+    assert xn.witness_ok(w, "C", 15.0) is None

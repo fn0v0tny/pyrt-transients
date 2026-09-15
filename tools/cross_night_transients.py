@@ -768,11 +768,11 @@ WITNESS_MIN_SOURCES = 10
 
 
 def witness_efficiency(clusters, observations, data_dir, cells_cache):
-    """{obs_id: fraction of the page's sources it covers and should have
-    detected (brighter than its limit by LIMIT_MARGIN_MAG, faintest band)
-    that its frames did detect}; None with fewer than WITNESS_MIN_SOURCES
-    testable sources."""
-    tested, found = {}, {}
+    """{obs_id: [(faintest-band magnitude, detected?), ...]} over the page's
+    sources the observation covers and should have detected (brighter
+    than its limit by LIMIT_MARGIN_MAG). witness_ok judges a miss against
+    the sources of similar magnitude in this list."""
+    tested = {}
     for field, dets in clusters:
         by_band = {}
         for p in dets:
@@ -797,10 +797,25 @@ def witness_efficiency(clusters, observations, data_dir, cells_cache):
                 cells = load_cells(data_dir, name) if data_dir is not None else None
                 cells_cache[name] = cells if cells is not None else set()
             dec0 = f["center"][1] if f.get("center") and f["center"][1] is not None else dec
-            tested[f["obs_id"]] = tested.get(f["obs_id"], 0) + 1
-            if cells and detected_in(cells, ra, dec, dec0):
-                found[f["obs_id"]] = found.get(f["obs_id"], 0) + 1
-    return {oid: (found.get(oid, 0) / n if n >= WITNESS_MIN_SOURCES else None) for oid, n in tested.items()}
+            tested.setdefault(f["obs_id"], []).append(
+                (faintest, bool(cells and detected_in(cells, ra, dec, dec0))))
+    return tested
+
+
+def witness_ok(witness, obs_id, mag, window=1.0, min_sources=5):
+    """Did the observation detect at least WITNESS_MIN_EFFICIENCY of the
+    page's sources within `window` mag of `mag` that it covers? None when
+    fewer than `min_sources` such sources exist: a lone 9 mag star that is
+    "missing" from frames whose other bright stars saturate and drop out,
+    or a 17 mag star near a limit the header overstates, is judged by its
+    peers or not at all."""
+    rows = witness.get(obs_id)
+    if not rows:
+        return None
+    peers = [d for m, d in rows if abs(m - mag) <= window]
+    if len(peers) < min_sources:
+        return None
+    return sum(peers) / len(peers) >= WITNESS_MIN_EFFICIENCY
 
 
 def non_detections(group_dets, ra, dec, observations, detected_obs, data_dir, cells_cache):
@@ -868,10 +883,11 @@ def build_groups(observations, args, log, data_dir=None):
     for field, dets in clusters:
         apply_offsets(dets, field, offsets)
     witness = witness_efficiency(clusters, observations, data_dir, cells_cache)
-    n_unfit = sum(1 for v in witness.values() if v is not None and v < WITNESS_MIN_EFFICIENCY)
+    n_unfit = sum(1 for rows in witness.values()
+                  if len(rows) >= WITNESS_MIN_SOURCES and sum(d for _, d in rows) / len(rows) < WITNESS_MIN_EFFICIENCY)
     if n_unfit:
-        log(f"{n_unfit} observations detect fewer than {WITNESS_MIN_EFFICIENCY:.0%} of the sources they cover "
-            "and do not count as misses")
+        log(f"{n_unfit} observations detect fewer than {WITNESS_MIN_EFFICIENCY:.0%} of the sources they cover; "
+            "a miss is judged against sources of similar magnitude")
     groups = []
     for field, dets in clusters:
         nights = sorted({p["night"] for p in dets if p["night"]})
@@ -882,7 +898,7 @@ def build_groups(observations, args, log, data_dir=None):
         ra = sum(p["ra"] * wi for p, wi in zip(dets, w)) / sum(w)
         dec = sum(p["dec"] * wi for p, wi in zip(dets, w)) / sum(w)
         scatter = max(angular_sep_arcsec(p["ra"], p["dec"], ra, dec) for p in dets)
-        mags = [p["mag"] for p in dets if math.isfinite(p["mag"]) and p["mag"] < 90]
+        mags = [p["mag"] for p in dets if math.isfinite(p["mag"]) and MAG_SANE_MIN < p["mag"] < MAG_SANE_MAX]
         # Night-to-night comparisons in one band at a time; the band with
         # the most epochs decides the trend and the tags, but the largest
         # significant change of any band counts.
@@ -947,10 +963,13 @@ def build_groups(observations, args, log, data_dir=None):
             # enough for the source as measured in its FAINTEST band: the
             # limit is quoted for the frame's band, and a source bright in
             # z and faint in r must clear the limit in r as well.
+            # ... and the observation must have detected its peers: at
+            # least WITNESS_MIN_EFFICIENCY of the page's sources within a
+            # magnitude of this one that it covers. No peers, no verdict.
             return [m for m in missed_list if m["maglim"] is not None and mag is not None
                     and m.get("n_det", 0) >= MIN_FRAME_DETECTIONS
                     and m["maglim"] - LIMIT_MARGIN_MAG >= mag
-                    and (witness.get(m["obs_id"]) is None or witness[m["obs_id"]] >= WITNESS_MIN_EFFICIENCY)]
+                    and witness_ok(witness, m["obs_id"], mag)]
         # The limit test uses the brightest band the source was seen in on
         # that night: a frame in another band is not directly comparable,
         # but a star well above the limit in one band is not 1 mag fainter
@@ -1379,7 +1398,8 @@ def render_page(groups, observations, args, public_dir, generated):
         "dropped, and a single epoch never decides. 'Missed' counts observations of the "
         "field covering the position in which no frame detected anything there: before / between / after its "
         "detections; a night where the frames saw the star but the pipeline did not flag it is not a miss, and an "
-        f"observation that detected fewer than {WITNESS_MIN_EFFICIENCY:.0%} of the sources it covers cannot witness one. "
+        f"observation only witnesses one when it detected at least {WITNESS_MIN_EFFICIENCY:.0%} of the page's sources "
+        "within a magnitude of the source that it covers (at least five of them). "
         f"Sources are grouped by the field most of their observations were taken as; the best "
         f"{args.per_field} of each field get a card with the stitched lightcurve (at most {args.max_cards} "
         f"cards in all; changed, appeared and disappeared sources take the cards before steady ones), "
