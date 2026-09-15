@@ -471,3 +471,31 @@ def test_within_night_change_needs_calibrated_frames():
     assert xn.within_night_change([det], calibrated=set()) == (0.0, 0.0)
     keys = {("N", round(pt[0] / xn.FRAME_KEY_DAYS)) for pt in det["points"]}
     assert xn.within_night_change([det], calibrated=keys)[0] == pytest.approx(0.8, abs=0.05)
+
+
+def test_three_sources_suffice_to_drop_a_frame_that_is_magnitudes_off():
+    clusters = []
+    for k in range(3):
+        pts = [[61000.0 + j / 1440, 15.0 + k, 0.03, "N"] for j in range(5)] + [[61000.5, 21.0 + k, 0.03, "N"]]
+        clusters.append(("F", [{"night": "2026-09-10", "mag": 15.0 + k, "magerr": 0.03, "points": pts}]))
+    off = xn.frame_offsets(clusters)
+    assert off[("F", "N", round(61000.5 / xn.FRAME_KEY_DAYS))] == pytest.approx(6.0, abs=0.01)
+    assert len(off) == 1                                   # the good frames: three votes are too few to correct
+    assert sum(xn.drop_bad_frames(d, f, off) for f, d in clusters) == 3
+
+
+def test_half_a_night_of_failed_frames_is_dropped_not_the_good_half():
+    # Three good g frames at 12.5 and three failed ones at 18.4 in one night,
+    # plus a second night of good frames: the failed half goes, the rest stays.
+    clusters = []
+    for k in range(5):
+        n1 = [[61000.0 + j / 1440, 12.5 + k + 0.02 * j, 0.02, "Sloan_g"] for j in range(3)] + \
+             [[61000.003 + j / 1440, 18.4 + k, 0.02, "Sloan_g"] for j in range(3)]
+        n2 = [[61010.0 + j / 1440, 12.5 + k, 0.02, "Sloan_g"] for j in range(3)]
+        clusters.append(("F", [{"night": "2026-09-10", "mag": 12.5 + k, "magerr": 0.02, "points": n1},
+                               {"night": "2026-09-20", "mag": 12.5 + k, "magerr": 0.02, "points": n2}]))
+    off = xn.frame_offsets(clusters)
+    dropped = sum(xn.drop_bad_frames(d, f, off) for f, d in clusters)
+    assert dropped == 15
+    assert all(len(d[0]["points"]) == 3 and len(d[1]["points"]) == 3 for _, d in clusters)
+    assert all(abs(pt[1] - (12.5 + k)) < 0.1 for k, (_, d) in enumerate(clusters) for pt in d[0]["points"])

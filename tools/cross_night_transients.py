@@ -670,29 +670,37 @@ FRAME_KEY_DAYS = 3e-4      # ~26 s: one frame
 
 def frame_offsets(groups_dets, min_sources=5):
     """{(field, band, frame key): median offset} of every source's point in
-    that frame from the source's own nightly median in that band. A frame
-    whose calibration failed shows as a common offset of all its sources;
-    such points are dropped by drop_bad_frames, not corrected."""
+    that frame from the source's own median in that band over all its
+    nights (not the night's alone: with three good and three failed frames
+    in a night the nightly median falls between them and both halves look
+    off). A frame whose calibration failed shows as a common offset of all
+    its sources; such points are dropped by drop_bad_frames, not corrected."""
     votes = {}
     for field, dets in groups_dets:
+        by_band = {}
         for p in dets:
-            by_band = {}
             for pt in p["points"]:
                 by_band.setdefault(pt[3], []).append(pt[1])
-            med = {}
-            for band, mags in by_band.items():
-                if len(mags) >= 3:
-                    m = sorted(mags)
-                    med[band] = m[len(m) // 2]
+        med = {}
+        for band, mags in by_band.items():
+            if len(mags) >= 3:
+                m = sorted(mags)
+                med[band] = m[len(m) // 2]
+        for p in dets:
             for pt in p["points"]:
                 if pt[0] is not None and pt[3] in med:
                     key = (field, pt[3], round(pt[0] / FRAME_KEY_DAYS))
                     votes.setdefault(key, []).append(pt[1] - med[pt[3]])
     out = {}
     for key, vals in votes.items():
-        if len(vals) >= min_sources:
-            vals.sort()
-            out[key] = vals[len(vals) // 2]
+        vals.sort()
+        med = vals[len(vals) // 2]
+        # Five sources are needed to correct a frame by a few tenths; three
+        # agreeing that it is off by more than FRAME_OFFSET_MAX are enough
+        # to throw it away (three g frames of a sparse field at Dec -6 were
+        # 6 mag off and made every star there "fade within a night").
+        if len(vals) >= min_sources or (len(vals) >= 3 and abs(med) > FRAME_OFFSET_MAX):
+            out[key] = med
     return out
 
 
