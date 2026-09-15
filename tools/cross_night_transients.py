@@ -1078,6 +1078,11 @@ def _mag_span(g):
     return _mag(lo) + (f" – {_mag(hi)}" if hi is not None and hi != lo else "")
 
 
+def interesting(g):
+    """Changed, appeared or disappeared: what the reader wants first."""
+    return bool(g.get("changed") or g.get("appeared") or g.get("disappeared"))
+
+
 def render_card(g, public_dir):
     """One group in full: header, chart, one row per observation."""
     e = html.escape
@@ -1153,7 +1158,7 @@ def render_row(g):
     e = html.escape
     sites = " ".join(f"<a href='{e(d['site'])}'>{e(d['night'])}</a>" if d.get("site") else e(d["night"])
                      for d in g["detections"])
-    return (f"<tr><td>{g['rank']}</td><td class='num'>{g['score']:.1f}</td><td class='num'>{g['ra']:.5f}</td>"
+    return (f"<tr id='g{g['rank']}'><td>{g['rank']}</td><td class='num'>{g['score']:.1f}</td><td class='num'>{g['ra']:.5f}</td>"
             f"<td class='num'>{g['dec']:+.5f}</td><td class='num'>{g['n_nights']}</td><td class='num'>{g['n_obs']}</td>"
             f"<td class='num'>{g['n_points']}</td><td class='num'>{e(_mag_span(g))}</td>"
             f"<td class='num'>{g['delta_mag']:.2f}</td><td class='num'>{g['change_sigma']:.0f}</td>"
@@ -1192,7 +1197,8 @@ def render_page(groups, observations, args, public_dir, generated):
         "detections; a night where the frames saw the star but the pipeline did not flag it is not a miss. "
         f"Sources are grouped by the field most of their observations were taken as; the best "
         f"{args.per_field} of each field get a card with the stitched lightcurve (at most {args.max_cards} "
-        f"cards in all), the rest of the field is a table of at most {args.max_rows} lines. "
+        f"cards in all; changed, appeared and disappeared sources take the cards before steady ones), "
+        f"the rest of the field is a table of at most {args.max_rows} lines. "
         "The JSON next to this page lists every source. Rows link to each observation's own page; "
         "thumbnails are that page's montage and lightcurve.</div>")
     if not groups:
@@ -1204,6 +1210,24 @@ def render_page(groups, observations, args, public_dir, generated):
         fields.setdefault(g["field"], []).append(g)
     order = sorted(fields, key=lambda f: -fields[f][0]["score"])
 
+    hot = [g for g in groups if interesting(g)]
+    parts.append(f"<div class='group' id='changed'><h2>Changed and new sources ({len(hot)})</h2>")
+    if hot:
+        parts.append("<table><tr><th>#</th><th>Field</th><th>RA</th><th>Dec</th><th>Tags</th><th>Score</th>"
+                     "<th>Mag</th><th>Δmag</th><th>σ</th><th>Nights</th><th>Missed</th></tr>")
+        for g in hot:
+            tags = " ".join(t for t in (g["trend"], "appeared" if g["appeared"] else "",
+                                        "disappeared" if g["disappeared"] else "") if t)
+            parts.append(f"<tr><td><a href='#g{g['rank']}'>{g['rank']}</a></td><td>{e(g['field'] or '-')}</td>"
+                         f"<td class='num'>{g['ra']:.5f}</td><td class='num'>{g['dec']:+.5f}</td><td>{e(tags)}</td>"
+                         f"<td class='num'>{g['score']:.1f}</td><td class='num'>{e(_mag_span(g))}</td>"
+                         f"<td class='num'>{g['delta_mag']:.2f}</td><td class='num'>{g['change_sigma']:.0f}</td>"
+                         f"<td class='num'>{g['n_nights']}</td>"
+                         f"<td class='num'>{g['n_missed_before']}/{g['n_missed_between']}/{g['n_missed_after']}</td></tr>")
+        parts.append("</table>")
+    else:
+        parts.append("<p class='empty'>None at the current thresholds.</p>")
+    parts.append("</div>")
     parts.append("<div class='group'><h2>Fields</h2><table><tr><th>Field</th><th>Sources</th><th>Changed</th>"
                  "<th>Appeared</th><th>Best score</th><th>Brightest</th><th>Most nights</th><th>Nights observed</th></tr>")
     for k, f in enumerate(order, 1):
@@ -1227,7 +1251,7 @@ def render_page(groups, observations, args, public_dir, generated):
                      f"<summary><b>{e(f or '(no field name)')}</b> — {len(gs)} sources, best score {gs[0]['score']:.1f}"
                      f", {n_cards} shown in full" +
                      (f", {len(rest)} more in the table" if rest else "") + "</summary>")
-        for g in gs:
+        for g in sorted(gs, key=lambda g: (not interesting(g), g["rank"])):
             if g.get("card"):
                 parts.append(render_card(g, public_dir))
         if rest:
@@ -1284,7 +1308,10 @@ def main(argv=None):
     carded = set()
     budget = args.max_cards if args.max_cards > 0 else len(groups)
     per_field = {}
-    for g in groups:  # the same allocation render_page makes
+    # Cards go to the sources the page is for first: those that changed,
+    # appeared or disappeared, in score order; the steady ones fill what is
+    # left of each field's allowance.
+    for g in sorted(groups, key=lambda g: (not interesting(g), g["rank"])):
         n = per_field.get(g["field"], 0)
         if n < args.per_field and budget > 0:
             per_field[g["field"]] = n + 1

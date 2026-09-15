@@ -177,7 +177,7 @@ def test_max_cards_puts_the_rest_in_a_table(tmp_path):
     out = json.loads((public / "new_transients" / "new_transients.json").read_text())
     assert len(out["groups"]) == 3
     assert page.count("<svg class='lc'") == 1 and "2 more in the table" in page
-    assert page.count("<tr><td>2</td>") == 1 and page.count("<tr><td>3</td>") == 1  # ranks in the table
+    assert page.count("<tr id='g2'><td>2</td>") == 1 and page.count("<tr id='g3'><td>3</td>") == 1  # ranks in the table
 
     # The page-wide cap wins over the per-field one, and the table can be cut too.
     assert xn.main(["--data-dir", str(data), "--public-dir", str(public), "--days", "0",
@@ -257,6 +257,7 @@ def test_change_and_appearance_from_field_history(tmp_path):
     assert [m["night"] for m in g["missed"]] == ["2026-09-04", "2026-09-06", "2026-09-13"]
     page = (public / "new_transients" / "index.html").read_text()
     assert "tag appeared" in page and "tag disappeared" in page and "tag fading" in page
+    assert "Changed and new sources (3)" in page and "<a href='#g1'>1</a>" in page  # dmag shifted every source
     assert "not in 2 earlier frame(s)" in page and "../obs_1/index.html" in page
     # The faint sources (17.5 mag) are below the 1 mag margin of the 17.1 limit: not "appeared".
     assert all(not h["appeared"] for h in out["groups"][1:])
@@ -347,3 +348,17 @@ def test_band_names_are_normalised(tmp_path):
                   "NUMBER MAG_CALIB MAGERR_CALIB mjd source_file\n"
                   "1 15.5 0.1 61000.5 20260909011221-634-i-020-df.ecsv\n")
     assert xn.read_lightcurve(lc, "N")[0][3] == "Sloan_i"
+
+
+def test_interesting_sources_take_the_cards_first(tmp_path):
+    data, public = tmp_path / "work", tmp_path / "html"
+    _make_obs(data, "1", 5, empty=True)
+    _make_obs(data, "2", 10)
+    _make_obs(data, "3", 12, dmag=1.5)
+    # One card per field: it must go to the changed/appeared afterglow (rank 1 anyway),
+    # so use a page cap of 1 with a steadier field ordering check on the JSON.
+    assert xn.main(["--data-dir", str(data), "--public-dir", str(public), "--days", "0",
+                    "--per-field", "1", "-q"]) == 0
+    out = json.loads((public / "new_transients" / "new_transients.json").read_text())
+    carded = [g for g in out["groups"] if g["card"]]
+    assert len(carded) == 1 and carded[0]["appeared"] and carded[0]["changed"]
