@@ -387,3 +387,11 @@ def test_a_single_epoch_or_one_outlier_does_not_make_a_change():
     assert xn.within_night_change([det("2026-09-10", [15.0, 15.0, 15.0, 13.0, 15.0], 0)]) == (0.0, 0.0)
     delta, sig = xn.within_night_change([det("2026-09-10", [15.0] * 8 + [13.0], 0)])
     assert abs(delta) < 0.05
+
+
+def test_frame_positions_skip_nan_rows(tmp_path):
+    f = tmp_path / "x.ecsv"
+    f.write_text("# %ECSV 1.0\n# ---\nNUMBER ALPHA_J2000 DELTA_J2000\n1 100.0 20.0\n2 nan nan\n3 100.1 20.1\n")
+    assert xn.frame_positions(f) == [(100.0, 20.0), (100.1, 20.1)]
+    assert xn.cell_of(float("nan"), 20.0, 20.0) is None
+    assert len(xn.scan_cells(tmp_path, 20.0)) == 2

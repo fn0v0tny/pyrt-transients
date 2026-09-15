@@ -245,7 +245,9 @@ CELLS_DIR = ".new_transients_cells"
 
 def cell_of(ra, dec, dec0):
     """Integer cell id of a position on a CELL_ARCSEC grid (RA scaled by
-    cos of the observation's centre declination)."""
+    cos of the observation's centre declination); None for a non-finite one."""
+    if not (math.isfinite(ra) and math.isfinite(dec) and math.isfinite(dec0)):
+        return None
     c = CELL_ARCSEC / 3600.0
     ix = int(math.floor(ra * math.cos(math.radians(dec0)) / c))
     iy = int(math.floor((dec + 90.0) / c))
@@ -272,9 +274,11 @@ def frame_positions(path):
                 if len(parts) <= max(ia, id_):
                     continue
                 try:
-                    out.append((float(parts[ia]), float(parts[id_])))
+                    ra, dec = float(parts[ia]), float(parts[id_])
                 except ValueError:
                     continue
+                if math.isfinite(ra) and math.isfinite(dec):   # old frames carry nan rows
+                    out.append((ra, dec))
     except OSError:
         pass
     return out
@@ -294,7 +298,9 @@ def scan_cells(obs_dir, dec0):
         return cells
     for path in frames:
         for ra, dec in frame_positions(path):
-            cells.add(cell_of(ra, dec, dec0))
+            cell = cell_of(ra, dec, dec0)
+            if cell is not None:
+                cells.add(cell)
     return cells
 
 
