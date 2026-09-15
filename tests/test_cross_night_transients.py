@@ -119,7 +119,7 @@ def test_page_groups_same_source_on_two_nights(tmp_path):
     # The 210619B afterglow fades by 1.2 mag (first third vs last third) inside the night.
     assert g["trend"] == "fading" and g["grb_field"] is True
     assert g["changed"] is True and g["change_kind"] == "within a night"
-    assert g["delta_mag"] == pytest.approx(1.2, abs=0.2) and g["score_parts"]["change"] == pytest.approx(3 * g["delta_mag"], abs=0.01)
+    assert g["delta_mag"] == pytest.approx(1.2, abs=0.2) and g["score_parts"]["change"] == pytest.approx(min(2.0, g["delta_mag"]), abs=0.01)
     assert g["n_missed_before"] == 0 and g["appeared"] is False
     assert all(h["changed"] is False and h["trend"] == "steady" for h in out["groups"][1:])
     # The forced NUMBER 0 row at the pointing is dropped, so it forms no group.
@@ -191,8 +191,9 @@ def test_score_and_dominant_field():
     assert s == {"brightness": 6.0, "coverage": 8.0, "quality": 2.0, "change": 0.0, "score": 16.0}
     assert xn.transient_score(None, 2, 1, 0.0)["score"] == 3.0
     s = xn.transient_score(12.0, 3, 15, 99.0, delta_mag=1.0, appeared=True, disappeared=True)
-    assert s["change"] == 9.0 and s["score"] == 25.0
+    assert s["change"] == 8.0 and s["score"] == 24.0
     assert xn.transient_score(12.0, 3, 15, 99.0, delta_mag=5.0)["change"] == 6.0
+    assert xn.transient_score(12.0, 3, 15, 99.0, delta_mag=5.0, fading=True)["change"] == 2.0
     assert xn.transient_score(5.0, 1, 0, 0.0)["brightness"] == 10.0
     dets = [{"obs": {"object": "A"}}, {"obs": {"object": "B"}}, {"obs": {"object": "B"}}, {"obs": {"object": ""}}]
     assert xn.dominant_field(dets) == "B"
@@ -234,7 +235,7 @@ def test_change_and_appearance_from_field_history(tmp_path):
     _make_obs(data, "1", 5, empty=True)            # field observed, nothing found (limit 17.1)
     _make_obs(data, "2", 7, empty=True)
     _make_obs(data, "3", 10)                       # source at 11.4
-    _make_obs(data, "4", 12, dmag=1.0)             # a magnitude fainter
+    _make_obs(data, "4", 12, dmag=1.5)             # a magnitude and a half fainter
     _make_obs(data, "5", 14, empty=True)           # gone again
     _make_obs(data, "6", 16, empty=True, keep_frame=True)   # in the frame, not flagged: not a miss
     assert xn.main(["--data-dir", str(data), "--public-dir", str(public), "--days", "0", "-q"]) == 0
@@ -250,9 +251,9 @@ def test_change_and_appearance_from_field_history(tmp_path):
     assert g["appeared"] is True and g["disappeared"] is True
     assert g["limit_before"] == pytest.approx(17.1, abs=0.05)
     assert g["changed"] is True and g["change_sigma"] > 5
-    assert g["nightly"]["2026-09-11"][0] - g["nightly"]["2026-09-09"][0] == pytest.approx(1.0, abs=0.01)
+    assert g["nightly"]["2026-09-11"][0] - g["nightly"]["2026-09-09"][0] == pytest.approx(1.5, abs=0.01)
     assert g["trend"] == "fading"
-    assert g["score_parts"]["change"] == pytest.approx(min(6.0, 3 * g["delta_mag"]) + 4.0 + 2.0, abs=0.01)
+    assert g["score_parts"]["change"] == pytest.approx(min(2.0, g["delta_mag"]) + 4.0 + 1.0, abs=0.01)
     assert [m["night"] for m in g["missed"]] == ["2026-09-04", "2026-09-06", "2026-09-13"]
     page = (public / "new_transients" / "index.html").read_text()
     assert "tag appeared" in page and "tag disappeared" in page and "tag fading" in page

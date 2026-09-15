@@ -44,8 +44,9 @@ What it does
 - Scores each source: brightness (18 - brightest nightly mean magnitude,
   0..10) + coverage (2 per extra night + log2 of the measured epochs) +
   quality (log10 of the best pipeline quality score, at most 2) + change
-  (3 x the significant night-to-night change, at most 6, +4 appeared,
-  +2 disappeared), so the bright, well covered and changing come first.
+  (3 x a significant brightening of at least 1 mag, at most 6, 1 x a
+  fading, +4 appeared, +1 disappeared), so the bright, well covered, new
+  and brightening come first.
 - Writes <out-dir>/new_transients.json and <out-dir>/index.html. The page
   groups the sources by the field most of their observations were taken
   as (the OBJECT header). Each field is a collapsible section with the
@@ -647,7 +648,10 @@ def within_night_change(dets):
     return best
 
 
-CHANGE_MIN_MAG = 0.3
+# A change has to be large to matter here: the interest is in new sources
+# and outbursts, and a few tenths of a magnitude between nights is within
+# what seeing does to the photometry of a crowded field. --min-change sets it.
+CHANGE_MIN_MAG = 1.0
 CHANGE_MIN_SIGMA = 5.0
 LIMIT_MARGIN_MAG = 1.0     # a non-detection counts when the source would have been this far above the limit
 
@@ -785,7 +789,8 @@ def build_groups(observations, args, log, data_dir=None):
         appeared = constraining(before, night_mag(first_night))
         disappeared = constraining(after, night_mag(last_night))
         score = transient_score(mag_bright, len(nights), n_points, max(p["q"] for p in dets),
-                                delta_mag if changed else 0.0, bool(appeared), bool(disappeared))
+                                delta_mag if changed else 0.0, bool(appeared), bool(disappeared),
+                                fading=(trend == "fading"))
         groups.append({
             "field": dominant_field(dets), "score": score["score"], "score_parts": score,
             "mag_bright": mag_bright, "n_points": n_points,
@@ -841,21 +846,25 @@ def dominant_field(dets):
     return max(sorted(counts), key=counts.get) if counts else ""
 
 
-def transient_score(mag_bright, n_nights, n_points, max_q, delta_mag=0.0, appeared=False, disappeared=False):
+def transient_score(mag_bright, n_nights, n_points, max_q, delta_mag=0.0, appeared=False, disappeared=False,
+                    fading=False):
     """Brightest, best covered and changing first.
 
     brightness = 18 - brightest nightly mean magnitude, clipped to 0..10
     coverage   = 2 x (nights - 1) + log2(1 + measured epochs)
     quality    = log10(1 + best pipeline quality score), at most 2
-    change     = 3 x (largest significant night-to-night change, mag), at most 6,
+    change     = 3 x the largest significant change in mag when it is a
+                 brightening (at most 6), 1 x when it is a fading (at most 2),
                  + 4 if the source appeared (absent from earlier frames deep
-                 enough to have shown it), + 2 if it disappeared the same way
+                 enough to have shown it), + 1 if it disappeared the same way.
+                 New and brightening sources are what the page is for.
     score      = brightness + coverage + quality + change
     """
     brightness = min(10.0, max(0.0, 18.0 - mag_bright)) if mag_bright is not None else 0.0
     coverage = 2.0 * (n_nights - 1) + math.log2(1 + n_points)
     quality = min(2.0, math.log10(1 + max(max_q, 0.0)))
-    change = min(6.0, 3.0 * max(0.0, delta_mag)) + (4.0 if appeared else 0.0) + (2.0 if disappeared else 0.0)
+    d = max(0.0, delta_mag)
+    change = (min(2.0, d) if fading else min(6.0, 3.0 * d)) + (4.0 if appeared else 0.0) + (1.0 if disappeared else 0.0)
     return {"brightness": round(brightness, 2), "coverage": round(coverage, 2),
             "quality": round(quality, 2), "change": round(change, 2),
             "score": round(brightness + coverage + quality + change, 2)}
@@ -1172,10 +1181,11 @@ def render_page(groups, observations, args, public_dir, generated):
         (", forced target rows included" if args.include_forced else ", forced target rows (NUMBER 0) dropped") +
         ".<br>Score = brightness (18 − brightest nightly mean mag, 0..10) + coverage (2 per extra night "
         "+ log2 of measured epochs) + quality (log10 of the best pipeline score, at most 2) + change "
-        f"(3 × the largest change, between nightly means, along a fitted trend, or between the first and last third of one night, when "
-        f"it is at least {CHANGE_MIN_MAG:g} mag and {CHANGE_MIN_SIGMA:g}σ, at most 6; +4 when the source appeared, "
+        f"(3 × the largest brightening, or 1 × the largest fading, between nightly means, along a fitted trend, or between "
+        f"the first and last third of one night, when it is at least {CHANGE_MIN_MAG:g} mag and {CHANGE_MIN_SIGMA:g}σ, "
+        "at most 6 or 2; +4 when the source appeared, "
         "i.e. earlier frames of the field "
-        f"went {LIMIT_MARGIN_MAG:g} mag deeper than it without showing it; +2 when it disappeared the same way). "
+        f"went {LIMIT_MARGIN_MAG:g} mag deeper than it without showing it; +1 when it disappeared the same way). "
         "Night-to-night changes are compared within one band, after removing each field's nightly zero-point "
         "offset (the median over its sources with three or more nights). 'Missed' counts observations of the "
         "field covering the position in which no frame detected anything there: before / between / after its "
@@ -1246,11 +1256,14 @@ def main(argv=None):
     ap.add_argument("--max-rows", type=int, default=100, help="table lines per field for the other sources (0 = all)")
     ap.add_argument("--open-fields", type=int, default=5, help="field sections open when the page loads")
     ap.add_argument("--include-forced", action="store_true", help="keep the NUMBER 0 forced target rows")
+    ap.add_argument("--min-change", type=float, default=1.0,
+                    help="smallest change in mag that counts (default %(default)s)")
     ap.add_argument("--no-ensemble", action="store_true",
                     help="do not remove per-field nightly zero-point offsets before looking for change")
     ap.add_argument("--title", default="Transients seen on more than one night")
     ap.add_argument("-q", "--quiet", action="store_true")
     args = ap.parse_args(argv)
+    globals()["CHANGE_MIN_MAG"] = args.min_change
 
     data_dir = Path(args.data_dir).expanduser()
     public_dir = Path(args.public_dir).expanduser()
