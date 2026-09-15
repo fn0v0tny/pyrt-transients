@@ -417,7 +417,7 @@ def test_witness_efficiency_disqualifies_a_blind_observation(tmp_path):
     # Twelve sources of one field; observation A detected all, observation B none.
     facts = lambda oid: {"obs_id": oid, "center": [100.0, 20.0], "crpix": [512.0, 512.0],
                          "cd": [-0.0003, 0.0, 0.0, 0.0003], "size": [1024, 1024], "maglim": 18.0, "n_det": 500,
-                         "nights": ["2026-09-01"], "object": "F", "first": ""}
+                         "nights": ["2026-09-01"], "object": "F", "first": "", "filter": "N", "first_frame": ""}
     clusters, cells_a = [], set()
     for k in range(12):
         ra, dec = 100.0 + 0.01 * k, 20.0 + 0.005 * k
@@ -435,3 +435,16 @@ def test_witness_efficiency_disqualifies_a_blind_observation(tmp_path):
     # Fewer than five peers and fewer than ten sources in all: no verdict.
     assert xn.witness_ok(xn.witness_efficiency(clusters[:4], observations, tmp_path, {}), "A", 15.0) is None
     assert xn.witness_ok(w, "C", 15.0) is None
+
+
+def test_a_frame_in_another_band_cannot_witness_a_miss(tmp_path):
+    # A g-band observation "misses" a source measured only in N: no verdict from it.
+    data, public = tmp_path / "work", tmp_path / "html"
+    _make_obs(data, "1", 5, empty=True)
+    _make_obs(data, "2", 10)
+    _make_obs(data, "3", 12, dmag=1.5)
+    for f in (data / "obs_1").glob("*.ecsv"):
+        f.write_text(f.read_text().replace("{FILTER: N}", "{FILTER: Sloan_g}"))
+    assert xn.main(["--data-dir", str(data), "--public-dir", str(public), "--days", "0", "-q"]) == 0
+    g = json.loads((public / "new_transients" / "new_transients.json").read_text())["groups"][0]
+    assert g["n_missed_before"] == 1 and g["appeared"] is False

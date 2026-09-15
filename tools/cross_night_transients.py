@@ -779,10 +779,9 @@ def witness_efficiency(clusters, observations, data_dir, cells_cache):
         for p in dets:
             for pt in p["points"]:
                 by_band.setdefault(pt[3], []).append(pt[1])
-        meds = [sorted(v)[len(v) // 2] for v in by_band.values() if len(v) >= 3]
+        meds = {b: sorted(v)[len(v) // 2] for b, v in by_band.items() if len(v) >= 3}
         if not meds:
             continue
-        faintest = max(meds)
         w = [max(p["q"], 0.1) for p in dets]
         ra = sum(p["ra"] * wi for p, wi in zip(dets, w)) / sum(w)
         dec = sum(p["dec"] * wi for p, wi in zip(dets, w)) / sum(w)
@@ -790,7 +789,10 @@ def witness_efficiency(clusters, observations, data_dir, cells_cache):
             f = obs["facts"]
             if f.get("maglim") is None or f.get("n_det", 0) < MIN_FRAME_DETECTIONS:
                 continue
-            if f["maglim"] - LIMIT_MARGIN_MAG < faintest or not covers(f, ra, dec):
+            # The source's magnitude in the observation's own band: a red
+            # star of 16 in i is 18 in g, and a g frame cannot miss it.
+            faintest = meds.get(obs_band(f))
+            if faintest is None or f["maglim"] - LIMIT_MARGIN_MAG < faintest or not covers(f, ra, dec):
                 continue
             name = f"obs_{f['obs_id']}"
             cells = cells_cache.get(name)
@@ -822,6 +824,11 @@ def witness_ok(witness, obs_id, mag, window=1.0, min_sources=5):
     return None
 
 
+def obs_band(facts):
+    """The band of the observation's first frame, as the lightcurves name it."""
+    return normalise_band(facts.get("filter") or band_of_frame(facts.get("first_frame", "")))
+
+
 def non_detections(group_dets, ra, dec, observations, detected_obs, data_dir, cells_cache):
     """(missed, present): observations covering (ra, dec) in which the
     source is not among the candidates. `missed` are those where no frame
@@ -841,7 +848,7 @@ def non_detections(group_dets, ra, dec, observations, detected_obs, data_dir, ce
         dec0 = f["center"][1] if f.get("center") and f["center"][1] is not None else dec
         rec = {"obs_id": f["obs_id"], "night": f["nights"][0] if f["nights"] else "",
                "object": f["object"], "maglim": f.get("maglim"), "first": f["first"],
-               "n_det": f.get("n_det", 0)}
+               "n_det": f.get("n_det", 0), "band": obs_band(f)}
         (present if cells and detected_in(cells, ra, dec, dec0) else missed).append(rec)
     return sorted(missed, key=lambda d: d["night"]), sorted(present, key=lambda d: d["night"])
 
@@ -962,34 +969,30 @@ def build_groups(observations, args, log, data_dir=None):
         between = [m for m in missed if m["night"] and first_night <= m["night"] <= last_night
                    and m["night"] not in stats]
 
-        def constraining(missed_list, mag):
-            # The frame has to be a real one (enough sources) and deep
-            # enough for the source as measured in its FAINTEST band: the
-            # limit is quoted for the frame's band, and a source bright in
-            # z and faint in r must clear the limit in r as well.
-            # ... and the observation must have detected its peers: at
-            # least WITNESS_MIN_EFFICIENCY of the page's sources within a
-            # magnitude of this one that it covers. No peers, no verdict.
-            # A sparse field gives no verdict (None): the limit test alone
-            # then decides, as it did before. Stars bright enough to
-            # saturate are never "missing": they are not extracted.
-            return [m for m in missed_list if m["maglim"] is not None and mag is not None
-                    and mag > SATURATION_BRIGHT_MAG
-                    and m.get("n_det", 0) >= MIN_FRAME_DETECTIONS
-                    and m["maglim"] - LIMIT_MARGIN_MAG >= mag
-                    and witness_ok(witness, m["obs_id"], mag) is not False]
-        # The limit test uses the brightest band the source was seen in on
-        # that night: a frame in another band is not directly comparable,
-        # but a star well above the limit in one band is not 1 mag fainter
-        # in the next.
-        def night_mag(night):
-            # Only a night with enough epochs in some band can claim the
-            # source was really there (or really gone by then); its
-            # faintest band is what a frame in any band has to reach.
-            vals = [pb[0][night][0] for pb in per_band.values() if night in pb[0]]
-            return max(vals) if vals else None
-        appeared = constraining(before, night_mag(first_night))
-        disappeared = constraining(after, night_mag(last_night))
+        band_meds = {b: pb[0] for b, pb in per_band.items()}
+
+        def constraining(missed_list, night):
+            # The frame has to be a real one (enough sources), in a band
+            # the source was measured in on that night, and deep enough
+            # for the source's magnitude IN THAT BAND: a red star of 16 in
+            # i is 18 in g, and a g frame with an 18.6 limit cannot miss
+            # it (one such frame "disappeared" forty stars of Cyg X-2).
+            # The observation must also have detected the source's peers
+            # (witness_ok); a sparse field gives no verdict and the limit
+            # test alone decides. Stars bright enough to saturate are
+            # never "missing": they are not extracted.
+            out = []
+            for m in missed_list:
+                st = band_meds.get(m.get("band"))
+                mag = st[night][0] if st and night in st else None
+                if (mag is not None and m["maglim"] is not None and mag > SATURATION_BRIGHT_MAG
+                        and m.get("n_det", 0) >= MIN_FRAME_DETECTIONS
+                        and m["maglim"] - LIMIT_MARGIN_MAG >= mag
+                        and witness_ok(witness, m["obs_id"], mag) is not False):
+                    out.append(m)
+            return out
+        appeared = constraining(before, first_night)
+        disappeared = constraining(after, last_night)
         score = transient_score(mag_bright, len(nights), n_points, max(p["q"] for p in dets),
                                 delta_mag if changed else 0.0, bool(appeared), bool(disappeared),
                                 fading=(trend == "fading"))
@@ -1405,7 +1408,8 @@ def render_page(groups, observations, args, public_dir, generated):
         f"more nights); frames whose zero point is more than {FRAME_OFFSET_MAX:g} mag off for the whole field are "
         "dropped, and a single epoch never decides. 'Missed' counts observations of the "
         "field covering the position in which no frame detected anything there: before / between / after its "
-        "detections; a night where the frames saw the star but the pipeline did not flag it is not a miss, and an "
+        "detections, in a band the source was measured in and to a limit reaching its magnitude in that band; a night "
+        "where the frames saw the star but the pipeline did not flag it is not a miss, and an "
         f"observation only witnesses one when it detected at least {WITNESS_MIN_EFFICIENCY:.0%} of the page's sources "
         "within a magnitude of the source that it covers (at least five of them). "
         f"Sources are grouped by the field most of their observations were taken as; the best "
