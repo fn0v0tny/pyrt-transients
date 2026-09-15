@@ -430,7 +430,8 @@ def test_witness_efficiency_disqualifies_a_blind_observation(tmp_path):
     w = xn.witness_efficiency(clusters, observations, tmp_path, {})
     assert all(d for _, d in w["A"]) and not any(d for _, d in w["B"])
     assert xn.witness_ok(w, "A", 15.0) is True and xn.witness_ok(w, "B", 15.0) is False
-    # No peers within a magnitude (a lone bright star), or fewer than five: no verdict.
-    assert xn.witness_ok(w, "A", 9.0) is None
+    # No peers within two magnitudes: the observation as a whole decides (12 sources tested).
+    assert xn.witness_ok(w, "A", 9.0) is True and xn.witness_ok(w, "B", 9.0) is False
+    # Fewer than five peers and fewer than ten sources in all: no verdict.
     assert xn.witness_ok(xn.witness_efficiency(clusters[:4], observations, tmp_path, {}), "A", 15.0) is None
     assert xn.witness_ok(w, "C", 15.0) is None

@@ -763,6 +763,7 @@ CHANGE_MIN_SIGMA = 5.0
 LIMIT_MARGIN_MAG = 1.0     # a non-detection counts when the source would have been this far above the limit
 
 
+SATURATION_BRIGHT_MAG = 10.5   # brighter than this the D50 saturates in its usual exposures; such a star is never "missing"
 WITNESS_MIN_EFFICIENCY = 0.8
 WITNESS_MIN_SOURCES = 10
 
@@ -812,10 +813,13 @@ def witness_ok(witness, obs_id, mag, window=1.0, min_sources=5):
     rows = witness.get(obs_id)
     if not rows:
         return None
-    peers = [d for m, d in rows if abs(m - mag) <= window]
-    if len(peers) < min_sources:
-        return None
-    return sum(peers) / len(peers) >= WITNESS_MIN_EFFICIENCY
+    for w in (window, 2.0 * window):
+        peers = [d for m, d in rows if abs(m - mag) <= w]
+        if len(peers) >= min_sources:
+            return sum(peers) / len(peers) >= WITNESS_MIN_EFFICIENCY
+    if len(rows) >= WITNESS_MIN_SOURCES:      # no peers of similar magnitude: the observation as a whole
+        return sum(d for _, d in rows) / len(rows) >= WITNESS_MIN_EFFICIENCY
+    return None
 
 
 def non_detections(group_dets, ra, dec, observations, detected_obs, data_dir, cells_cache):
@@ -966,10 +970,14 @@ def build_groups(observations, args, log, data_dir=None):
             # ... and the observation must have detected its peers: at
             # least WITNESS_MIN_EFFICIENCY of the page's sources within a
             # magnitude of this one that it covers. No peers, no verdict.
+            # A sparse field gives no verdict (None): the limit test alone
+            # then decides, as it did before. Stars bright enough to
+            # saturate are never "missing": they are not extracted.
             return [m for m in missed_list if m["maglim"] is not None and mag is not None
+                    and mag > SATURATION_BRIGHT_MAG
                     and m.get("n_det", 0) >= MIN_FRAME_DETECTIONS
                     and m["maglim"] - LIMIT_MARGIN_MAG >= mag
-                    and witness_ok(witness, m["obs_id"], mag)]
+                    and witness_ok(witness, m["obs_id"], mag) is not False]
         # The limit test uses the brightest band the source was seen in on
         # that night: a frame in another band is not directly comparable,
         # but a star well above the limit in one band is not 1 mag fainter
