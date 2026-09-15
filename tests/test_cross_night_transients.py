@@ -8,6 +8,8 @@ from pathlib import Path
 
 REPO = Path(__file__).resolve().parent.parent
 FIXTURE = REPO / "tests" / "210619B"
+needs_fixture = pytest.mark.skipif(not (FIXTURE / "candidates.tbl").exists(),
+                                   reason="tests/210619B fixture data not present")
 SPEC = importlib.util.spec_from_file_location("cross_night_transients",
                                               REPO / "tools" / "cross_night_transients.py")
 xn = importlib.util.module_from_spec(SPEC)
@@ -69,6 +71,7 @@ def test_cluster_joins_neighbours_only():
     assert groups == [[0, 1, 2], [3]]
 
 
+@needs_fixture
 def test_page_groups_same_source_on_two_nights(tmp_path):
     data, public = tmp_path / "work", tmp_path / "html"
     _make_obs(data, "1", 10)
@@ -144,6 +147,7 @@ def test_read_lightcurve_bands_and_fallback(tmp_path):
     assert xn.detection_points(p, tmp_path) == [[pytest.approx(61292.05024, abs=1e-4), 16.0, 0.05, "i"]]
 
 
+@needs_fixture
 def test_max_cards_puts_the_rest_in_a_table(tmp_path):
     data, public = tmp_path / "work", tmp_path / "html"
     _make_obs(data, "1", 10)
@@ -187,6 +191,7 @@ def test_bin_points_caps_marks_per_night():
     assert len(two) == 41 and sum(1 for pt, _, _ in two if pt[3] == "Sloan_r") == 1
 
 
+@needs_fixture
 def test_recent_window_excludes_old_nights(tmp_path):
     data, public = tmp_path / "work", tmp_path / "html"
     _make_obs(data, "1", 10)
@@ -204,6 +209,7 @@ def test_covers_uses_the_frame_wcs():
     assert not xn.covers({"center": [None, None], "cd": None, "size": None}, 100.0, 20.0)
 
 
+@needs_fixture
 def test_change_and_appearance_from_field_history(tmp_path):
     data, public = tmp_path / "work", tmp_path / "html"
     _make_obs(data, "1", 5, empty=True)            # field observed, nothing found (limit 17.1)

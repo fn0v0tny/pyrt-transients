@@ -1259,7 +1259,7 @@ class CatTransients(_PyrtCatalog):
         except (AttributeError, KeyError, TypeError):
             name = ""
         name = str(name).lower()
-        return not any(tag in name for tag in self.PROPER_MOTION_UNTRUSTED)
+        return not any(tag in name for tag in CatTransients.PROPER_MOTION_UNTRUSTED)
 
     def positions_at_epoch(self, epoch: Optional[float]) -> Tuple[np.ndarray, np.ndarray]:
         """Catalogue RA/Dec (deg) moved to `epoch` with the pmra/pmdec
@@ -1275,14 +1275,14 @@ class CatTransients(_PyrtCatalog):
         """
         ra = np.asarray(self["radeg"], dtype=np.float64)
         dec = np.asarray(self["decdeg"], dtype=np.float64)
-        cat_epoch = self.catalog_epoch()
-        if (epoch is None or cat_epoch is None or not self.proper_motions_trusted()
+        cat_epoch = CatTransients.catalog_epoch(self)
+        if (epoch is None or cat_epoch is None or not CatTransients.proper_motions_trusted(self)
                 or "pmra" not in self.colnames or "pmdec" not in self.colnames):
             return ra, dec
         dt = epoch - cat_epoch
         pmra = np.asarray(self["pmra"], dtype=np.float64)
         pmdec = np.asarray(self["pmdec"], dtype=np.float64)
-        cap = self.MAX_PROPER_MOTION_MAS_YR / 3.6e6
+        cap = CatTransients.MAX_PROPER_MOTION_MAS_YR / 3.6e6
         ok = (np.isfinite(pmra) & np.isfinite(pmdec)
               & (np.hypot(pmra, pmdec) <= cap))
         cosd = np.cos(np.radians(dec))
@@ -1327,9 +1327,11 @@ class CatTransients(_PyrtCatalog):
             elif not has_sip and any(p in key for p in ("A_", "B_", "AP_", "BP_")):
                 del header[key]
         wcs = astropy.wcs.WCS(header)
-        epoch = (self.observation_epoch(det.meta)
+        # Class-qualified: the projection is also used on a plain Table of
+        # positions (tests/test_catalog_projection.py), which has no methods.
+        epoch = (CatTransients.observation_epoch(det.meta)
                  if det.meta.get("propagate_proper_motion", True) else None)
-        ra, dec = self.positions_at_epoch(epoch)
+        ra, dec = CatTransients.positions_at_epoch(self, epoch)
         cat_x, cat_y = wcs.all_world2pix(ra, dec, 1)
         return np.column_stack([cat_x, cat_y])
 
