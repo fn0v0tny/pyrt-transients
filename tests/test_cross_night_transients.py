@@ -350,6 +350,7 @@ def test_band_names_are_normalised(tmp_path):
     assert xn.read_lightcurve(lc, "N")[0][3] == "Sloan_i"
 
 
+@needs_fixture
 def test_interesting_sources_take_the_cards_first(tmp_path):
     data, public = tmp_path / "work", tmp_path / "html"
     _make_obs(data, "1", 5, empty=True)
