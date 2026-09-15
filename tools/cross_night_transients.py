@@ -727,19 +727,25 @@ def apply_offsets(dets, field, offsets):
                 pt[1] -= off
 
 
-def within_night_change(dets):
+def within_night_change(dets, calibrated=None):
     """Largest change inside one night: the median of the first third of
     the night's epochs against the median of the last third, with at least
     two epochs per third, in one band at a time. The telescope cycles its filters
     within a night, so across bands the first and last third are simply
     different filters and every star with a colour would "fade". Returns
     (delta with sign, significance) for the most significant night and
-    band; delta > 0 means fading."""
+    band; delta > 0 means fading. With `calibrated` (the (band, frame key)
+    pairs that received a common-mode correction) only those frames take
+    part: without differential calibration a trend along the night can
+    be extinction as well as the star."""
     by_night = {}
     for p in dets:
         for pt in p["points"]:
-            if pt[0] is not None:
-                by_night.setdefault((p["night"], pt[3]), []).append((pt[0], pt[1], pt[2]))
+            if pt[0] is None:
+                continue
+            if calibrated is not None and (pt[3], round(pt[0] / FRAME_KEY_DAYS)) not in calibrated:
+                continue    # no field-wide correction for this frame: a trend here could be the sky
+            by_night.setdefault((p["night"], pt[3]), []).append((pt[0], pt[1], pt[2]))
     best = (0.0, 0.0)
     for pts in by_night.values():
         pts.sort()
@@ -880,8 +886,12 @@ def build_groups(observations, args, log, data_dir=None):
         for p in dets:
             p["points"] = detection_points(p, data_dir)
         clusters.append((dominant_field(dets), dets))
+    calibrated_frames = {}
     if not args.no_ensemble:
         bad = frame_offsets(clusters)
+        for (field, band, key), off in bad.items():
+            if abs(off) <= FRAME_OFFSET_MAX:
+                calibrated_frames.setdefault(field, set()).add((band, key))
         n_bad_frames = sum(1 for v in bad.values() if abs(v) > FRAME_OFFSET_MAX)
         n_dropped = sum(drop_bad_frames(d, f, bad) for f, d in clusters)
         log(f"{len(bad)} frames corrected for their field's common-mode offset"
@@ -924,10 +934,12 @@ def build_groups(observations, args, log, data_dir=None):
         per_band, saturated_bands = {}, set()
         for band in bands:
             st = nightly_stats(dets, band)
-            if st and sorted(v[0] for v in st.values())[len(st) // 2] < SATURATION_BRIGHT_MAG:
-                # Saturated in this band: the nightly values are instrumental
-                # and cannot testify to a change (the new matcher keeps such
-                # stars out of the candidates; older tables still have them).
+            if st and min(v[0] for v in st.values()) < SATURATION_BRIGHT_MAG:
+                # Saturated in this band on at least one night: the nightly
+                # values are instrumental (a star at 8.7 one night and 11.3
+                # the next is the flat top, not a fading) and cannot testify
+                # to a change. The new matcher keeps such stars out of the
+                # candidates; older tables still have them.
                 saturated_bands.add(band)
                 per_band[band] = (st, (0.0, 0.0), None)
                 continue
@@ -938,7 +950,8 @@ def build_groups(observations, args, log, data_dir=None):
         night_mags = [stats[n][0] for n in night_order]
         d_nights, s_nights = max((pb[1] for pb in per_band.values()), key=lambda t: t[1], default=(0.0, 0.0))
         d_within, s_within = within_night_change(
-            [dict(p, points=[pt for pt in p["points"] if pt[3] not in saturated_bands]) for p in dets])
+            [dict(p, points=[pt for pt in p["points"] if pt[3] not in saturated_bands]) for p in dets],
+            calibrated=None if args.no_ensemble else calibrated_frames.get(field, set()))
         trend_fit = max((pb[2] for pb in per_band.values() if pb[2]), key=lambda f: f["sigma"], default=None)
         # A slow, steady decline or rise (a supernova over weeks) shows as a
         # significant slope even when single steps are small.
@@ -1420,8 +1433,9 @@ def render_page(groups, observations, args, public_dir, generated):
         f"Night-to-night changes are compared within one band, between nightly medians of at least {MIN_EPOCHS_PER_NIGHT} "
         "epochs, after removing each field's nightly zero-point offset (the median over its sources with three or "
         f"more nights) and each frame's common-mode offset (differential photometry against the field; frames more than "
-        f"{FRAME_OFFSET_MAX:g} mag off are dropped); a band in which the source is brighter than {SATURATION_BRIGHT_MAG:g} mag is "
-        "saturated and cannot testify; a single epoch never decides. 'Missed' counts observations of the "
+        f"{FRAME_OFFSET_MAX:g} mag off are dropped, and a change within a night counts only in corrected frames); a band in "
+        f"which the source is brighter than {SATURATION_BRIGHT_MAG:g} mag on any night is saturated and cannot testify; a single "
+        "epoch never decides. 'Missed' counts observations of the "
         "field covering the position in which no frame detected anything there: before / between / after its "
         "detections, in a band the source was measured in and to a limit reaching its magnitude in that band; a night "
         "where the frames saw the star but the pipeline did not flag it is not a miss, and an "

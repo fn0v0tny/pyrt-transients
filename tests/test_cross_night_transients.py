@@ -463,3 +463,11 @@ def test_a_frame_in_another_band_cannot_witness_a_miss(tmp_path):
     assert xn.main(["--data-dir", str(data), "--public-dir", str(public), "--days", "0", "-q"]) == 0
     g = json.loads((public / "new_transients" / "new_transients.json").read_text())["groups"][0]
     assert g["n_missed_before"] == 1 and g["appeared"] is False
+
+
+def test_within_night_change_needs_calibrated_frames():
+    det = {"night": "2026-09-09", "points": [[61000.0 + k / 1440, 15.0 + 0.2 * k, 0.02, "N"] for k in range(6)]}
+    assert xn.within_night_change([det])[0] == pytest.approx(0.8, abs=0.05)
+    assert xn.within_night_change([det], calibrated=set()) == (0.0, 0.0)
+    keys = {("N", round(pt[0] / xn.FRAME_KEY_DAYS)) for pt in det["points"]}
+    assert xn.within_night_change([det], calibrated=keys)[0] == pytest.approx(0.8, abs=0.05)
