@@ -151,6 +151,20 @@ def night_of(t):
     return (t - timedelta(hours=12)).strftime("%Y-%m-%d")
 
 
+def frame_rows(path):
+    """Number of data rows of a detection ECSV (a cheap depth check: a
+    5-second frame with 30 detections proves nothing about a 12 mag star)."""
+    n = 0
+    try:
+        with open(path, errors="replace") as fh:
+            for line in fh:
+                if not line.startswith("#") and line.strip():
+                    n += 1
+    except OSError:
+        return 0
+    return max(0, n - 1)
+
+
 def first_science_ecsv(obs_dir):
     try:
         with os.scandir(obs_dir) as it:
@@ -339,9 +353,11 @@ def scan_observation(obs_dir):
         # field?": TAN centre, CD matrix (deg/px) and size, plus the frame's
         # own limiting magnitude for non-detections.
         "center": [_num("CRVAL1"), _num("CRVAL2")],
+        "crpix": [_num("CRPIX1"), _num("CRPIX2")],
         "cd": [_num("CD1_1"), _num("CD1_2"), _num("CD2_1"), _num("CD2_2")],
         "size": [_num("IMAGEW") or _num("NAXIS1"), _num("IMAGEH") or _num("NAXIS2")],
         "maglim": _num("MAGLIM"),
+        "n_det": frame_rows(obs_dir / ecsv) if ecsv else 0,
         "obs_id": obs_dir.name[4:],
         "object": meta.get("OBJECT", ""),
         "target": meta.get("TARGET", ""),
@@ -399,11 +415,15 @@ def crawl(data_dir, days, log):
         except OSError:
             continue  # nothing analysed yet (fewer than three epochs), or removed
         entry = cache.get(name)
-        if entry and entry.get("mtime") == st.st_mtime:
+        if entry and entry.get("mtime") == st.st_mtime and "n_det" in entry.get("facts", {}):
             n_cached += 1
         else:
-            entry = {"mtime": st.st_mtime, **scan_observation(obs_dir)}
-            entry.pop("cells_mtime", None)
+            fresh = {"mtime": st.st_mtime, **scan_observation(obs_dir)}
+            # The detection cells depend only on the frames, which do not
+            # change once processed: keep them across a header re-scan.
+            if entry and entry.get("mtime") == st.st_mtime and entry.get("cells_mtime") == st.st_mtime:
+                fresh["cells_mtime"] = st.st_mtime
+            entry = fresh
             cache[name] = entry
             n_read += 1
         # The frame time, not the table's mtime, decides whether a night is
@@ -486,24 +506,30 @@ def cluster(points, radius):
     return list(groups.values())
 
 
-COVERAGE_FRACTION = 0.45   # of the frame half-size: stay clear of the edges
+EDGE_FRACTION = 0.05   # of the frame size: this close to an edge a source is not reliably extracted
+MIN_FRAME_DETECTIONS = 100   # a frame with fewer sources is too shallow or too poor to prove an absence
 
 
 def covers(facts, ra, dec):
-    """Was (ra, dec) inside this observation's first frame? Uses the TAN
-    centre and CD matrix from the header; False when they are missing."""
+    """Was (ra, dec) well inside this observation's first frame? Projects
+    through the header's TAN reference point (CRVAL at CRPIX, which need
+    not be the frame centre) and CD matrix; False when they are missing."""
     c, cd, size = facts.get("center"), facts.get("cd"), facts.get("size")
+    crpix = facts.get("crpix") or [None, None]
     if not c or not cd or not size or None in c or None in cd or None in size:
         return False
+    if None in crpix:
+        crpix = [size[0] / 2.0, size[1] / 2.0]
     det = cd[0] * cd[3] - cd[1] * cd[2]
     if abs(det) < 1e-20:
         return False
     dx = (ra - c[0]) * math.cos(math.radians(dec))
     dra = ((dx + 180) % 360) - 180 if abs(dx) > 180 else dx
     ddec = dec - c[1]
-    px = (cd[3] * dra - cd[1] * ddec) / det
-    py = (-cd[2] * dra + cd[0] * ddec) / det
-    return abs(px) < COVERAGE_FRACTION * size[0] and abs(py) < COVERAGE_FRACTION * size[1]
+    px = crpix[0] + (cd[3] * dra - cd[1] * ddec) / det
+    py = crpix[1] + (-cd[2] * dra + cd[0] * ddec) / det
+    return (EDGE_FRACTION * size[0] < px < (1 - EDGE_FRACTION) * size[0]
+            and EDGE_FRACTION * size[1] < py < (1 - EDGE_FRACTION) * size[1])
 
 
 def n_pts_total(dets):
@@ -688,7 +714,8 @@ def non_detections(group_dets, ra, dec, observations, detected_obs, data_dir, ce
             cells_cache[name] = cells if cells is not None else set()
         dec0 = f["center"][1] if f.get("center") and f["center"][1] is not None else dec
         rec = {"obs_id": f["obs_id"], "night": f["nights"][0] if f["nights"] else "",
-               "object": f["object"], "maglim": f.get("maglim"), "first": f["first"]}
+               "object": f["object"], "maglim": f.get("maglim"), "first": f["first"],
+               "n_det": f.get("n_det", 0)}
         (present if cells and detected_in(cells, ra, dec, dec0) else missed).append(rec)
     return sorted(missed, key=lambda d: d["night"]), sorted(present, key=lambda d: d["night"])
 
@@ -791,7 +818,12 @@ def build_groups(observations, args, log, data_dir=None):
                    and m["night"] not in stats]
 
         def constraining(missed_list, mag):
+            # The frame has to be a real one (enough sources) and deep
+            # enough for the source as measured in its FAINTEST band: the
+            # limit is quoted for the frame's band, and a source bright in
+            # z and faint in r must clear the limit in r as well.
             return [m for m in missed_list if m["maglim"] is not None and mag is not None
+                    and m.get("n_det", 0) >= MIN_FRAME_DETECTIONS
                     and m["maglim"] - LIMIT_MARGIN_MAG >= mag]
         # The limit test uses the brightest band the source was seen in on
         # that night: a frame in another band is not directly comparable,
@@ -799,9 +831,10 @@ def build_groups(observations, args, log, data_dir=None):
         # in the next.
         def night_mag(night):
             # Only a night with enough epochs in some band can claim the
-            # source was really there (or really gone by then).
+            # source was really there (or really gone by then); its
+            # faintest band is what a frame in any band has to reach.
             vals = [pb[0][night][0] for pb in per_band.values() if night in pb[0]]
-            return min(vals) if vals else None
+            return max(vals) if vals else None
         appeared = constraining(before, night_mag(first_night))
         disappeared = constraining(after, night_mag(last_night))
         score = transient_score(mag_bright, len(nights), n_points, max(p["q"] for p in dets),
@@ -1206,7 +1239,8 @@ def render_page(groups, observations, args, public_dir, generated):
         f"the first and last third of one night, when it is at least {CHANGE_MIN_MAG:g} mag and {CHANGE_MIN_SIGMA:g}σ, "
         "at most 6 or 2; +4 when the source appeared, "
         "i.e. earlier frames of the field "
-        f"went {LIMIT_MARGIN_MAG:g} mag deeper than it without showing it; +1 when it disappeared the same way). "
+        f"went {LIMIT_MARGIN_MAG:g} mag deeper than its faintest band without showing it, in frames of at least "
+        f"{MIN_FRAME_DETECTIONS} sources with the position clear of the edges; +1 when it disappeared the same way). "
         f"Night-to-night changes are compared within one band, between nightly medians of at least {MIN_EPOCHS_PER_NIGHT} "
         "epochs, after removing each field's nightly zero-point offset (the median over its sources with three or "
         "more nights); a single epoch never decides. 'Missed' counts observations of the "

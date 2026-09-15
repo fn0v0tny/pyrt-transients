@@ -223,10 +223,15 @@ def test_recent_window_excludes_old_nights(tmp_path):
 
 def test_covers_uses_the_frame_wcs():
     facts = {"center": [100.0, 20.0], "cd": [-0.0003, 0.0, 0.0, 0.0003], "size": [1024, 1024]}
-    assert xn.covers(facts, 100.0, 20.0)
+    assert xn.covers(facts, 100.0, 20.0)                                          # no CRPIX: centre assumed
     assert xn.covers(facts, 100.0 + 0.1 / math.cos(math.radians(20.0)), 20.1)     # 333 px off centre
-    assert not xn.covers(facts, 100.0, 20.2)                                      # 667 px: beyond 0.45 x 1024
+    assert not xn.covers(facts, 100.0, 20.2)                                      # 667 px: beyond the edge
     assert not xn.covers({"center": [None, None], "cd": None, "size": None}, 100.0, 20.0)
+    # CRVAL sits at CRPIX, which need not be the centre: with the reference
+    # point in a corner the same sky position is outside the frame.
+    corner = dict(facts, crpix=[1.0, 1.0])
+    assert not xn.covers(corner, 100.0, 20.2) and not xn.covers(corner, 100.0, 19.9)
+    assert xn.covers(corner, 100.0 - 0.1 / math.cos(math.radians(20.0)), 20.1)   # +333 px in x and y
 
 
 @needs_fixture
