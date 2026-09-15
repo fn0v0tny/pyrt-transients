@@ -213,6 +213,19 @@ class DetectionConfig:
     vsx_match_radius_arcsec: float = 2.5
     vsx_catalog_id: str = "B/vsx/vsx"
 
+    # High proper-motion star veto on the final candidates: Gaia DR3 stars
+    # above high_pm_threshold_masyr (queried once per field through VizieR,
+    # cached in the observation directory) are propagated to the run's
+    # latest epoch, and a candidate within high_pm_match_radius_arcsec of
+    # one is dropped. The matcher's own proper-motion propagation
+    # (propagate_proper_motion) covers Gaia and ATLAS; this covers the
+    # rest: a run without Gaia, a local ATLAS without pm columns, stars
+    # pyrt's calibrator-style Gaia query leaves out. The forced target row
+    # (NUMBER 0) is never dropped. 50 mas/yr moves 1.3" in 26 years.
+    high_pm_veto_enabled: bool = True
+    high_pm_threshold_masyr: float = 50.0
+    high_pm_match_radius_arcsec: float = 3.0
+
     # Detection strategy: "blind_multicatalog" (cross-match against reference
     # catalogs, the only strategy today) or "subtraction" (differencing
     # against a template -- see detection/subtraction/). Kept as a plain str

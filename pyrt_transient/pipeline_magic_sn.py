@@ -40,6 +40,7 @@ from pyrt_transient.io.logging_setup import setup_pipeline_logging
 from pyrt_transient.io.observation_store import ObservationStore, extract_observation_id
 from pyrt_transient.web.orchestration import generate_frontend
 from pyrt_transient.detection.blind_multicatalog import BlindMulticatalogStrategy
+from pyrt_transient.detection.high_pm import reject_high_pm_stars
 from pyrt_transient.detection.blind_multicatalog.clustering import detections_time
 from pyrt_transient.detection.subtraction import SubtractionStrategy
 from pyrt_transient.detection.subtraction.candidates import (
@@ -284,139 +285,6 @@ def score_galaxy_proximity(candidates, ra_center, dec_center, search_radius_deg,
     candidates['galaxy_name'] = gal_name
     candidates['galaxy_flag'] = gal_flag
     return candidates
-
-
-def reject_high_pm_stars(candidates, ra_center, dec_center, field_deg, obs_jd,
-                          logger, pm_threshold_masyr=20.0, match_radius_arcsec=5.0,
-                          cache_path=None):
-    """Remove candidates that are high proper-motion (PM) stars caught at their
-    current (propagated) position rather than their Gaia J2016 catalog position.
-
-    The standard transient detector compares each detection to the Gaia J2016
-    catalog positions.  A fast-moving star (|PM| > pm_threshold_masyr mas/yr)
-    may have drifted far enough that it no longer matches its catalog entry and
-    is therefore flagged as a 'new' source.  This function:
-      1. Queries Gaia DR3 via VizieR for all stars with measured PM in the field.
-      2. Propagates their positions from J2016.0 to the observation epoch using
-         astropy SkyCoord.apply_space_motion().
-      3. Filters candidates whose position matches a propagated high-PM star.
-
-    cache_path: if given, the raw high-PM Gaia star list (step 1's result, a
-    field-level property that doesn't change from one call to the next) is
-    cached there. Only the propagation (step 2, cheap and local) depends on
-    obs_jd and is redone every call. Matters for a daemon-style caller that
-    invokes this once per new epoch across a multi-night campaign (e.g.
-    SubtractionStrategy's accumulation, see pipeline_magic_sn.py's
-    run_sn_pipeline) -- without this, the same VizieR query for the same
-    field's high-PM stars would otherwise repeat, unchanged, on every call.
-
-    Returns (filtered_candidates, n_rejected).
-    """
-    import astropy.units as u
-    from astropy.coordinates import SkyCoord
-    from astropy.time import Time
-
-    if len(candidates) == 0:
-        return candidates, 0
-
-    if obs_jd is None:
-        logger.warning("  PM check: no observation epoch — skipping high-PM star rejection")
-        return candidates, 0
-
-    try:
-        gaia_hp = None
-        if cache_path is not None and Path(cache_path).exists():
-            from astropy.table import Table as _Table
-            gaia_hp = _Table.read(str(cache_path), format="ascii.ecsv")
-            logger.info(f"  PM check: using cached high-PM Gaia stars ({len(gaia_hp)}) "
-                        f"from {cache_path}")
-
-        if gaia_hp is None:
-            from astroquery.vizier import Vizier
-
-            logger.info(f"  PM check: querying Gaia DR3 for high-PM stars "
-                        f"(|PM| > {pm_threshold_masyr} mas/yr) ...")
-
-            v = Vizier(
-                columns=['RA_ICRS', 'DE_ICRS', 'pmRA', 'pmDE', 'Gmag'],
-                row_limit=-1,
-            )
-            center = SkyCoord(ra_center, dec_center, unit='deg')
-            result = v.query_region(center, radius=field_deg * 0.75 * u.deg,
-                                    catalog='I/355/gaiadr3')
-
-            if not result or len(result) == 0:
-                logger.info("  PM check: no Gaia DR3 stars returned")
-                return candidates, 0
-
-            gaia = result[0]
-
-            # Filter to stars with measured PM above the threshold
-            pmra = np.array(gaia['pmRA'], dtype=float)
-            pmde = np.array(gaia['pmDE'], dtype=float)
-            pm_mag = np.sqrt(np.where(np.isnan(pmra), 0.0, pmra)**2 +
-                             np.where(np.isnan(pmde), 0.0, pmde)**2)
-            high_pm_mask = pm_mag >= pm_threshold_masyr
-            gaia_hp = gaia[high_pm_mask]
-
-            if cache_path is not None:
-                try:
-                    gaia_hp.write(str(cache_path), format="ascii.ecsv", overwrite=True)
-                except Exception as e:
-                    logger.debug(f"  PM check: could not write cache {cache_path}: {e}")
-
-        if len(gaia_hp) == 0:
-            logger.info("  PM check: no high-PM stars in this field")
-            return candidates, 0
-
-        logger.info(f"  PM check: {len(gaia_hp)} high-PM Gaia stars, "
-                    f"propagating to JD={obs_jd:.3f} ...")
-
-        # Propagate to observation epoch
-        gaia_epoch = Time('J2016.0')
-        obs_epoch = Time(obs_jd, format='jd')
-
-        pmra_hp = np.where(np.isnan(np.array(gaia_hp['pmRA'], dtype=float)),
-                           0.0, np.array(gaia_hp['pmRA'], dtype=float))
-        pmde_hp = np.where(np.isnan(np.array(gaia_hp['pmDE'], dtype=float)),
-                           0.0, np.array(gaia_hp['pmDE'], dtype=float))
-
-        gaia_coords = SkyCoord(
-            ra=np.array(gaia_hp['RA_ICRS'], dtype=float) * u.deg,
-            dec=np.array(gaia_hp['DE_ICRS'], dtype=float) * u.deg,
-            pm_ra_cosdec=pmra_hp * u.mas / u.yr,
-            pm_dec=pmde_hp * u.mas / u.yr,
-            obstime=gaia_epoch,
-            frame='icrs',
-        )
-        propagated = gaia_coords.apply_space_motion(new_obstime=obs_epoch)
-
-        # Match candidates against propagated positions
-        cand_coords = SkyCoord(
-            np.array(candidates['ALPHA_J2000'], dtype=float) * u.deg,
-            np.array(candidates['DELTA_J2000'], dtype=float) * u.deg,
-        )
-
-        keep_mask = np.ones(len(candidates), dtype=bool)
-        for i, cc in enumerate(cand_coords):
-            seps = cc.separation(propagated).arcsec
-            if np.min(seps) <= match_radius_arcsec:
-                keep_mask[i] = False
-
-        n_rejected = int(np.sum(~keep_mask))
-        if n_rejected:
-            logger.info(f"  PM check: removed {n_rejected} high-PM star matches")
-        else:
-            logger.info("  PM check: no candidates match a high-PM star")
-
-        return candidates[keep_mask], n_rejected
-
-    except ImportError:
-        logger.warning("  PM check: astroquery not available — skipping")
-        return candidates, 0
-    except Exception as e:
-        logger.warning(f"  PM check: query failed ({e}) — skipping")
-        return candidates, 0
 
 
 def crossmatch_tns(candidates, logger, api_key=None, match_radius_arcsec=5.0,
