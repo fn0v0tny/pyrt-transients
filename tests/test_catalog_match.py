@@ -98,3 +98,24 @@ if __name__ == "__main__":
     test_combine_results_does_not_crash_when_one_catalog_has_no_coverage()
     test_combine_results_still_works_when_all_catalogs_have_no_coverage()
     print("All catalog_match.py regression tests passed.")
+
+
+def test_quality_gate_applies_to_the_best_row_not_before_the_catalogue_count():
+    """SN 2026zji: 'new' in all three catalogues, but its USNO-B row scored
+    0.001 (the host galaxy's USNO-B entry on top of it). A per-row gate
+    before the unanimity count dropped that row, USNO-B no longer agreed,
+    and the supernova vanished. The gate belongs on the cluster's best row."""
+    def cat(name, q):
+        return Table({
+            "ALPHA_J2000": np.array([301.1436]), "DELTA_J2000": np.array([62.6441]),
+            "X_IMAGE": np.array([500.0]), "Y_IMAGE": np.array([500.0]),
+            "quality_score": np.array([q]), "candidate_type": np.array(["new"]),
+            "reference_catalog": np.array([name]),
+        })
+    transients = {"atlas": cat("atlas", 0.66), "gaia": cat("gaia", 0.60), "usno": cat("usno", 0.001)}
+    result = combine_results(transients, min_catalogs_fraction=1.0, min_quality=0.2, time=None)
+    assert len(result) == 1 and float(result["quality_score"][0]) == 0.66
+    # A cluster whose best row is below the gate still goes.
+    transients = {"atlas": cat("atlas", 0.1), "gaia": cat("gaia", 0.15), "usno": cat("usno", 0.001)}
+    assert len(combine_results(transients, min_catalogs_fraction=1.0, min_quality=0.2, time=None)) == 0
+    print("test_quality_gate_applies_to_the_best_row_not_before_the_catalogue_count: PASS")
