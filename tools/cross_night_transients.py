@@ -455,6 +455,13 @@ def crawl(data_dir, days, log):
             log(f"  detection cells: {n_cells} observations read")
     live = {name for name in dirs}
     cache = {k: v for k, v in cache.items() if k in live}
+    # Cells of observations that were cleaned up go too (160 KB each).
+    try:
+        for entry in os.scandir(data_dir / CELLS_DIR):
+            if entry.name.endswith(".bin") and entry.name[:-4] not in live:
+                os.unlink(entry.path)
+    except OSError:
+        pass
     try:
         tmp = cache_path.with_suffix(".tmp")
         tmp.write_text(json.dumps(cache))
