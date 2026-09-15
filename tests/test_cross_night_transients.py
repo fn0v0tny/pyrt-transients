@@ -158,12 +158,12 @@ def test_read_lightcurve_bands_and_fallback(tmp_path):
                   "0 99.0 99.0 61000.6 20260909011300-634-i-020-df.ecsv i Sloan_r\n"
                   "2 15.7 0.2 61000.4 20260909011000-634-i-020-df.ecsv \"\" \"\"\n")
     pts = xn.read_lightcurve(lc, "N")
-    assert pts == [[61000.4, 15.7, 0.2, "i"], [61000.5, 15.5, 0.1, "Sloan_r"]]
+    assert pts == [[61000.4, 15.7, 0.2, "Sloan_i"], [61000.5, 15.5, 0.1, "Sloan_r"]]
     assert xn.read_lightcurve(tmp_path / "missing.ecsv") == []
     obs = {"obs_id": "9", "filter": "", "first_frame": "20260909011221-634-i-020-df.ecsv"}
     p = {"id": "nothing", "obs": obs, "mag": 16.0, "magerr": 0.05,
          "source_file": "20260909011221-634-i-020-df"}
-    assert xn.detection_points(p, tmp_path) == [[pytest.approx(61292.05024, abs=1e-4), 16.0, 0.05, "i"]]
+    assert xn.detection_points(p, tmp_path) == [[pytest.approx(61292.05024, abs=1e-4), 16.0, 0.05, "Sloan_i"]]
 
 
 @needs_fixture
@@ -324,3 +324,25 @@ def test_nightly_stats_keep_bands_apart():
     assert set(xn.nightly_stats(dets, "Sloan_r")) == {"2026-09-10"} and xn.nightly_stats(dets, "Sloan_r")["2026-09-10"][0] == 15.0
     assert xn.nightly_stats(dets, "Sloan_i")["2026-09-10"][0] == pytest.approx(15.6)
     assert xn.nightly_stats(dets, "V") == {}
+
+
+def test_within_night_change_does_not_mix_bands():
+    # r frames then g frames in one night: a colour, not a change.
+    det = {"night": "2026-09-09", "points": [[61000.0 + k / 1440, 12.6, 0.02, "Sloan_r"] for k in range(6)]
+           + [[61000.01 + k / 1440, 13.96, 0.02, "Sloan_g"] for k in range(6)]}
+    delta, sig = xn.within_night_change([det])
+    assert abs(delta) < 0.05
+    # The same in one band is a change.
+    det = {"night": "2026-09-09", "points": [[61000.0 + k / 1440, 12.6 + 0.2 * k, 0.02, "Sloan_r"] for k in range(6)]}
+    delta, sig = xn.within_night_change([det])
+    assert delta == pytest.approx(0.8, abs=0.05) and sig > 5
+
+
+def test_band_names_are_normalised(tmp_path):
+    assert xn.normalise_band("i") == "Sloan_i" and xn.normalise_band("Sloan_i") == "Sloan_i"
+    assert xn.normalise_band("C") == "N" and xn.normalise_band("N") == "N" and xn.normalise_band("V") == "V"
+    lc = tmp_path / "x_lightcurve.ecsv"
+    lc.write_text("# %ECSV 1.0\n# ---\n# datatype:\n# - {name: MAG_CALIB}\n"
+                  "NUMBER MAG_CALIB MAGERR_CALIB mjd source_file\n"
+                  "1 15.5 0.1 61000.5 20260909011221-634-i-020-df.ecsv\n")
+    assert xn.read_lightcurve(lc, "N")[0][3] == "Sloan_i"

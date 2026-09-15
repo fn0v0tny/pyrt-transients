@@ -167,6 +167,18 @@ def band_of_frame(name):
     return parts[2] if len(parts) > 3 else ""
 
 
+def normalise_band(band):
+    """One name per band: the frame-name letter of an older lightcurve
+    ("i") and the calibration column of a newer one ("Sloan_i") are the
+    same band and must be compared with each other, not treated as two."""
+    b = (band or "").strip()
+    if b in ("g", "r", "i", "z", "u"):
+        return "Sloan_" + b
+    if b in ("C", "clear", "Clear", "N"):
+        return "N"
+    return b
+
+
 def read_lightcurve(path, default_band=""):
     """[[mjd, mag, magerr, band], ...] from a <transient_id>_lightcurve.ecsv.
 
@@ -201,7 +213,7 @@ def read_lightcurve(path, default_band=""):
         if not band and "source_file" in col:
             band = band_of_frame(Path(row[col["source_file"]]).name)
         err = _float(row[col["MAGERR_CALIB"]]) if "MAGERR_CALIB" in col else float("nan")
-        points.append([mjd, mag, _finite(err), band or default_band])
+        points.append([mjd, mag, _finite(err), normalise_band(band or default_band)])
     points.sort()
     return points
 
@@ -605,12 +617,16 @@ def apply_offsets(dets, field, offsets):
 def within_night_change(dets):
     """Largest change inside one night: the mean of the first third of the
     night's epochs against the mean of the last third (single bad epochs do
-    not count). Returns (delta with sign, significance) for the most
-    significant night; delta > 0 means fading."""
+    not count), in one band at a time. The telescope cycles its filters
+    within a night, so across bands the first and last third are simply
+    different filters and every star with a colour would "fade". Returns
+    (delta with sign, significance) for the most significant night and
+    band; delta > 0 means fading."""
     by_night = {}
     for p in dets:
-        by_night.setdefault(p["night"], []).extend(
-            (pt[0], pt[1], pt[2]) for pt in p["points"] if pt[0] is not None)
+        for pt in p["points"]:
+            if pt[0] is not None:
+                by_night.setdefault((p["night"], pt[3]), []).append((pt[0], pt[1], pt[2]))
     best = (0.0, 0.0)
     for pts in by_night.values():
         pts.sort()
@@ -701,7 +717,7 @@ def build_groups(observations, args, log, data_dir=None):
         # the most epochs decides the trend and the tags, but the largest
         # significant change of any band counts.
         bands = bands_of(dets) or [None]
-        stats_all = nightly_stats(dets)           # every band, for the summary numbers
+        stats_all = nightly_stats(dets)           # every band together: only for the "seen at all" questions
         per_band = {}
         for band in bands:
             st = nightly_stats(dets, band)
@@ -759,8 +775,15 @@ def build_groups(observations, args, log, data_dir=None):
         def constraining(missed_list, mag):
             return [m for m in missed_list if m["maglim"] is not None and mag is not None
                     and m["maglim"] - LIMIT_MARGIN_MAG >= mag]
-        appeared = constraining(before, stats_all[first_night][0] if first_night in stats_all else None)
-        disappeared = constraining(after, stats_all[last_night][0] if last_night in stats_all else None)
+        # The limit test uses the brightest band the source was seen in on
+        # that night: a frame in another band is not directly comparable,
+        # but a star well above the limit in one band is not 1 mag fainter
+        # in the next.
+        def night_mag(night):
+            vals = [pb[0][night][0] for pb in per_band.values() if night in pb[0]]
+            return min(vals) if vals else (stats_all[night][0] if night in stats_all else None)
+        appeared = constraining(before, night_mag(first_night))
+        disappeared = constraining(after, night_mag(last_night))
         score = transient_score(mag_bright, len(nights), n_points, max(p["q"] for p in dets),
                                 delta_mag if changed else 0.0, bool(appeared), bool(disappeared))
         groups.append({
@@ -771,7 +794,8 @@ def build_groups(observations, args, log, data_dir=None):
             "slope_mag_per_day": round(trend_fit["slope"], 4) if trend_fit else None,
             "slope_sigma": round(trend_fit["sigma"], 1) if trend_fit else None,
             "span_days": round(trend_fit["span_days"], 1) if trend_fit else None,
-            "nightly": {n: [round(v[0], 3), round(v[1], 3), v[2]] for n, v in sorted(stats_all.items())},
+            "nightly": {n: [round(v[0], 3), round(v[1], 3), v[2]] for n, v in sorted(stats.items())},
+            "band": main_band or "",
             "bands": bands if bands != [None] else [],
             "offsets_applied": {f"{n} {b}": round(offsets[(field, n, b)], 3) for n in nights for b in bands
                                 if (field, n, b) in offsets},
@@ -847,7 +871,7 @@ def detection_points(p, data_dir):
     if not (math.isfinite(p["mag"]) and p["mag"] < 90):
         return []
     t = frame_time(p.get("source_file", "")) or frame_time(p["obs"]["first_frame"])
-    return [[mjd_of(t) if t else None, p["mag"], _finite(p["magerr"]), band]]
+    return [[mjd_of(t) if t else None, p["mag"], _finite(p["magerr"]), normalise_band(band)]]
 
 
 # ------------------------------------------------------------------- page
