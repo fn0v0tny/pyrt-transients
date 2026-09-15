@@ -413,6 +413,21 @@ def test_insane_magnitudes_and_bad_frames_are_dropped(tmp_path):
     assert all(len(d[0]["points"]) == 6 for _, d in clusters)
 
 
+def test_common_mode_extinction_trend_is_removed():
+    # Six stars fading together by 0.6 mag along the night (airmass): after the
+    # per-frame correction none of them changes within the night.
+    clusters = []
+    for k in range(6):
+        pts = [[61000.0 + j / 1440, 15.0 + k + 0.1 * j, 0.03, "N"] for j in range(7)]
+        clusters.append(("F", [{"night": "2026-09-10", "mag": 15.0 + k, "magerr": 0.03, "points": pts}]))
+    d, sig = xn.within_night_change(clusters[0][1])
+    assert d == pytest.approx(0.5, abs=0.05)      # medians of the first and last two epochs
+    off = xn.frame_offsets(clusters)
+    assert sum(xn.drop_bad_frames(dd, f, off) for f, dd in clusters) == 0
+    d, sig = xn.within_night_change(clusters[0][1])
+    assert abs(d) < 0.05
+
+
 def test_witness_efficiency_disqualifies_a_blind_observation(tmp_path):
     # Twelve sources of one field; observation A detected all, observation B none.
     facts = lambda oid: {"obs_id": oid, "center": [100.0, 20.0], "crpix": [512.0, 512.0],

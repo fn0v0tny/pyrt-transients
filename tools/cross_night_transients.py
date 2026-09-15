@@ -664,7 +664,7 @@ def ensemble_offsets(groups_dets, min_sources=5):
     return out
 
 
-FRAME_OFFSET_MAX = 0.5     # a frame whose sources all sit this far off their nightly medians is dropped
+FRAME_OFFSET_MAX = 1.0     # a frame whose sources all sit this far off their nightly medians is dropped
 FRAME_KEY_DAYS = 3e-4      # ~26 s: one frame
 
 
@@ -697,16 +697,22 @@ def frame_offsets(groups_dets, min_sources=5):
 
 
 def drop_bad_frames(dets, field, offsets):
-    """Remove the points of frames offset by more than FRAME_OFFSET_MAX (in
-    place). Returns the number of points dropped."""
+    """Differential photometry against the field: subtract each frame's
+    common-mode offset from its points (extinction along a long sequence
+    at low altitude, a thin cloud, a zero point off by a tenth) and remove
+    the points of frames off by more than FRAME_OFFSET_MAX (a calibration
+    that failed). In place; returns the number of points dropped."""
     n = 0
     for p in dets:
         keep = []
         for pt in p["points"]:
             off = offsets.get((field, pt[3], round(pt[0] / FRAME_KEY_DAYS))) if pt[0] is not None else None
-            if off is not None and abs(off) > FRAME_OFFSET_MAX:
+            if off is None:
+                keep.append(pt)
+            elif abs(off) > FRAME_OFFSET_MAX:
                 n += 1
             else:
+                pt[1] -= off
                 keep.append(pt)
         p["points"] = keep
     return n
@@ -878,9 +884,9 @@ def build_groups(observations, args, log, data_dir=None):
         bad = frame_offsets(clusters)
         n_bad_frames = sum(1 for v in bad.values() if abs(v) > FRAME_OFFSET_MAX)
         n_dropped = sum(drop_bad_frames(d, f, bad) for f, d in clusters)
-        if n_bad_frames:
-            log(f"{n_bad_frames} frames with a zero point more than {FRAME_OFFSET_MAX:g} mag off their field: "
-                f"{n_dropped} points dropped")
+        log(f"{len(bad)} frames corrected for their field's common-mode offset"
+            + (f", {n_bad_frames} of them more than {FRAME_OFFSET_MAX:g} mag off and dropped ({n_dropped} points)"
+               if n_bad_frames else ""))
     offsets = ensemble_offsets([(f, d) for f, d in clusters]) if not args.no_ensemble else {}
     if offsets:
         big = sorted(offsets.items(), key=lambda kv: -abs(kv[1]))[:3]
@@ -915,16 +921,24 @@ def build_groups(observations, args, log, data_dir=None):
         # significant change of any band counts.
         bands = bands_of(dets) or [None]
         stats_all = nightly_stats(dets, min_epochs_off=True)   # every band, every night: "seen at all" only
-        per_band = {}
+        per_band, saturated_bands = {}, set()
         for band in bands:
             st = nightly_stats(dets, band)
+            if st and sorted(v[0] for v in st.values())[len(st) // 2] < SATURATION_BRIGHT_MAG:
+                # Saturated in this band: the nightly values are instrumental
+                # and cannot testify to a change (the new matcher keeps such
+                # stars out of the candidates; older tables still have them).
+                saturated_bands.add(band)
+                per_band[band] = (st, (0.0, 0.0), None)
+                continue
             per_band[band] = (st, change_between_nights(st), night_trend(st))
         main_band = bands[0]
         stats = per_band[main_band][0] or stats_all
         night_order = sorted(stats)
         night_mags = [stats[n][0] for n in night_order]
         d_nights, s_nights = max((pb[1] for pb in per_band.values()), key=lambda t: t[1], default=(0.0, 0.0))
-        d_within, s_within = within_night_change(dets)
+        d_within, s_within = within_night_change(
+            [dict(p, points=[pt for pt in p["points"] if pt[3] not in saturated_bands]) for p in dets])
         trend_fit = max((pb[2] for pb in per_band.values() if pb[2]), key=lambda f: f["sigma"], default=None)
         # A slow, steady decline or rise (a supernova over weeks) shows as a
         # significant slope even when single steps are small.
@@ -1405,8 +1419,9 @@ def render_page(groups, observations, args, public_dir, generated):
         f"{MIN_FRAME_DETECTIONS} sources with the position clear of the edges; +1 when it disappeared the same way). "
         f"Night-to-night changes are compared within one band, between nightly medians of at least {MIN_EPOCHS_PER_NIGHT} "
         "epochs, after removing each field's nightly zero-point offset (the median over its sources with three or "
-        f"more nights); frames whose zero point is more than {FRAME_OFFSET_MAX:g} mag off for the whole field are "
-        "dropped, and a single epoch never decides. 'Missed' counts observations of the "
+        f"more nights) and each frame's common-mode offset (differential photometry against the field; frames more than "
+        f"{FRAME_OFFSET_MAX:g} mag off are dropped); a band in which the source is brighter than {SATURATION_BRIGHT_MAG:g} mag is "
+        "saturated and cannot testify; a single epoch never decides. 'Missed' counts observations of the "
         "field covering the position in which no frame detected anything there: before / between / after its "
         "detections, in a band the source was measured in and to a limit reaching its magnitude in that band; a night "
         "where the frames saw the star but the pipeline did not flag it is not a miss, and an "
