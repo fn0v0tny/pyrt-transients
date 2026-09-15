@@ -33,6 +33,7 @@ from pyrt_transient.detection.blind_multicatalog.stdpipe_filters import (
     apply_skybot_filter,
     apply_vsx_filter,
 )
+from pyrt_transient.detection.high_pm import apply_high_pm_veto
 from pyrt_transient.detection.blind_multicatalog.lightcurve import (
     build_lightcurve_for_group,
     estimate_magnitude_error_floor,
@@ -887,6 +888,16 @@ def combine_with_lightcurves(
                 n_removed = 0
             if n_removed > 0:
                 logging.info(f"VSX filter removed {n_removed} final candidates")
+                surviving_ids = set(str(t) for t in result_table['transient_id'])
+                lightcurves = {k: v for k, v in lightcurves.items() if k in surviving_ids}
+
+        # High proper-motion stars: once, on the final candidates, against
+        # Gaia DR3 propagated to this run's latest epoch (see high_pm.py for
+        # why the matcher's own propagation is not enough on its own).
+        if config and getattr(config.detection, "high_pm_veto_enabled", False):
+            result_table, n_removed = apply_high_pm_veto(result_table, detection_tables, data_dir, config)
+            if n_removed > 0:
+                logging.info(f"High-pm veto removed {n_removed} final candidates")
                 surviving_ids = set(str(t) for t in result_table['transient_id'])
                 lightcurves = {k: v for k, v in lightcurves.items() if k in surviving_ids}
 

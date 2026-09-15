@@ -1197,9 +1197,99 @@ class CatTransients(_PyrtCatalog):
                     if isinstance(val, (float, np.floating))
                     else val
                 )
+        # The catalogue pixel positions depend on the epoch too (proper
+        # motion), so two frames with the same WCS solution but taken at
+        # different times must not share a cache entry.
+        epoch = self.observation_epoch(meta) if meta.get("propagate_proper_motion", True) else None
+        wcs_keys["_epoch"] = None if epoch is None else round(epoch, 4)
         return "img_" + hashlib.md5(
             str(sorted(wcs_keys.items())).encode()
         ).hexdigest()[:12]
+
+    # ------------------------------------------------------------------
+    # Proper-motion propagation
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def observation_epoch(meta: Dict[str, Any]) -> Optional[float]:
+        """Decimal year of a frame from its header (JD, then CTIME, then
+        DATE-OBS), or None when none of them is usable."""
+        try:
+            jd = float(meta["JD"])
+            if np.isfinite(jd) and jd > 2400000:
+                return 2000.0 + (jd - 2451545.0) / 365.25
+        except (KeyError, TypeError, ValueError):
+            pass
+        try:
+            ctime = float(meta["CTIME"])
+            if np.isfinite(ctime) and ctime > 0:
+                return 2000.0 + (ctime - 946728000.0) / (365.25 * 86400.0)  # J2000.0 = unix 946728000
+        except (KeyError, TypeError, ValueError):
+            pass
+        try:
+            from astropy.time import Time
+            return float(Time(str(meta["DATE-OBS"])).jyear)
+        except Exception:
+            return None
+
+    def catalog_epoch(self) -> Optional[float]:
+        """Epoch of the catalogue positions (decimal year), or None."""
+        for value in (self.meta.get("astepoch"),
+                      self.meta.get("catalog_props", {}).get("epoch")):
+            try:
+                if value is not None and np.isfinite(float(value)):
+                    return float(value)
+            except (TypeError, ValueError):
+                continue
+        return None
+
+    # Catalogues whose proper motions are not to be used. USNO-B's are largely
+    # spurious: in the cached 210619B field 12 % of its stars would move by
+    # more than 2 arcsec between 2000 and 2026 (median 7.7 arcsec), and most
+    # of those sit on a real Gaia star at the ORIGINAL position; Gaia has 6
+    # such stars in 230 000. Propagating them would create the very
+    # "persistent new source" this fix removes.
+    PROPER_MOTION_UNTRUSTED = ("usno",)
+    # Sanity cap on the proper motion used (Barnard's star is 10.4 arcsec/yr).
+    MAX_PROPER_MOTION_MAS_YR = 20000.0
+
+    def proper_motions_trusted(self) -> bool:
+        try:
+            name = self.meta.get("catalog") or self.catalog_name or ""
+        except (AttributeError, KeyError, TypeError):
+            name = ""
+        name = str(name).lower()
+        return not any(tag in name for tag in CatTransients.PROPER_MOTION_UNTRUSTED)
+
+    def positions_at_epoch(self, epoch: Optional[float]) -> Tuple[np.ndarray, np.ndarray]:
+        """Catalogue RA/Dec (deg) moved to `epoch` with the pmra/pmdec
+        columns (deg/yr; pmra includes cos dec, as Gaia and ATLAS give it).
+
+        Stars without a finite proper motion, or above
+        MAX_PROPER_MOTION_MAS_YR, stay where the catalogue puts them. With no
+        epoch on either side, no pm columns, or a catalogue in
+        PROPER_MOTION_UNTRUSTED, the raw positions are returned. Over the ~10-25 years between the catalogue
+        epochs and today a 150 mas/yr star has moved 2-4 arcsec, which is
+        more than the identification radius: without this every such star
+        is a "new" source in every frame.
+        """
+        ra = np.asarray(self["radeg"], dtype=np.float64)
+        dec = np.asarray(self["decdeg"], dtype=np.float64)
+        cat_epoch = CatTransients.catalog_epoch(self)
+        if (epoch is None or cat_epoch is None or not CatTransients.proper_motions_trusted(self)
+                or "pmra" not in self.colnames or "pmdec" not in self.colnames):
+            return ra, dec
+        dt = epoch - cat_epoch
+        pmra = np.asarray(self["pmra"], dtype=np.float64)
+        pmdec = np.asarray(self["pmdec"], dtype=np.float64)
+        cap = CatTransients.MAX_PROPER_MOTION_MAS_YR / 3.6e6
+        ok = (np.isfinite(pmra) & np.isfinite(pmdec)
+              & (np.hypot(pmra, pmdec) <= cap))
+        cosd = np.cos(np.radians(dec))
+        cosd = np.where(np.abs(cosd) < 1e-6, 1e-6, cosd)
+        ra = np.where(ok, ra + dt * pmra / cosd, ra)
+        dec = np.where(ok, dec + dt * pmdec, dec)
+        return ra, dec
 
     def _transform_catalog_to_pixel(self, det: astropy.table.Table) -> np.ndarray:
         # X_IMAGE/Y_IMAGE are measured on the distorted image, so a frame's
@@ -1237,7 +1327,12 @@ class CatTransients(_PyrtCatalog):
             elif not has_sip and any(p in key for p in ("A_", "B_", "AP_", "BP_")):
                 del header[key]
         wcs = astropy.wcs.WCS(header)
-        cat_x, cat_y = wcs.all_world2pix(self["radeg"], self["decdeg"], 1)
+        # Class-qualified: the projection is also used on a plain Table of
+        # positions (tests/test_catalog_projection.py), which has no methods.
+        epoch = (CatTransients.observation_epoch(det.meta)
+                 if det.meta.get("propagate_proper_motion", True) else None)
+        ra, dec = CatTransients.positions_at_epoch(self, epoch)
+        cat_x, cat_y = wcs.all_world2pix(ra, dec, 1)
         return np.column_stack([cat_x, cat_y])
 
     def get_pixel_coordinates_cached(
@@ -1635,25 +1730,50 @@ class CatTransients(_PyrtCatalog):
         blended_siglim = min(new_source_siglim, siglim)
         effective_matched_siglim = np.where(det_blended, blended_siglim, siglim)
         bad_snr_matched = det_errs >= (1.091 / effective_matched_siglim)
+        saturated, sat_limit = self.saturated_mask(detections)
+        n_sat_matched = 0
         bad_snr_new     = det_errs >= (1.091 / new_source_siglim)
 
         candidates: List[int] = []
         types:      List[str] = []
         diffs:      List[float] = []
+        limits:     List[bool] = []
         response = detections.meta.get("RESPONSE", "P0=25.0")
 
         for i, matches in enumerate(matches_list):
             if edge[i]:
                 continue
             if len(matches) == 0:
+                # No catalogue star here. A saturated detection is still a
+                # candidate: a bright GRB or nova saturates too, and being
+                # absent from the catalogue is the physical signal. The
+                # `saturated` column (FLAGS & 4) stays on the row for the
+                # scoring and the reader.
                 if bad_snr_new[i]:
                     continue
                 candidates.append(i)
                 types.append("new")
                 diffs.append(0.0)
+                limits.append(False)
                 continue
             if bad_snr_matched[i]:
                 continue
+            limit = None
+            if saturated[i]:
+                # A catalogue star sits here and the measured magnitude is
+                # instrumental. Saturation still says the source is at least
+                # as bright as the limit, so the limit is compared instead: a
+                # catalogue star much fainter than it has brightened (an
+                # outburst), one already brighter is consistent, and fading
+                # cannot be claimed. (Before this, the brightest "transients"
+                # of every field were 9th-magnitude Tycho stars measured
+                # 1.5 mag off.) The limit is the fainter of the frame's
+                # saturation magnitude and the measurement: both are lower
+                # bounds on the brightness, and a faint star that merely
+                # carries the flag (a deblended child of a saturated
+                # neighbour) must not inherit the frame-wide limit.
+                n_sat_matched += 1
+                limit = float(det_mags[i]) if sat_limit is None else float(max(sat_limit, det_mags[i]))
             is_cand, ctype, mdiff = self._check_magnitude_changes_cached(
                 matches, det_mags[i], det_errs[i], response,
                 mag_change_threshold, siglim,
@@ -1662,18 +1782,87 @@ class CatTransients(_PyrtCatalog):
                 unphotometered_match_is_new=unphotometered_match_is_new,
                 unphotometered_veto_max_brightening=unphotometered_veto_max_brightening,
                 band_idx=band_idx,
+                saturation_limit=limit,
             )
             if is_cand:
                 candidates.append(i)
                 types.append(ctype)
                 diffs.append(float(mdiff))
+                limits.append(limit is not None and ctype != "new")
 
+        if n_sat_matched:
+            logging.info(f"Saturation: {n_sat_matched} matched detections compared as a brightness limit"
+                         + (f" (flagged, or brighter than {sat_limit:.2f} mag)" if sat_limit is not None
+                            else " (flagged)"))
         if not candidates:
             return astropy.table.Table()
         result = detections[candidates].copy()
         result["candidate_type"]       = types
         result["magnitude_difference"] = diffs
+        # True where magnitude_difference is a limit (saturated detection),
+        # so a reader or a later stage can tell it from a measurement.
+        result["mag_is_limit"]         = limits
         return result
+
+    # How well the frame's saturation magnitude is known (the Gaussian-peak
+    # estimate is off by a few tenths for an undersampled PSF).
+    SATURATION_LIMIT_SIGMA = 0.2
+
+    @staticmethod
+    def saturation_magnitude(meta: Dict[str, Any], saturation_adu: float) -> Optional[float]:
+        """Calibrated magnitude at which a star's peak pixel reaches
+        `saturation_adu`, from MAGZERO and the FWHM: a Gaussian star of total
+        flux F has peak F / (1.133 FWHM^2), so F_sat = sat * 1.133 * FWHM^2.
+        None when the header lacks either value.
+        """
+        try:
+            magzero = float(meta["MAGZERO"])
+            fwhm = float(meta["FWHM"])
+        except (KeyError, TypeError, ValueError):
+            return None
+        if not (np.isfinite(magzero) and np.isfinite(fwhm) and fwhm > 0 and saturation_adu > 0):
+            return None
+        return magzero - 2.5 * np.log10(saturation_adu * 1.133 * fwhm ** 2)
+
+    def saturated_mask(self, detections: astropy.table.Table) -> Tuple[np.ndarray, Optional[float]]:
+        """(mask, frame saturation limit) -- detections whose photometry
+        cannot be trusted: SExtractor's saturation flag (FLAGS & 4), or
+        brighter than the frame's estimated saturation magnitude plus
+        `saturation_margin_mag`. Against a matched catalogue star they count
+        as "brighter than a limit" rather than as a measurement (a
+        flat-topped profile biases the magnitude by a magnitude or more,
+        which used to make the brightest star of every field a "brightening
+        transient"). They remain candidates when no catalogue star matches
+        at all: a bright GRB saturates too. Controlled through
+        detections.meta: reject_saturated (default True), saturation_adu
+        (60000), saturation_margin_mag (0.0). The forced target row
+        (NUMBER 0) is never masked. On a stacked table (IS_STACK) the flag
+        bit is SEP's deblending-overflow bit, not saturation, so only the
+        magnitude rule applies there.
+        """
+        n = len(detections)
+        meta = detections.meta
+        if not meta.get("reject_saturated", True):
+            return np.zeros(n, dtype=bool), None
+        limit = None
+        sat_mag = self.saturation_magnitude(meta, float(meta.get("saturation_adu", 60000.0)))
+        if sat_mag is not None:
+            limit = sat_mag + float(meta.get("saturation_margin_mag", 0.0))
+        mask = np.zeros(n, dtype=bool)
+        if "FLAGS" in detections.colnames and not meta.get("IS_STACK", False):
+            try:
+                mask |= (np.asarray(detections["FLAGS"], dtype=np.int64) & 4) > 0
+            except (TypeError, ValueError):
+                pass
+        if limit is not None and "MAG_CALIB" in detections.colnames:
+            mags = np.asarray(detections["MAG_CALIB"], dtype=np.float64)
+            mask |= np.isfinite(mags) & (mags < limit)
+        if "NUMBER" in detections.colnames:
+            try:
+                mask &= np.asarray(detections["NUMBER"], dtype=np.int64) != 0
+            except (TypeError, ValueError):
+                pass
+        return mask, limit
 
     def _check_magnitude_changes_cached(
         self,
@@ -1688,6 +1877,7 @@ class CatTransients(_PyrtCatalog):
         unphotometered_match_is_new: bool = True,
         unphotometered_veto_max_brightening: Optional[float] = None,
         band_idx: int = 1,
+        saturation_limit: Optional[float] = None,
     ) -> Tuple[bool, str, float]:
         """is_blended/new_source_siglim: a detection blended with a known
         catalog star (SExtractor FLAGS bit 2) measures the *combined* flux
@@ -1700,6 +1890,14 @@ class CatTransients(_PyrtCatalog):
         checked against the same more permissive bar new-source detections
         already get (`new_source_siglim`) instead of the strict one, rather
         than treating any blend as automatically "same star, unchanged".
+
+        With `saturation_limit` the detection is saturated and its magnitude
+        is only known to be brighter than the limit: the limit replaces the
+        measured magnitude, its uncertainty is SATURATION_LIMIT_SIGMA rather
+        than the (meaningless) measurement error, a match consistent with
+        the limit settles the row, only "brightening" can result, and the
+        blend check is skipped. The reported magnitude_difference is then a
+        limit too.
         """
         if new_source_siglim is None:
             new_source_siglim = siglim
@@ -1727,6 +1925,12 @@ class CatTransients(_PyrtCatalog):
         rough_mags = getattr(self._photometric_cache, "rough_mags", None)
         unphotometered_rough: List[float] = []
         predicted: set = set()  # matches with a Sloan prediction in matched_cat_mags
+        consistent = False
+        if saturation_limit is not None:
+            det_mag = saturation_limit
+            det_err = self.SATURATION_LIMIT_SIGMA
+        else:
+            det_err = np.sqrt(det_mag_err ** 2 + det_sys ** 2)
 
         for idx in matches:
             if not self._photometric_cache.valid_stars[idx]:  # type: ignore[union-attr]
@@ -1750,7 +1954,7 @@ class CatTransients(_PyrtCatalog):
                     (r_mag, colors[0], colors[1], colors[2], colors[3]),
                 )
 
-                sigma  = np.sqrt(det_mag_err ** 2 + det_sys ** 2 + cat_sys ** 2)
+                sigma  = np.sqrt(det_err ** 2 + cat_sys ** 2)
                 diff   = det_mag - cat_mag
                 nsigma = abs(diff) / sigma
                 any_valid = True
@@ -1764,7 +1968,13 @@ class CatTransients(_PyrtCatalog):
                     # against the summed prediction below instead.
                     continue
 
-                if abs(diff) >= mag_change_threshold and nsigma > siglim:
+                if saturation_limit is not None and diff > -mag_change_threshold:
+                    # A star at least about as bright as the limit is what a
+                    # saturated detection looks like: this match explains
+                    # the row, whatever fainter neighbours also fall inside
+                    # the identification radius.
+                    consistent = True
+                elif abs(diff) >= mag_change_threshold and nsigma > siglim:
                     significant.append(
                         (diff, "brightening" if diff < 0 else "fading")
                     )
@@ -1777,7 +1987,9 @@ class CatTransients(_PyrtCatalog):
             except Exception:
                 continue
 
-        if is_blended and matched_cat_mags:
+        if consistent:
+            return False, "none", 0.0
+        if is_blended and matched_cat_mags and saturation_limit is None:
             # The blend also holds the matches without a Sloan prediction.
             # Leaving them out of the sum read every such blend as
             # "brightening" by exactly their flux, so their rough magnitudes

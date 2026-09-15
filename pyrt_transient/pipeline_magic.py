@@ -283,9 +283,9 @@ def main():
                 logger.info(f"Analysis completed successfully")
 
             except Exception as e:
-                logger.error(f"Analysis failed: {e}")
-                import traceback
-                logger.debug(f"Full traceback: {traceback.format_exc()}")
+                # The traceback goes to the error log too: a one-line message
+                # such as "No table found" cannot be traced without it.
+                logger.error(f"Analysis failed: {e}", exc_info=True)
                 sys.exit(1)
 
         # Frontend generation runs after the lock is released so queued
