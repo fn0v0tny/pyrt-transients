@@ -510,13 +510,18 @@ def n_pts_total(dets):
     return sum(len(p["points"]) for p in dets)
 
 
-def nightly_stats(dets, band=None):
-    """{night: (mean mag, error of the mean, n, mean mjd)} from every epoch
-    of the night, in one band (the points' band; None takes them all). The
-    error is the scatter over sqrt(n), never below 0.02 mag or below the
-    median quoted error over sqrt(n). Two nights are only comparable in the
-    same band: a clear frame calibrated to Sloan r and one to Sloan i
-    differ by the star's colour, not by variability."""
+MIN_EPOCHS_PER_NIGHT = 3   # a night with fewer epochs in the band cannot testify to a change
+
+
+def nightly_stats(dets, band=None, min_epochs_off=False):
+    """{night: (median mag, error, n, mean mjd)} from every epoch of the
+    night, in one band (the points' band; None takes them all). Nights
+    with fewer than MIN_EPOCHS_PER_NIGHT epochs are left out (unless
+    min_epochs_off, for the band-blind summary). The error is the robust
+    scatter over sqrt(n), never below 0.02 mag or below the median quoted
+    error over sqrt(n). Two nights are only comparable in the same band:
+    a clear frame calibrated to Sloan r and one to Sloan i differ by the
+    star's colour, not by variability."""
     by_night = {}
     for p in dets:
         pts = [(pt[1], pt[2], pt[0]) for pt in p["points"] if band is None or pt[3] == band] or (
@@ -526,15 +531,23 @@ def nightly_stats(dets, band=None):
             by_night.setdefault(p["night"], []).extend(pts)
     out = {}
     for night, pts in by_night.items():
-        mags = [m for m, _, _ in pts]
+        mags = sorted(m for m, _, _ in pts)
         n = len(mags)
-        mean = sum(mags) / n
-        scatter = math.sqrt(sum((m - mean) ** 2 for m in mags) / (n - 1)) if n > 1 else 0.0
+        if n < MIN_EPOCHS_PER_NIGHT and not (band is None and min_epochs_off):
+            continue
+        # Median and a scatter from the median absolute deviation: one bad
+        # epoch (a cosmic ray, a satellite, a frame with a poor zero point)
+        # then moves neither the value nor the error. On the first live
+        # page 41 of 65 "changed" sources rested on a single-epoch night.
+        med = mags[n // 2] if n % 2 else 0.5 * (mags[n // 2 - 1] + mags[n // 2])
+        dev = sorted(abs(m - med) for m in mags)
+        mad = dev[n // 2] if n % 2 else 0.5 * (dev[n // 2 - 1] + dev[n // 2])
+        scatter = 1.4826 * mad
         errs = sorted(e for _, e, _ in pts if e is not None and e > 0)
         quoted = errs[len(errs) // 2] if errs else 0.05
         err = max(0.02, scatter / math.sqrt(n), quoted / math.sqrt(n))
         mjds = [t for _, _, t in pts if t is not None]
-        out[night] = (mean, err, n, sum(mjds) / len(mjds) if mjds else None)
+        out[night] = (med, err, n, sum(mjds) / len(mjds) if mjds else None)
     return out
 
 
@@ -616,9 +629,9 @@ def apply_offsets(dets, field, offsets):
 
 
 def within_night_change(dets):
-    """Largest change inside one night: the mean of the first third of the
-    night's epochs against the mean of the last third (single bad epochs do
-    not count), in one band at a time. The telescope cycles its filters
+    """Largest change inside one night: the median of the first third of
+    the night's epochs against the median of the last third, with at least
+    two epochs per third, in one band at a time. The telescope cycles its filters
     within a night, so across bands the first and last third are simply
     different filters and every star with a colour would "fade". Returns
     (delta with sign, significance) for the most significant night and
@@ -632,13 +645,14 @@ def within_night_change(dets):
     for pts in by_night.values():
         pts.sort()
         n = len(pts)
-        if n < 4:
-            continue
-        k = max(1, n // 3)
-        a, b = [m for _, m, _ in pts[:k]], [m for _, m, _ in pts[-k:]]
-        ma, mb = sum(a) / k, sum(b) / k
-        var_a = sum((m - ma) ** 2 for m in a) / (k - 1) if k > 1 else 0.0
-        var_b = sum((m - mb) ** 2 for m in b) / (k - 1) if k > 1 else 0.0
+        if n < 6:
+            continue           # fewer than two epochs per third: one point would decide
+        k = n // 3
+        a, b = sorted(m for _, m, _ in pts[:k]), sorted(m for _, m, _ in pts[-k:])
+        ma, mb = a[k // 2] if k % 2 else 0.5 * (a[k // 2 - 1] + a[k // 2]), \
+                 b[k // 2] if k % 2 else 0.5 * (b[k // 2 - 1] + b[k // 2])
+        var_a = sum((m - ma) ** 2 for m in a) / (k - 1)
+        var_b = sum((m - mb) ** 2 for m in b) / (k - 1)
         errs = sorted(e for _, _, e in pts if e is not None and e > 0)
         quoted = errs[len(errs) // 2] if errs else 0.05
         err = max(0.02, math.sqrt((var_a + var_b) / k), quoted * math.sqrt(2.0 / k))
@@ -721,7 +735,7 @@ def build_groups(observations, args, log, data_dir=None):
         # the most epochs decides the trend and the tags, but the largest
         # significant change of any band counts.
         bands = bands_of(dets) or [None]
-        stats_all = nightly_stats(dets)           # every band together: only for the "seen at all" questions
+        stats_all = nightly_stats(dets, min_epochs_off=True)   # every band, every night: "seen at all" only
         per_band = {}
         for band in bands:
             st = nightly_stats(dets, band)
@@ -784,8 +798,10 @@ def build_groups(observations, args, log, data_dir=None):
         # but a star well above the limit in one band is not 1 mag fainter
         # in the next.
         def night_mag(night):
+            # Only a night with enough epochs in some band can claim the
+            # source was really there (or really gone by then).
             vals = [pb[0][night][0] for pb in per_band.values() if night in pb[0]]
-            return min(vals) if vals else (stats_all[night][0] if night in stats_all else None)
+            return min(vals) if vals else None
         appeared = constraining(before, night_mag(first_night))
         disappeared = constraining(after, night_mag(last_night))
         score = transient_score(mag_bright, len(nights), n_points, max(p["q"] for p in dets),
@@ -1191,8 +1207,9 @@ def render_page(groups, observations, args, public_dir, generated):
         "at most 6 or 2; +4 when the source appeared, "
         "i.e. earlier frames of the field "
         f"went {LIMIT_MARGIN_MAG:g} mag deeper than it without showing it; +1 when it disappeared the same way). "
-        "Night-to-night changes are compared within one band, after removing each field's nightly zero-point "
-        "offset (the median over its sources with three or more nights). 'Missed' counts observations of the "
+        f"Night-to-night changes are compared within one band, between nightly medians of at least {MIN_EPOCHS_PER_NIGHT} "
+        "epochs, after removing each field's nightly zero-point offset (the median over its sources with three or "
+        "more nights); a single epoch never decides. 'Missed' counts observations of the "
         "field covering the position in which no frame detected anything there: before / between / after its "
         "detections; a night where the frames saw the star but the pipeline did not flag it is not a miss. "
         f"Sources are grouped by the field most of their observations were taken as; the best "

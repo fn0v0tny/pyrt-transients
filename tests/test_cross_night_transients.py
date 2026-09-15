@@ -362,3 +362,22 @@ def test_interesting_sources_take_the_cards_first(tmp_path):
     out = json.loads((public / "new_transients" / "new_transients.json").read_text())
     carded = [g for g in out["groups"] if g["card"]]
     assert len(carded) == 1 and carded[0]["appeared"] and carded[0]["changed"]
+
+
+def test_a_single_epoch_or_one_outlier_does_not_make_a_change():
+    def det(night, mags, day):
+        return {"night": night, "mag": 15.0, "magerr": 0.05,
+                "points": [[61000 + day + k / 1440, m, 0.03, "N"] for k, m in enumerate(mags)]}
+    # Night with one epoch 1.5 mag off: not a night.
+    stats = xn.nightly_stats([det("2026-09-10", [15.0] * 6, 0), det("2026-09-12", [13.5], 2)], "N")
+    assert list(stats) == ["2026-09-10"]
+    # One wild epoch among six: the median and its error ignore it.
+    stats = xn.nightly_stats([det("2026-09-10", [15.0] * 6, 0), det("2026-09-12", [15.0, 15.02, 13.0, 14.98, 15.01, 15.0], 2)], "N")
+    d, sig = xn.change_between_nights(stats)
+    assert d < 0.05
+    # The band-blind summary still lists the single-epoch night.
+    assert len(xn.nightly_stats([det("2026-09-10", [15.0] * 6, 0), det("2026-09-12", [13.5], 2)], min_epochs_off=True)) == 2
+    # Within a night: five epochs are too few for the thirds test; one outlier in nine is ignored.
+    assert xn.within_night_change([det("2026-09-10", [15.0, 15.0, 15.0, 13.0, 15.0], 0)]) == (0.0, 0.0)
+    delta, sig = xn.within_night_change([det("2026-09-10", [15.0] * 8 + [13.0], 0)])
+    assert abs(delta) < 0.05
