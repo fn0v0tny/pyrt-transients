@@ -16,11 +16,13 @@ xn = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(xn)
 
 
-def _make_obs(data_dir, obs_id, day, empty=False, dmag=0.0):
+def _make_obs(data_dir, obs_id, day, empty=False, dmag=0.0, keep_frame=False):
     """A copy of the 210619B observation moved to the night of 2026-09-<day>.
 
-    empty: the field was observed but nothing was found (header-only table,
-    no lightcurves). dmag: shift every magnitude in the lightcurve files.
+    empty: the field was observed but nothing was flagged (header-only
+    candidates table, no lightcurves); the afterglow's rows are dropped
+    from the frame too unless keep_frame (seen, but not flagged).
+    dmag: shift every magnitude in the lightcurve files.
     """
     obs_dir = data_dir / f"obs_{obs_id}"
     obs_dir.mkdir(parents=True)
@@ -30,7 +32,24 @@ def _make_obs(data_dir, obs_id, day, empty=False, dmag=0.0):
 
     ecsvs = sorted(f for f in FIXTURE.glob("*.ecsv")
                    if not f.name.endswith(("_transients.ecsv", "_lightcurve.ecsv")))
-    (obs_dir / ren(ecsvs[0].name)).write_text(ecsvs[0].read_text())
+    # The third frame is the first one that holds the afterglow.
+    frame = ecsvs[2].read_text()
+    if empty and not keep_frame:
+        # The field was observed but the afterglow was not there: drop its
+        # rows from the frame's detection table too (the crawler reads the
+        # frames to tell a miss from an unflagged detection).
+        kept, names = [], None
+        for ln in frame.splitlines():
+            if ln.startswith("#") or not ln.strip():
+                kept.append(ln); continue
+            parts = ln.split()
+            if names is None:
+                names = parts; kept.append(ln); continue
+            ra, dec = float(parts[names.index("ALPHA_J2000")]), float(parts[names.index("DELTA_J2000")])
+            if abs(ra - 319.7181) * 0.83 + abs(dec - 33.8504) > 0.003:
+                kept.append(ln)
+        frame = "\n".join(kept) + "\n"
+    (obs_dir / ren(ecsvs[2].name)).write_text(frame)
     (obs_dir / "detection_metadata.json").write_text(json.dumps(
         {"processed_files": [ren(f.name) for f in ecsvs]}))
     table = (FIXTURE / "candidates.tbl").read_text().splitlines()
@@ -92,7 +111,7 @@ def test_page_groups_same_source_on_two_nights(tmp_path):
     scores = [g["score"] for g in out["groups"]]
     assert scores == sorted(scores, reverse=True) and [g["rank"] for g in out["groups"]] == [1, 2, 3]
     g = out["groups"][0]
-    assert round(g["max_q"], 3) == 36.929 and g["field"] == "Gaia21azb"
+    assert round(g["max_q"], 3) == 36.929 and g["field"] == "GRB 210620.000 GCN #1056757"
     assert g["score_parts"]["brightness"] == pytest.approx(18 - g["mag_bright"], abs=0.01)
     assert g["score_parts"]["coverage"] == pytest.approx(2 + math.log2(1 + g["n_points"]), abs=0.01)
     assert g["nights"] == ["2026-09-09", "2026-09-11"] and g["obs_ids"] == ["1", "2", "3"]
@@ -119,7 +138,7 @@ def test_page_groups_same_source_on_two_nights(tmp_path):
     page = (public / "new_transients" / "index.html").read_text()
     assert "319.71811 +33.85042" in page and "../obs_1/index.html" in page and "grb" in page
     assert page.count("<svg class='lc'") == 3 and page.count("2026-09-09 ·") == 3 and page.count("2026-09-11 ·") == 3
-    assert page.count("<details class='field'") == 1 and "<b>Gaia21azb</b> — 3 sources" in page
+    assert page.count("<details class='field'") == 1 and "<b>GRB 210620.000 GCN #1056757</b> — 3 sources" in page
 
     # A rerun serves everything from the cache; with the forced target row kept
     # (quality 0.63 in the fixture) the pointing becomes a group of its own.
@@ -217,10 +236,17 @@ def test_change_and_appearance_from_field_history(tmp_path):
     _make_obs(data, "3", 10)                       # source at 11.4
     _make_obs(data, "4", 12, dmag=1.0)             # a magnitude fainter
     _make_obs(data, "5", 14, empty=True)           # gone again
+    _make_obs(data, "6", 16, empty=True, keep_frame=True)   # in the frame, not flagged: not a miss
     assert xn.main(["--data-dir", str(data), "--public-dir", str(public), "--days", "0", "-q"]) == 0
     out = json.loads((public / "new_transients" / "new_transients.json").read_text())
     g = out["groups"][0]
     assert g["n_missed_before"] == 2 and g["n_missed_after"] == 1 and g["n_missed_between"] == 0
+    assert g["n_present_unflagged"] == 1
+    # The other two fixture sources sit outside the covered part of the frames.
+    assert all(h["n_missed_before"] == 0 and h["n_present_unflagged"] == 0 for h in out["groups"][1:])
+    assert (data / xn.CELLS_DIR / "obs_1.bin").exists()
+    page = (public / "new_transients" / "index.html").read_text()
+    assert "detected but not flagged on 1 other night(s)" in page
     assert g["appeared"] is True and g["disappeared"] is True
     assert g["limit_before"] == pytest.approx(17.1, abs=0.05)
     assert g["changed"] is True and g["change_sigma"] > 5
@@ -261,3 +287,40 @@ def test_slow_decline_over_many_nights_is_a_trend():
     assert xn.night_trend({k: v for k, v in list(stats.items())[:2]}) is None
     steps = xn.change_between_nights(stats)
     assert steps[0] == pytest.approx(1.12, abs=0.02)   # first against last night, still caught
+
+
+def test_detection_cells_round_trip(tmp_path):
+    cells = {xn.cell_of(100.0, 20.0, 20.0), xn.cell_of(100.1, 20.1, 20.0)}
+    xn.save_cells(tmp_path, "obs_x", cells)
+    assert xn.load_cells(tmp_path, "obs_x") == cells
+    assert xn.load_cells(tmp_path, "obs_missing") is None
+    assert xn.detected_in(cells, 100.0 + 1.0 / 3600 / math.cos(math.radians(20.0)), 20.0, 20.0)  # 1" away
+    assert not xn.detected_in(cells, 100.0, 20.0 + 10.0 / 3600, 20.0)                           # 10" away
+
+
+def test_ensemble_offsets_remove_a_bad_night():
+    # Six constant stars; night 2 is 0.4 mag off for all of them (zero point).
+    dets_by_star = []
+    for k in range(6):
+        dets = []
+        for n in range(4):
+            off = 0.4 if n == 1 else 0.0
+            dets.append({"night": f"2026-09-{10 + n:02d}", "mag": 15.0 + k, "magerr": 0.05,
+                         "points": [[61000 + n + j / 1440, 15.0 + k + off + 0.01 * (j % 2), 0.03, "N"] for j in range(6)]})
+        dets_by_star.append(("F", dets))
+    offsets = xn.ensemble_offsets(dets_by_star)
+    assert offsets[("F", "2026-09-11", "N")] == pytest.approx(0.3, abs=0.01)   # 0.4 above the star's 4-night mean
+    dets = dets_by_star[0][1]
+    assert xn.change_between_nights(xn.nightly_stats(dets, "N"))[0] == pytest.approx(0.4, abs=0.02)
+    xn.apply_offsets(dets, "F", offsets)
+    assert xn.change_between_nights(xn.nightly_stats(dets, "N"))[0] < 0.15
+    assert xn.ensemble_offsets(dets_by_star[:3]) == {}                          # too few sources to vote
+
+
+def test_nightly_stats_keep_bands_apart():
+    dets = [{"night": "2026-09-10", "mag": 15.0, "magerr": 0.05,
+             "points": [[61000.0, 15.0, 0.03, "Sloan_r"]] * 4 + [[61000.1, 15.6, 0.03, "Sloan_i"]] * 4}]
+    assert xn.bands_of(dets) == ["Sloan_i", "Sloan_r"]
+    assert set(xn.nightly_stats(dets, "Sloan_r")) == {"2026-09-10"} and xn.nightly_stats(dets, "Sloan_r")["2026-09-10"][0] == 15.0
+    assert xn.nightly_stats(dets, "Sloan_i")["2026-09-10"][0] == pytest.approx(15.6)
+    assert xn.nightly_stats(dets, "V") == {}

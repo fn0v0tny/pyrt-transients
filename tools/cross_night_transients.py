@@ -210,6 +210,100 @@ def mjd_of(t):
     return t.timestamp() / 86400.0 + 40587.0
 
 
+# ------------------------------------------------------ detection cells
+
+CELL_ARCSEC = 3.0
+CELLS_DIR = ".new_transients_cells"
+
+
+def cell_of(ra, dec, dec0):
+    """Integer cell id of a position on a CELL_ARCSEC grid (RA scaled by
+    cos of the observation's centre declination)."""
+    c = CELL_ARCSEC / 3600.0
+    ix = int(math.floor(ra * math.cos(math.radians(dec0)) / c))
+    iy = int(math.floor((dec + 90.0) / c))
+    return ix * 4000000 + iy
+
+
+def frame_positions(path):
+    """(ra, dec) of every row of a pyrt detection ECSV, by text parsing."""
+    out = []
+    try:
+        with open(path, errors="replace") as fh:
+            names = None
+            for line in fh:
+                if line.startswith("#") or not line.strip():
+                    continue
+                parts = line.split()
+                if names is None:
+                    names = parts
+                    try:
+                        ia, id_ = names.index("ALPHA_J2000"), names.index("DELTA_J2000")
+                    except ValueError:
+                        return out
+                    continue
+                if len(parts) <= max(ia, id_):
+                    continue
+                try:
+                    out.append((float(parts[ia]), float(parts[id_])))
+                except ValueError:
+                    continue
+    except OSError:
+        pass
+    return out
+
+
+def scan_cells(obs_dir, dec0):
+    """Set of cells holding at least one detection in any frame of the
+    observation. What a frame detected is not what candidates.tbl lists:
+    a star matched to the catalogue on one night is absent from that
+    night's candidates without being undetected."""
+    cells = set()
+    try:
+        with os.scandir(obs_dir) as it:
+            frames = [e.path for e in it if e.name.endswith(".ecsv")
+                      and not e.name.endswith(("_transients.ecsv", "_lightcurve.ecsv"))]
+    except OSError:
+        return cells
+    for path in frames:
+        for ra, dec in frame_positions(path):
+            cells.add(cell_of(ra, dec, dec0))
+    return cells
+
+
+def save_cells(data_dir, obs_name, cells):
+    import array
+    d = data_dir / CELLS_DIR
+    d.mkdir(exist_ok=True)
+    arr = array.array("q", sorted(cells))
+    tmp = d / f"{obs_name}.tmp"
+    with open(tmp, "wb") as fh:
+        arr.tofile(fh)
+    os.replace(tmp, d / f"{obs_name}.bin")
+
+
+def load_cells(data_dir, obs_name):
+    import array
+    path = data_dir / CELLS_DIR / f"{obs_name}.bin"
+    try:
+        arr = array.array("q")
+        with open(path, "rb") as fh:
+            arr.frombytes(fh.read())
+        return set(arr)
+    except OSError:
+        return None
+
+
+def detected_in(cells, ra, dec, dec0):
+    """Was anything detected within about one cell of (ra, dec)?"""
+    c = CELL_ARCSEC / 3600.0
+    for dra in (-c, 0.0, c):
+        for ddec in (-c, 0.0, c):
+            if cell_of(ra + dra / max(1e-6, math.cos(math.radians(dec0))), dec + ddec, dec0) in cells:
+                return True
+    return False
+
+
 # ------------------------------------------------------------------- crawl
 
 def scan_observation(obs_dir):
@@ -296,6 +390,7 @@ def crawl(data_dir, days, log):
             n_cached += 1
         else:
             entry = {"mtime": st.st_mtime, **scan_observation(obs_dir)}
+            entry.pop("cells_mtime", None)
             cache[name] = entry
             n_read += 1
         # The frame time, not the table's mtime, decides whether a night is
@@ -311,6 +406,20 @@ def crawl(data_dir, days, log):
         elif cutoff and st.st_mtime < cutoff:
             continue
         observations.append(entry)
+    # Detection cells (every frame's sources) only for the observations in
+    # the window: reading the frames is the slow part (about 2 s per
+    # observation), and only these are ever asked about.
+    n_cells = 0
+    for entry in observations:
+        name = f"obs_{entry['facts']['obs_id']}"
+        if entry.get("cells_mtime") == entry["mtime"] and (data_dir / CELLS_DIR / f"{name}.bin").exists():
+            continue
+        dec0 = entry["facts"]["center"][1]
+        save_cells(data_dir, name, scan_cells(data_dir / name, 0.0 if dec0 is None else dec0))
+        entry["cells_mtime"] = entry["mtime"]
+        n_cells += 1
+        if n_cells % 50 == 0:
+            log(f"  detection cells: {n_cells} observations read")
     live = {name for name in dirs}
     cache = {k: v for k, v in cache.items() if k in live}
     try:
@@ -320,8 +429,8 @@ def crawl(data_dir, days, log):
     except OSError as e:
         log(f"cache not written: {e}")
     log(f"{len(dirs)} observation dirs, {n_read} read, {n_cached} from cache, "
-        f"{len(observations)} within {days} days" if days else
-        f"{len(dirs)} observation dirs, {n_read} read, {n_cached} from cache")
+        + (f"{len(observations)} within {days} days, " if days else "")
+        + f"detection cells built for {n_cells}")
     return observations
 
 
@@ -388,15 +497,20 @@ def n_pts_total(dets):
     return sum(len(p["points"]) for p in dets)
 
 
-def nightly_stats(dets):
-    """{night: (mean mag, error of the mean, n)} from every epoch of the
-    night. The error is the scatter over sqrt(n), never below 0.02 mag or
-    below the median quoted error over sqrt(n)."""
+def nightly_stats(dets, band=None):
+    """{night: (mean mag, error of the mean, n, mean mjd)} from every epoch
+    of the night, in one band (the points' band; None takes them all). The
+    error is the scatter over sqrt(n), never below 0.02 mag or below the
+    median quoted error over sqrt(n). Two nights are only comparable in the
+    same band: a clear frame calibrated to Sloan r and one to Sloan i
+    differ by the star's colour, not by variability."""
     by_night = {}
     for p in dets:
-        pts = [(pt[1], pt[2], pt[0]) for pt in p["points"]] or (
-            [(p["mag"], _finite(p["magerr"]), None)] if math.isfinite(p["mag"]) and p["mag"] < 90 else [])
-        by_night.setdefault(p["night"], []).extend(pts)
+        pts = [(pt[1], pt[2], pt[0]) for pt in p["points"] if band is None or pt[3] == band] or (
+            [(p["mag"], _finite(p["magerr"]), None)]
+            if band is None and math.isfinite(p["mag"]) and p["mag"] < 90 else [])
+        if pts:
+            by_night.setdefault(p["night"], []).extend(pts)
     out = {}
     for night, pts in by_night.items():
         mags = [m for m, _, _ in pts]
@@ -446,6 +560,48 @@ def change_between_nights(stats):
     return best
 
 
+def bands_of(dets):
+    """Bands of the group's points, most epochs first."""
+    counts = {}
+    for p in dets:
+        for pt in p["points"]:
+            counts[pt[3]] = counts.get(pt[3], 0) + 1
+    return sorted(counts, key=lambda b: (-counts[b], b))
+
+
+def ensemble_offsets(groups_dets, min_sources=5):
+    """{(field, night, band): median offset} of the field's nightly means
+    from each source's own mean over its nights, in mag. A night whose
+    zero point sits 0.2 mag off for every star (a clear filter under a
+    different sky, an airmass term) would otherwise make every star of the
+    field "changed". Sources need three nights in the band to vote, a
+    night needs min_sources votes to get an offset."""
+    votes = {}
+    for field, dets in groups_dets:
+        for band in bands_of(dets):
+            stats = nightly_stats(dets, band)
+            if len(stats) < 3:
+                continue
+            mean_all = sum(v[0] for v in stats.values()) / len(stats)
+            for night, v in stats.items():
+                votes.setdefault((field, night, band), []).append(v[0] - mean_all)
+    out = {}
+    for key, vals in votes.items():
+        if len(vals) >= min_sources:
+            vals.sort()
+            out[key] = vals[len(vals) // 2]
+    return out
+
+
+def apply_offsets(dets, field, offsets):
+    """Subtract the field's nightly offsets from the points (in place)."""
+    for p in dets:
+        for pt in p["points"]:
+            off = offsets.get((field, p["night"], pt[3]))
+            if off:
+                pt[1] -= off
+
+
 def within_night_change(dets):
     """Largest change inside one night: the mean of the first third of the
     night's epochs against the mean of the last third (single bad epochs do
@@ -480,20 +636,31 @@ CHANGE_MIN_SIGMA = 5.0
 LIMIT_MARGIN_MAG = 1.0     # a non-detection counts when the source would have been this far above the limit
 
 
-def non_detections(group_dets, ra, dec, observations, detected_obs):
-    """Observations covering (ra, dec) in which the source is not in
-    candidates.tbl, with the frame limit, oldest first."""
-    out = []
+def non_detections(group_dets, ra, dec, observations, detected_obs, data_dir, cells_cache):
+    """(missed, present): observations covering (ra, dec) in which the
+    source is not among the candidates. `missed` are those where no frame
+    detected anything at the position (with the frame limit); `present`
+    are those where the frames did detect it but the pipeline did not
+    flag it (a catalogue-matched night). Both oldest first."""
+    missed, present = [], []
     for obs in observations:
         f = obs["facts"]
         if f["obs_id"] in detected_obs or not covers(f, ra, dec):
             continue
-        out.append({"obs_id": f["obs_id"], "night": f["nights"][0] if f["nights"] else "",
-                    "object": f["object"], "maglim": f.get("maglim"), "first": f["first"]})
-    return sorted(out, key=lambda d: d["night"])
+        name = f"obs_{f['obs_id']}"
+        cells = cells_cache.get(name)
+        if cells is None:
+            cells = load_cells(data_dir, name) if data_dir is not None else None
+            cells_cache[name] = cells if cells is not None else set()
+        dec0 = f["center"][1] if f.get("center") and f["center"][1] is not None else dec
+        rec = {"obs_id": f["obs_id"], "night": f["nights"][0] if f["nights"] else "",
+               "object": f["object"], "maglim": f.get("maglim"), "first": f["first"]}
+        (present if cells and detected_in(cells, ra, dec, dec0) else missed).append(rec)
+    return sorted(missed, key=lambda d: d["night"]), sorted(present, key=lambda d: d["night"])
 
 
 def build_groups(observations, args, log, data_dir=None):
+    cells_cache = {}
     points = []
     for obs in observations:
         facts = obs["facts"]
@@ -504,13 +671,25 @@ def build_groups(observations, args, log, data_dir=None):
                 continue
             points.append({**row, "obs": facts})
     log(f"{len(points)} candidates kept for clustering")
-    groups = []
+    clusters = []
     for members in cluster(points, args.radius):
         dets = sorted((points[i] for i in members), key=lambda p: (p["night"], p["obs"]["obs_id"]))
         nights = sorted({p["night"] for p in dets if p["night"]})
-        obs_ids = sorted({p["obs"]["obs_id"] for p in dets})
         if len(nights) < args.min_nights:
             continue
+        for p in dets:
+            p["points"] = detection_points(p, data_dir)
+        clusters.append((dominant_field(dets), dets))
+    offsets = ensemble_offsets([(f, d) for f, d in clusters]) if not args.no_ensemble else {}
+    if offsets:
+        big = sorted(offsets.items(), key=lambda kv: -abs(kv[1]))[:3]
+        log(f"{len(offsets)} field/night/band zero-point offsets removed, largest: "
+            + ", ".join(f"{k[0]} {k[1]} {k[2]} {v:+.2f}" for k, v in big))
+    groups = []
+    for field, dets in clusters:
+        apply_offsets(dets, field, offsets)
+        nights = sorted({p["night"] for p in dets if p["night"]})
+        obs_ids = sorted({p["obs"]["obs_id"] for p in dets})
         # One detection per observation is the norm; the pipeline may split a
         # source into two rows, in which case both are listed.
         w = [max(p["q"], 0.1) for p in dets]
@@ -518,14 +697,22 @@ def build_groups(observations, args, log, data_dir=None):
         dec = sum(p["dec"] * wi for p, wi in zip(dets, w)) / sum(w)
         scatter = max(angular_sep_arcsec(p["ra"], p["dec"], ra, dec) for p in dets)
         mags = [p["mag"] for p in dets if math.isfinite(p["mag"]) and p["mag"] < 90]
-        for p in dets:
-            p["points"] = detection_points(p, data_dir)
-        stats = nightly_stats(dets)
+        # Night-to-night comparisons in one band at a time; the band with
+        # the most epochs decides the trend and the tags, but the largest
+        # significant change of any band counts.
+        bands = bands_of(dets) or [None]
+        stats_all = nightly_stats(dets)           # every band, for the summary numbers
+        per_band = {}
+        for band in bands:
+            st = nightly_stats(dets, band)
+            per_band[band] = (st, change_between_nights(st), night_trend(st))
+        main_band = bands[0]
+        stats = per_band[main_band][0] or stats_all
         night_order = sorted(stats)
         night_mags = [stats[n][0] for n in night_order]
-        d_nights, s_nights = change_between_nights(stats)
+        d_nights, s_nights = max((pb[1] for pb in per_band.values()), key=lambda t: t[1], default=(0.0, 0.0))
         d_within, s_within = within_night_change(dets)
-        trend_fit = night_trend(stats)
+        trend_fit = max((pb[2] for pb in per_band.values() if pb[2]), key=lambda f: f["sigma"], default=None)
         # A slow, steady decline or rise (a supernova over weeks) shows as a
         # significant slope even when single steps are small.
         slope_changed = bool(trend_fit) and trend_fit["sigma"] >= CHANGE_MIN_SIGMA and \
@@ -538,6 +725,8 @@ def build_groups(observations, args, log, data_dir=None):
         delta_mag, change_sigma = max(cands or [(d_nights, s_nights), (abs(d_within), s_within)])
         change_kind = ("between nights" if nights_changed and (not within_changed or d_nights >= abs(d_within))
                        else "within a night" if within_changed else "")
+        if change_kind and len(bands) > 1:
+            change_kind += f", {main_band}"
         trend = ""
         if not changed:
             trend = "steady" if len(night_mags) >= 2 or n_pts_total(dets) >= 4 else ""
@@ -559,7 +748,8 @@ def build_groups(observations, args, log, data_dir=None):
         # Nights the field was observed without this source. A non-detection
         # is constraining when the frame went LIMIT_MARGIN_MAG deeper than
         # the source's magnitude on its nearest detected night.
-        missed = non_detections(dets, ra, dec, observations, set(obs_ids)) if nights else []
+        missed, present = (non_detections(dets, ra, dec, observations, set(obs_ids), data_dir, cells_cache)
+                           if nights else ([], []))
         first_night, last_night = nights[0], nights[-1]
         before = [m for m in missed if m["night"] and m["night"] < first_night]
         after = [m for m in missed if m["night"] and m["night"] > last_night]
@@ -569,8 +759,8 @@ def build_groups(observations, args, log, data_dir=None):
         def constraining(missed_list, mag):
             return [m for m in missed_list if m["maglim"] is not None and mag is not None
                     and m["maglim"] - LIMIT_MARGIN_MAG >= mag]
-        appeared = constraining(before, stats[first_night][0] if first_night in stats else None)
-        disappeared = constraining(after, stats[last_night][0] if last_night in stats else None)
+        appeared = constraining(before, stats_all[first_night][0] if first_night in stats_all else None)
+        disappeared = constraining(after, stats_all[last_night][0] if last_night in stats_all else None)
         score = transient_score(mag_bright, len(nights), n_points, max(p["q"] for p in dets),
                                 delta_mag if changed else 0.0, bool(appeared), bool(disappeared))
         groups.append({
@@ -581,8 +771,12 @@ def build_groups(observations, args, log, data_dir=None):
             "slope_mag_per_day": round(trend_fit["slope"], 4) if trend_fit else None,
             "slope_sigma": round(trend_fit["sigma"], 1) if trend_fit else None,
             "span_days": round(trend_fit["span_days"], 1) if trend_fit else None,
-            "nightly": {n: [round(stats[n][0], 3), round(stats[n][1], 3), stats[n][2]] for n in night_order},
+            "nightly": {n: [round(v[0], 3), round(v[1], 3), v[2]] for n, v in sorted(stats_all.items())},
+            "bands": bands if bands != [None] else [],
+            "offsets_applied": {f"{n} {b}": round(offsets[(field, n, b)], 3) for n in nights for b in bands
+                                if (field, n, b) in offsets},
             "n_missed_before": len(before), "n_missed_after": len(after), "n_missed_between": len(between),
+            "n_present_unflagged": len(present),
             "appeared": bool(appeared), "disappeared": bool(disappeared),
             "limit_before": max((m["maglim"] for m in before if m["maglim"] is not None), default=None),
             "limit_after": max((m["maglim"] for m in after if m["maglim"] is not None), default=None),
@@ -867,19 +1061,25 @@ def render_card(g, public_dir):
         change_txt += (f", trend {g['slope_mag_per_day']:+.3f} mag/day over {g['span_days']:.0f} days "
                        f"({g['slope_sigma']:.0f}σ)")
     missed_txt = ""
-    if g["n_missed_before"] or g["n_missed_after"] or g["n_missed_between"]:
-        bits = []
-        if g["n_missed_before"]:
-            bits.append(f"not in {g['n_missed_before']} earlier frame(s) of the field"
-                        + (f" (deepest limit {g['limit_before']:.1f})" if g["limit_before"] is not None else ""))
-        if g["n_missed_between"]:
-            bits.append(f"missed on {g['n_missed_between']} night(s) in between")
-        if g["n_missed_after"]:
-            bits.append(f"not in {g['n_missed_after']} later frame(s)"
-                        + (f" (deepest limit {g['limit_after']:.1f})" if g["limit_after"] is not None else ""))
-        missed_txt = "<div class='meta'>" + e("; ".join(bits)) + ". Nights: " + ", ".join(
-            f"<a href='../obs_{e(m['obs_id'])}/index.html'>{e(m['night'])}</a>"
-            + (f" &gt;{m['maglim']:.1f}" if m["maglim"] is not None else "") for m in g["missed"]) + "</div>"
+    bits = []
+    any_missed = g["n_missed_before"] or g["n_missed_after"] or g["n_missed_between"]
+    if g["n_missed_before"]:
+        bits.append(f"not in {g['n_missed_before']} earlier frame(s) of the field"
+                    + (f" (deepest limit {g['limit_before']:.1f})" if g["limit_before"] is not None else ""))
+    if g["n_missed_between"]:
+        bits.append(f"missed on {g['n_missed_between']} night(s) in between")
+    if g["n_missed_after"]:
+        bits.append(f"not in {g['n_missed_after']} later frame(s)"
+                    + (f" (deepest limit {g['limit_after']:.1f})" if g["limit_after"] is not None else ""))
+    if g.get("n_present_unflagged"):
+        bits.append(f"detected but not flagged on {g['n_present_unflagged']} other night(s)")
+    if bits:
+        missed_txt = "<div class='meta'>" + e("; ".join(bits)) + "."
+        if any_missed:
+            missed_txt += " Missed nights: " + ", ".join(
+                f"<a href='../obs_{e(m['obs_id'])}/index.html'>{e(m['night'])}</a>"
+                + (f" &gt;{m['maglim']:.1f}" if m["maglim"] is not None else "") for m in g["missed"])
+        missed_txt += "</div>"
     parts = [
         f"<div class='group' id='g{g['rank']}'><h2>#{g['rank']} &nbsp; {ra:.5f} {dec:+.5f} "
         f"<small>({e(sexagesimal(ra, dec))})</small>{tags}"
@@ -924,7 +1124,8 @@ def render_row(g):
             f"<td class='num'>{g['dec']:+.5f}</td><td class='num'>{g['n_nights']}</td><td class='num'>{g['n_obs']}</td>"
             f"<td class='num'>{g['n_points']}</td><td class='num'>{e(_mag_span(g))}</td>"
             f"<td class='num'>{g['delta_mag']:.2f}</td><td class='num'>{g['change_sigma']:.0f}</td>"
-            f"<td class='num'>{g['n_missed_before']}/{g['n_missed_between']}/{g['n_missed_after']}</td>"
+            f"<td class='num'>{g['n_missed_before']}/{g['n_missed_between']}/{g['n_missed_after']}"
+            + (f" (+{g['n_present_unflagged']} seen)" if g.get('n_present_unflagged') else "") + "</td>"
             f"<td class='num'>{g['max_q']:.2f}</td>"
             f"<td>{e(' '.join(t for t in (g['trend'], 'appeared' if g['appeared'] else '', 'disappeared' if g['disappeared'] else '') if t))}</td>"
             f"<td>{sites}</td></tr>")
@@ -951,8 +1152,10 @@ def render_page(groups, observations, args, public_dir, generated):
         f"it is at least {CHANGE_MIN_MAG:g} mag and {CHANGE_MIN_SIGMA:g}σ, at most 6; +4 when the source appeared, "
         "i.e. earlier frames of the field "
         f"went {LIMIT_MARGIN_MAG:g} mag deeper than it without showing it; +2 when it disappeared the same way). "
-        "'Missed' counts frames of the field covering the position without the source: before / between / after "
-        "its detections. "
+        "Night-to-night changes are compared within one band, after removing each field's nightly zero-point "
+        "offset (the median over its sources with three or more nights). 'Missed' counts observations of the "
+        "field covering the position in which no frame detected anything there: before / between / after its "
+        "detections; a night where the frames saw the star but the pipeline did not flag it is not a miss. "
         f"Sources are grouped by the field most of their observations were taken as; the best "
         f"{args.per_field} of each field get a card with the stitched lightcurve (at most {args.max_cards} "
         f"cards in all), the rest of the field is a table of at most {args.max_rows} lines. "
@@ -1019,6 +1222,8 @@ def main(argv=None):
     ap.add_argument("--max-rows", type=int, default=100, help="table lines per field for the other sources (0 = all)")
     ap.add_argument("--open-fields", type=int, default=5, help="field sections open when the page loads")
     ap.add_argument("--include-forced", action="store_true", help="keep the NUMBER 0 forced target rows")
+    ap.add_argument("--no-ensemble", action="store_true",
+                    help="do not remove per-field nightly zero-point offsets before looking for change")
     ap.add_argument("--title", default="Transients seen on more than one night")
     ap.add_argument("-q", "--quiet", action="store_true")
     args = ap.parse_args(argv)

@@ -2,7 +2,8 @@
 """Does proper-motion propagation put the catalogue's high-pm stars on the
 detections? Read-only check on processed observation directories.
 
-  pm_check.py [--catalog gaia] [--pm-min 100] [--cache-dir DIR] obs_dir [obs_dir ...]
+  pm_check.py [--catalog gaia] [--pm-min 100] [--cache-dir DIR] [--cache-only]
+              obs_dir [obs_dir ...]
 
 For one detection table per observation (the middle one) the catalogue is
 loaded the way the pipeline loads it (disk cache under --cache-dir, default
@@ -45,15 +46,69 @@ def middle_table(obs_dir):
     return det[np.isfinite(det["MAG_CALIB"])] if "MAG_CALIB" in det.colnames else None
 
 
-def check(obs_dir, catalog_name, pm_min):
+def cached_catalog(cache_dir, catalog_name, ra0, dec0, half):
+    """The pipeline's own cached table covering (ra0, dec0), as a CatTransients,
+    or None. Used when the service is down (the Gaia archive was in
+    maintenance the first time this ran on the production host) or with
+    --cache-only. The cache key depends on the exact query the pipeline
+    made, so the pickles are scanned for coverage instead of looked up."""
+    import pickle
+    best = None
+    for f in sorted(Path(cache_dir, catalog_name).glob("*.pkl")):
+        try:
+            t = pickle.load(open(f, "rb"))
+        except Exception:
+            continue
+        t = t if hasattr(t, "colnames") else (t.get("data", t.get("table")) if isinstance(t, dict) else None)
+        if t is None or "radeg" not in t.colnames or len(t) == 0:
+            continue
+        ra, dec = np.asarray(t["radeg"], float), np.asarray(t["decdeg"], float)
+        cosd = np.cos(np.radians(dec0))
+        inside = (np.abs((ra - ra0) * cosd) < half) & (np.abs(dec - dec0) < half)
+        # Covers the field if its stars span the whole box (not just a corner).
+        if inside.sum() < 50:
+            continue
+        span_ra = (ra[inside].max() - ra[inside].min()) * cosd
+        span_dec = dec[inside].max() - dec[inside].min()
+        if span_ra < 1.6 * half or span_dec < 1.6 * half:
+            continue
+        if best is None or inside.sum() > best[0]:
+            best = (int(inside.sum()), t, f.name)
+    if best is None:
+        return None
+    n, t, name = best
+    cat = CatTransients(t)
+    cat.meta.update(t.meta if hasattr(t, "meta") else {})
+    cat.meta.setdefault("catalog", catalog_name)
+    if cat.catalog_epoch() is None:
+        cat.meta["astepoch"] = {"usno": 2000.0, "atlas": 2015.5}.get(
+            next((k for k in ("usno", "atlas") if k in catalog_name), ""), 2016.0)
+    cat.precompute_photometric_data()
+    logging.disable(logging.NOTSET)
+    print(f"    (catalogue {catalog_name} from cache file {name}, {n} stars in the box)", file=sys.stderr)
+    logging.disable(logging.CRITICAL)
+    return cat
+
+
+def check(obs_dir, catalog_name, pm_min, cache_dir=None, cache_only=False):
     det = middle_table(obs_dir)
     if det is None or len(det) == 0:
         return None
     ra0, dec0 = float(np.median(det["ALPHA_J2000"])), float(np.median(det["DELTA_J2000"]))
     half = 0.5 * float(det.meta.get("FIELD", 0.3)) * 2 + 0.05
-    params = QueryParams(ra=ra0, dec=dec0, width=half, height=half, mlim=20.0)
-    cat = CatTransients(catalog=catalog_name, **params.__dict__)
-    cat.precompute_photometric_data()
+    cat = None
+    if not cache_only:
+        try:
+            params = QueryParams(ra=ra0, dec=dec0, width=half, height=half, mlim=20.0)
+            cat = CatTransients(catalog=catalog_name, **params.__dict__)
+            cat.precompute_photometric_data()
+        except Exception as e:
+            print(f"    (query failed: {e}; trying the cache)", file=sys.stderr)
+            cat = None
+    if cat is None and cache_dir:
+        cat = cached_catalog(cache_dir, catalog_name, ra0, dec0, half)
+    if cat is None:
+        raise RuntimeError("no catalogue: query failed and nothing cached covers the field")
     epoch = cat.observation_epoch(det.meta)
     res = {}
     for prop in (False, True):
@@ -100,6 +155,7 @@ def main(argv=None):
     ap.add_argument("--pm-min", type=float, default=100.0, help="mas/yr")
     ap.add_argument("--cache-dir", default=str(Path.home() / "catalog_cache"))
     ap.add_argument("-v", "--verbose", action="store_true", help="list every high-pm star")
+    ap.add_argument("--cache-only", action="store_true", help="never query; use the pipeline's cached tables")
     args = ap.parse_args(argv)
     logging.disable(logging.CRITICAL)
     warnings.filterwarnings("ignore")
@@ -109,7 +165,7 @@ def main(argv=None):
     tot = dict.fromkeys(("hpm", "at_prop", "at_cat", "neither", "new_off", "new_on", "removed", "created"), 0)
     for obs_dir in args.obs_dirs:
         try:
-            r = check(obs_dir, args.catalog, args.pm_min)
+            r = check(obs_dir, args.catalog, args.pm_min, cache_dir=args.cache_dir, cache_only=args.cache_only)
         except Exception as e:
             print(f"{Path(obs_dir).name:14} failed: {e}")
             continue
