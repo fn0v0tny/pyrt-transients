@@ -226,6 +226,17 @@ class DetectionConfig:
     high_pm_threshold_masyr: float = 50.0
     high_pm_match_radius_arcsec: float = 3.0
 
+    # Known-galaxy label (detection/blind_multicatalog/galaxy_flag.py) on the
+    # final candidates: 'galaxy' when a Legacy Survey DR10 / Pan-STARRS
+    # extended source sits under the candidate at a total magnitude the
+    # detection doesn't exceed by more than galaxy_host_margin_mag; 'host'
+    # when it does (a transient on its galaxy). Labels only, never removes;
+    # 'galaxy' candidates don't count toward stacking_score_threshold.
+    galaxy_flag_enabled: bool = True
+    galaxy_flag_catalogs: List[str] = field(default_factory=lambda: ["legacysurvey", "panstarrs"])
+    galaxy_match_radius_arcsec: float = 2.0
+    galaxy_host_margin_mag: float = 0.75
+
     # Detection strategy: "blind_multicatalog" (cross-match against reference
     # catalogs, the only strategy today) or "subtraction" (differencing
     # against a template -- see detection/subtraction/). Kept as a plain str

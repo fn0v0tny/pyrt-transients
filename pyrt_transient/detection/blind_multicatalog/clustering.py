@@ -29,6 +29,9 @@ from pyrt_transient.config_trans import DetectionConfig
 from pyrt_transient.core.union_find import UnionFind
 from pyrt_transient.core.matching import match_radius
 from pyrt_transient.core.scoring import add_score_probability, apply_lightcurve_score_factor
+from pyrt_transient.detection.blind_multicatalog.galaxy_flag import (
+    band_for_filter, flag_known_galaxies,
+)
 from pyrt_transient.detection.blind_multicatalog.stdpipe_filters import (
     apply_skybot_filter,
     apply_vsx_filter,
@@ -934,6 +937,21 @@ def combine_with_lightcurves(
                 result_table = result_table[quality_keep]
                 surviving_ids = set(str(t) for t in result_table['transient_id'])
                 lightcurves = {k: v for k, v in lightcurves.items() if k in surviving_ids}
+
+        # Known-galaxy label: annotates, never removes (a transient on its
+        # host must survive) -- see galaxy_flag.py. After the quality gate
+        # so only the candidates that are kept cost a catalogue query.
+        if config and config.detection.galaxy_flag_enabled and len(result_table) > 0:
+            phfilter = next((t.meta.get("PHFILTER") for t in detection_tables
+                             if t.meta.get("PHFILTER")), None)
+            result_table = flag_known_galaxies(
+                result_table,
+                band=band_for_filter(phfilter),
+                catalogs=config.detection.galaxy_flag_catalogs,
+                match_radius_arcsec=config.detection.galaxy_match_radius_arcsec,
+                host_margin_mag=config.detection.galaxy_host_margin_mag,
+                cache_dir=data_dir,
+            )
 
         # Trail detection summary logging
         if 'candidate_type' in result_table.colnames:
