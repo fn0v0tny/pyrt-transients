@@ -124,6 +124,11 @@ const transientViewer = {
             <input type="checkbox" id="variableOnly" onchange="transientViewer.filterCandidates()">
             Variable only
           </label>
+          <br>
+          <label style="font-size: 0.8em; cursor: pointer;">
+            <input type="checkbox" id="hideGalaxies" onchange="transientViewer.filterCandidates()">
+            Hide catalogued galaxies (${this.candidates.filter(c => c.galaxy_flag === 'galaxy').length})
+          </label>
         </div>
       </div>
     `;
@@ -135,11 +140,13 @@ const transientViewer = {
     }
     
     const variableOnly = document.getElementById('variableOnly')?.checked;
+    const hideGalaxies = document.getElementById('hideGalaxies')?.checked;
     
     this.filteredCandidates = this.candidates.filter(candidate => {
       const typeMatch = this.currentFilter === 'all' || candidate.candidate_type === this.currentFilter;
       const variableMatch = !variableOnly || candidate.is_variable === true || candidate.is_variable === 'True';
-      return typeMatch && variableMatch;
+      const galaxyMatch = !hideGalaxies || candidate.galaxy_flag !== 'galaxy';
+      return typeMatch && variableMatch && galaxyMatch;
     });
     
     this.renderCandidateList();
@@ -155,6 +162,21 @@ const transientViewer = {
     
     const type = types[candidateType] || types['new'];
     return `<span class="candidate-type-badge" style="background-color: ${type.color}; color: white; padding: 2px 6px; border-radius: 3px; font-size: 0.7em; font-weight: bold; margin-left: 5px;">${type.icon} ${type.label}</span>`;
+  },
+
+  // galaxy_flag from galaxy_flag.py: 'galaxy' = a catalogued galaxy at its
+  // own brightness (constant source), 'host' = brighter than its galaxy.
+  getGalaxyBadge(candidate) {
+    const flag = candidate.galaxy_flag;
+    if (flag !== 'galaxy' && flag !== 'host') return '';
+    const mag = candidate.galaxy_mag, sep = candidate.galaxy_sep_arcsec;
+    const title = `${candidate.galaxy_catalog || ''} galaxy` +
+      (mag != null ? `, ${Number(mag).toFixed(2)} mag` : '') +
+      (sep != null ? `, ${Number(sep).toFixed(1)}" away` : '');
+    const style = flag === 'galaxy'
+      ? { color: '#7f8c8d', label: '🌌 Galaxy' }
+      : { color: '#16a085', label: '🌌 On host' };
+    return `<span class="galaxy-badge" title="${title}" style="background-color: ${style.color}; color: white; padding: 2px 6px; border-radius: 3px; font-size: 0.7em; font-weight: bold; margin-left: 5px;">${style.label}</span>`;
   },
 
   renderCandidateList(append = false) {
@@ -191,6 +213,7 @@ const transientViewer = {
             ${candidate.id}
             ${hasLightcurve ? '<span style="color: #27ae60; font-size: 0.8em;">📈</span>' : ''}
             ${this.getCandidateTypeBadge(candidateType)}
+            ${this.getGalaxyBadge(candidate)}
           </div>
           <div class="candidate-info">
             <div>Mag: ${Number(candidate.MAG_CALIB ?? candidate.mag_weighted_mean ?? 0).toFixed(2)}</div>
@@ -576,7 +599,7 @@ const transientViewer = {
         <table class="properties-table">
           <tr>
             <th>Type:</th>
-            <td>${this.getCandidateTypeBadge(candidate.candidate_type || 'new')}</td>
+            <td>${this.getCandidateTypeBadge(candidate.candidate_type || 'new')}${this.getGalaxyBadge(candidate)}</td>
             <th>Quality:</th>
             <td>${Number(candidate.quality_score ?? 0).toFixed(3)}${
               candidate.p_real !== undefined && candidate.p_real !== null && !Number.isNaN(Number(candidate.p_real))

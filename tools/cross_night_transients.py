@@ -44,8 +44,9 @@ What it does
 - Scores each source: brightness (18 - brightest nightly mean magnitude,
   0..10) + coverage (2 per extra night + log2 of the measured epochs) +
   quality (log10 of the best pipeline quality score, at most 2) + change
-  (3 x the significant night-to-night change, at most 6, +4 appeared,
-  +2 disappeared), so the bright, well covered and changing come first.
+  (3 x a significant brightening of at least 1 mag, at most 6, 1 x a
+  fading, +4 appeared, +1 disappeared), so the bright, well covered, new
+  and brightening come first.
 - Writes <out-dir>/new_transients.json and <out-dir>/index.html. The page
   groups the sources by the field most of their observations were taken
   as (the OBJECT header). Each field is a collapsible section with the
@@ -150,6 +151,20 @@ def night_of(t):
     return (t - timedelta(hours=12)).strftime("%Y-%m-%d")
 
 
+def frame_rows(path):
+    """Number of data rows of a detection ECSV (a cheap depth check: a
+    5-second frame with 30 detections proves nothing about a 12 mag star)."""
+    n = 0
+    try:
+        with open(path, errors="replace") as fh:
+            for line in fh:
+                if not line.startswith("#") and line.strip():
+                    n += 1
+    except OSError:
+        return 0
+    return max(0, n - 1)
+
+
 def first_science_ecsv(obs_dir):
     try:
         with os.scandir(obs_dir) as it:
@@ -179,6 +194,10 @@ def normalise_band(band):
     return b
 
 
+MAG_SANE_MIN, MAG_SANE_MAX = 4.0, 24.0   # anything outside is a calibration failure, not a star
+MAGERR_SANE_MAX = 0.5
+
+
 def read_lightcurve(path, default_band=""):
     """[[mjd, mag, magerr, band], ...] from a <transient_id>_lightcurve.ecsv.
 
@@ -203,8 +222,8 @@ def read_lightcurve(path, default_band=""):
         if len(row) < len(header):
             continue
         mag, mjd = _float(row[col["MAG_CALIB"]]), _float(row[col["mjd"]])
-        if not (math.isfinite(mag) and math.isfinite(mjd)) or mag > 90:
-            continue
+        if not (math.isfinite(mag) and math.isfinite(mjd)) or not (MAG_SANE_MIN < mag < MAG_SANE_MAX):
+            continue        # 99 = not measured; -28 = a frame whose calibration failed
         band = ""
         for key in ("phot_filter", "filter"):
             if key in col and row[col[key]] not in ("", "nan", "None"):
@@ -213,6 +232,8 @@ def read_lightcurve(path, default_band=""):
         if not band and "source_file" in col:
             band = band_of_frame(Path(row[col["source_file"]]).name)
         err = _float(row[col["MAGERR_CALIB"]]) if "MAGERR_CALIB" in col else float("nan")
+        if math.isfinite(err) and err > MAGERR_SANE_MAX:
+            continue
         points.append([mjd, mag, _finite(err), normalise_band(band or default_band)])
     points.sort()
     return points
@@ -230,7 +251,9 @@ CELLS_DIR = ".new_transients_cells"
 
 def cell_of(ra, dec, dec0):
     """Integer cell id of a position on a CELL_ARCSEC grid (RA scaled by
-    cos of the observation's centre declination)."""
+    cos of the observation's centre declination); None for a non-finite one."""
+    if not (math.isfinite(ra) and math.isfinite(dec) and math.isfinite(dec0)):
+        return None
     c = CELL_ARCSEC / 3600.0
     ix = int(math.floor(ra * math.cos(math.radians(dec0)) / c))
     iy = int(math.floor((dec + 90.0) / c))
@@ -257,9 +280,11 @@ def frame_positions(path):
                 if len(parts) <= max(ia, id_):
                     continue
                 try:
-                    out.append((float(parts[ia]), float(parts[id_])))
+                    ra, dec = float(parts[ia]), float(parts[id_])
                 except ValueError:
                     continue
+                if math.isfinite(ra) and math.isfinite(dec):   # old frames carry nan rows
+                    out.append((ra, dec))
     except OSError:
         pass
     return out
@@ -279,7 +304,9 @@ def scan_cells(obs_dir, dec0):
         return cells
     for path in frames:
         for ra, dec in frame_positions(path):
-            cells.add(cell_of(ra, dec, dec0))
+            cell = cell_of(ra, dec, dec0)
+            if cell is not None:
+                cells.add(cell)
     return cells
 
 
@@ -338,9 +365,11 @@ def scan_observation(obs_dir):
         # field?": TAN centre, CD matrix (deg/px) and size, plus the frame's
         # own limiting magnitude for non-detections.
         "center": [_num("CRVAL1"), _num("CRVAL2")],
+        "crpix": [_num("CRPIX1"), _num("CRPIX2")],
         "cd": [_num("CD1_1"), _num("CD1_2"), _num("CD2_1"), _num("CD2_2")],
         "size": [_num("IMAGEW") or _num("NAXIS1"), _num("IMAGEH") or _num("NAXIS2")],
         "maglim": _num("MAGLIM"),
+        "n_det": frame_rows(obs_dir / ecsv) if ecsv else 0,
         "obs_id": obs_dir.name[4:],
         "object": meta.get("OBJECT", ""),
         "target": meta.get("TARGET", ""),
@@ -398,11 +427,15 @@ def crawl(data_dir, days, log):
         except OSError:
             continue  # nothing analysed yet (fewer than three epochs), or removed
         entry = cache.get(name)
-        if entry and entry.get("mtime") == st.st_mtime:
+        if entry and entry.get("mtime") == st.st_mtime and "n_det" in entry.get("facts", {}):
             n_cached += 1
         else:
-            entry = {"mtime": st.st_mtime, **scan_observation(obs_dir)}
-            entry.pop("cells_mtime", None)
+            fresh = {"mtime": st.st_mtime, **scan_observation(obs_dir)}
+            # The detection cells depend only on the frames, which do not
+            # change once processed: keep them across a header re-scan.
+            if entry and entry.get("mtime") == st.st_mtime and entry.get("cells_mtime") == st.st_mtime:
+                fresh["cells_mtime"] = st.st_mtime
+            entry = fresh
             cache[name] = entry
             n_read += 1
         # The frame time, not the table's mtime, decides whether a night is
@@ -434,6 +467,13 @@ def crawl(data_dir, days, log):
             log(f"  detection cells: {n_cells} observations read")
     live = {name for name in dirs}
     cache = {k: v for k, v in cache.items() if k in live}
+    # Cells of observations that were cleaned up go too (160 KB each).
+    try:
+        for entry in os.scandir(data_dir / CELLS_DIR):
+            if entry.name.endswith(".bin") and entry.name[:-4] not in live:
+                os.unlink(entry.path)
+    except OSError:
+        pass
     try:
         tmp = cache_path.with_suffix(".tmp")
         tmp.write_text(json.dumps(cache))
@@ -485,37 +525,48 @@ def cluster(points, radius):
     return list(groups.values())
 
 
-COVERAGE_FRACTION = 0.45   # of the frame half-size: stay clear of the edges
+EDGE_FRACTION = 0.05   # of the frame size: this close to an edge a source is not reliably extracted
+MIN_FRAME_DETECTIONS = 100   # a frame with fewer sources is too shallow or too poor to prove an absence
 
 
 def covers(facts, ra, dec):
-    """Was (ra, dec) inside this observation's first frame? Uses the TAN
-    centre and CD matrix from the header; False when they are missing."""
+    """Was (ra, dec) well inside this observation's first frame? Projects
+    through the header's TAN reference point (CRVAL at CRPIX, which need
+    not be the frame centre) and CD matrix; False when they are missing."""
     c, cd, size = facts.get("center"), facts.get("cd"), facts.get("size")
+    crpix = facts.get("crpix") or [None, None]
     if not c or not cd or not size or None in c or None in cd or None in size:
         return False
+    if None in crpix:
+        crpix = [size[0] / 2.0, size[1] / 2.0]
     det = cd[0] * cd[3] - cd[1] * cd[2]
     if abs(det) < 1e-20:
         return False
     dx = (ra - c[0]) * math.cos(math.radians(dec))
     dra = ((dx + 180) % 360) - 180 if abs(dx) > 180 else dx
     ddec = dec - c[1]
-    px = (cd[3] * dra - cd[1] * ddec) / det
-    py = (-cd[2] * dra + cd[0] * ddec) / det
-    return abs(px) < COVERAGE_FRACTION * size[0] and abs(py) < COVERAGE_FRACTION * size[1]
+    px = crpix[0] + (cd[3] * dra - cd[1] * ddec) / det
+    py = crpix[1] + (-cd[2] * dra + cd[0] * ddec) / det
+    return (EDGE_FRACTION * size[0] < px < (1 - EDGE_FRACTION) * size[0]
+            and EDGE_FRACTION * size[1] < py < (1 - EDGE_FRACTION) * size[1])
 
 
 def n_pts_total(dets):
     return sum(len(p["points"]) for p in dets)
 
 
-def nightly_stats(dets, band=None):
-    """{night: (mean mag, error of the mean, n, mean mjd)} from every epoch
-    of the night, in one band (the points' band; None takes them all). The
-    error is the scatter over sqrt(n), never below 0.02 mag or below the
-    median quoted error over sqrt(n). Two nights are only comparable in the
-    same band: a clear frame calibrated to Sloan r and one to Sloan i
-    differ by the star's colour, not by variability."""
+MIN_EPOCHS_PER_NIGHT = 3   # a night with fewer epochs in the band cannot testify to a change
+
+
+def nightly_stats(dets, band=None, min_epochs_off=False):
+    """{night: (median mag, error, n, mean mjd)} from every epoch of the
+    night, in one band (the points' band; None takes them all). Nights
+    with fewer than MIN_EPOCHS_PER_NIGHT epochs are left out (unless
+    min_epochs_off, for the band-blind summary). The error is the robust
+    scatter over sqrt(n), never below 0.02 mag or below the median quoted
+    error over sqrt(n). Two nights are only comparable in the same band:
+    a clear frame calibrated to Sloan r and one to Sloan i differ by the
+    star's colour, not by variability."""
     by_night = {}
     for p in dets:
         pts = [(pt[1], pt[2], pt[0]) for pt in p["points"] if band is None or pt[3] == band] or (
@@ -525,15 +576,23 @@ def nightly_stats(dets, band=None):
             by_night.setdefault(p["night"], []).extend(pts)
     out = {}
     for night, pts in by_night.items():
-        mags = [m for m, _, _ in pts]
+        mags = sorted(m for m, _, _ in pts)
         n = len(mags)
-        mean = sum(mags) / n
-        scatter = math.sqrt(sum((m - mean) ** 2 for m in mags) / (n - 1)) if n > 1 else 0.0
+        if n < MIN_EPOCHS_PER_NIGHT and not (band is None and min_epochs_off):
+            continue
+        # Median and a scatter from the median absolute deviation: one bad
+        # epoch (a cosmic ray, a satellite, a frame with a poor zero point)
+        # then moves neither the value nor the error. On the first live
+        # page 41 of 65 "changed" sources rested on a single-epoch night.
+        med = mags[n // 2] if n % 2 else 0.5 * (mags[n // 2 - 1] + mags[n // 2])
+        dev = sorted(abs(m - med) for m in mags)
+        mad = dev[n // 2] if n % 2 else 0.5 * (dev[n // 2 - 1] + dev[n // 2])
+        scatter = 1.4826 * mad
         errs = sorted(e for _, e, _ in pts if e is not None and e > 0)
         quoted = errs[len(errs) // 2] if errs else 0.05
         err = max(0.02, scatter / math.sqrt(n), quoted / math.sqrt(n))
         mjds = [t for _, _, t in pts if t is not None]
-        out[night] = (mean, err, n, sum(mjds) / len(mjds) if mjds else None)
+        out[night] = (med, err, n, sum(mjds) / len(mjds) if mjds else None)
     return out
 
 
@@ -605,6 +664,68 @@ def ensemble_offsets(groups_dets, min_sources=5):
     return out
 
 
+FRAME_OFFSET_MAX = 1.0     # a frame whose sources all sit this far off their nightly medians is dropped
+FRAME_KEY_DAYS = 3e-4      # ~26 s: one frame
+
+
+def frame_offsets(groups_dets, min_sources=5):
+    """{(field, band, frame key): median offset} of every source's point in
+    that frame from the source's own median in that band over all its
+    nights (not the night's alone: with three good and three failed frames
+    in a night the nightly median falls between them and both halves look
+    off). A frame whose calibration failed shows as a common offset of all
+    its sources; such points are dropped by drop_bad_frames, not corrected."""
+    votes = {}
+    for field, dets in groups_dets:
+        by_band = {}
+        for p in dets:
+            for pt in p["points"]:
+                by_band.setdefault(pt[3], []).append(pt[1])
+        med = {}
+        for band, mags in by_band.items():
+            if len(mags) >= 3:
+                m = sorted(mags)
+                med[band] = m[len(m) // 2]
+        for p in dets:
+            for pt in p["points"]:
+                if pt[0] is not None and pt[3] in med:
+                    key = (field, pt[3], round(pt[0] / FRAME_KEY_DAYS))
+                    votes.setdefault(key, []).append(pt[1] - med[pt[3]])
+    out = {}
+    for key, vals in votes.items():
+        vals.sort()
+        med = vals[len(vals) // 2]
+        # Five sources are needed to correct a frame by a few tenths; three
+        # agreeing that it is off by more than FRAME_OFFSET_MAX are enough
+        # to throw it away (three g frames of a sparse field at Dec -6 were
+        # 6 mag off and made every star there "fade within a night").
+        if len(vals) >= min_sources or (len(vals) >= 3 and abs(med) > FRAME_OFFSET_MAX):
+            out[key] = med
+    return out
+
+
+def drop_bad_frames(dets, field, offsets):
+    """Differential photometry against the field: subtract each frame's
+    common-mode offset from its points (extinction along a long sequence
+    at low altitude, a thin cloud, a zero point off by a tenth) and remove
+    the points of frames off by more than FRAME_OFFSET_MAX (a calibration
+    that failed). In place; returns the number of points dropped."""
+    n = 0
+    for p in dets:
+        keep = []
+        for pt in p["points"]:
+            off = offsets.get((field, pt[3], round(pt[0] / FRAME_KEY_DAYS))) if pt[0] is not None else None
+            if off is None:
+                keep.append(pt)
+            elif abs(off) > FRAME_OFFSET_MAX:
+                n += 1
+            else:
+                pt[1] -= off
+                keep.append(pt)
+        p["points"] = keep
+    return n
+
+
 def apply_offsets(dets, field, offsets):
     """Subtract the field's nightly offsets from the points (in place)."""
     for p in dets:
@@ -614,30 +735,37 @@ def apply_offsets(dets, field, offsets):
                 pt[1] -= off
 
 
-def within_night_change(dets):
-    """Largest change inside one night: the mean of the first third of the
-    night's epochs against the mean of the last third (single bad epochs do
-    not count), in one band at a time. The telescope cycles its filters
+def within_night_change(dets, calibrated=None):
+    """Largest change inside one night: the median of the first third of
+    the night's epochs against the median of the last third, with at least
+    two epochs per third, in one band at a time. The telescope cycles its filters
     within a night, so across bands the first and last third are simply
     different filters and every star with a colour would "fade". Returns
     (delta with sign, significance) for the most significant night and
-    band; delta > 0 means fading."""
+    band; delta > 0 means fading. With `calibrated` (the (band, frame key)
+    pairs that received a common-mode correction) only those frames take
+    part: without differential calibration a trend along the night can
+    be extinction as well as the star."""
     by_night = {}
     for p in dets:
         for pt in p["points"]:
-            if pt[0] is not None:
-                by_night.setdefault((p["night"], pt[3]), []).append((pt[0], pt[1], pt[2]))
+            if pt[0] is None:
+                continue
+            if calibrated is not None and (pt[3], round(pt[0] / FRAME_KEY_DAYS)) not in calibrated:
+                continue    # no field-wide correction for this frame: a trend here could be the sky
+            by_night.setdefault((p["night"], pt[3]), []).append((pt[0], pt[1], pt[2]))
     best = (0.0, 0.0)
     for pts in by_night.values():
         pts.sort()
         n = len(pts)
-        if n < 4:
-            continue
-        k = max(1, n // 3)
-        a, b = [m for _, m, _ in pts[:k]], [m for _, m, _ in pts[-k:]]
-        ma, mb = sum(a) / k, sum(b) / k
-        var_a = sum((m - ma) ** 2 for m in a) / (k - 1) if k > 1 else 0.0
-        var_b = sum((m - mb) ** 2 for m in b) / (k - 1) if k > 1 else 0.0
+        if n < 6:
+            continue           # fewer than two epochs per third: one point would decide
+        k = n // 3
+        a, b = sorted(m for _, m, _ in pts[:k]), sorted(m for _, m, _ in pts[-k:])
+        ma, mb = a[k // 2] if k % 2 else 0.5 * (a[k // 2 - 1] + a[k // 2]), \
+                 b[k // 2] if k % 2 else 0.5 * (b[k // 2 - 1] + b[k // 2])
+        var_a = sum((m - ma) ** 2 for m in a) / (k - 1)
+        var_b = sum((m - mb) ** 2 for m in b) / (k - 1)
         errs = sorted(e for _, _, e in pts if e is not None and e > 0)
         quoted = errs[len(errs) // 2] if errs else 0.05
         err = max(0.02, math.sqrt((var_a + var_b) / k), quoted * math.sqrt(2.0 / k))
@@ -647,9 +775,78 @@ def within_night_change(dets):
     return best
 
 
-CHANGE_MIN_MAG = 0.3
+# A change has to be large to matter here: the interest is in new sources
+# and outbursts, and a few tenths of a magnitude between nights is within
+# what seeing does to the photometry of a crowded field. --min-change sets it.
+CHANGE_MIN_MAG = 1.0
 CHANGE_MIN_SIGMA = 5.0
 LIMIT_MARGIN_MAG = 1.0     # a non-detection counts when the source would have been this far above the limit
+
+
+SATURATION_BRIGHT_MAG = 10.5   # brighter than this the D50 saturates in its usual exposures; such a star is never "missing"
+WITNESS_MIN_EFFICIENCY = 0.8
+WITNESS_MIN_SOURCES = 10
+
+
+def witness_efficiency(clusters, observations, data_dir, cells_cache):
+    """{obs_id: [(faintest-band magnitude, detected?), ...]} over the page's
+    sources the observation covers and should have detected (brighter
+    than its limit by LIMIT_MARGIN_MAG). witness_ok judges a miss against
+    the sources of similar magnitude in this list."""
+    tested = {}
+    for field, dets in clusters:
+        by_band = {}
+        for p in dets:
+            for pt in p["points"]:
+                by_band.setdefault(pt[3], []).append(pt[1])
+        meds = {b: sorted(v)[len(v) // 2] for b, v in by_band.items() if len(v) >= 3}
+        if not meds:
+            continue
+        w = [max(p["q"], 0.1) for p in dets]
+        ra = sum(p["ra"] * wi for p, wi in zip(dets, w)) / sum(w)
+        dec = sum(p["dec"] * wi for p, wi in zip(dets, w)) / sum(w)
+        for obs in observations:
+            f = obs["facts"]
+            if f.get("maglim") is None or f.get("n_det", 0) < MIN_FRAME_DETECTIONS:
+                continue
+            # The source's magnitude in the observation's own band: a red
+            # star of 16 in i is 18 in g, and a g frame cannot miss it.
+            faintest = meds.get(obs_band(f))
+            if faintest is None or f["maglim"] - LIMIT_MARGIN_MAG < faintest or not covers(f, ra, dec):
+                continue
+            name = f"obs_{f['obs_id']}"
+            cells = cells_cache.get(name)
+            if cells is None:
+                cells = load_cells(data_dir, name) if data_dir is not None else None
+                cells_cache[name] = cells if cells is not None else set()
+            dec0 = f["center"][1] if f.get("center") and f["center"][1] is not None else dec
+            tested.setdefault(f["obs_id"], []).append(
+                (faintest, bool(cells and detected_in(cells, ra, dec, dec0))))
+    return tested
+
+
+def witness_ok(witness, obs_id, mag, window=1.0, min_sources=5):
+    """Did the observation detect at least WITNESS_MIN_EFFICIENCY of the
+    page's sources within `window` mag of `mag` that it covers? None when
+    fewer than `min_sources` such sources exist: a lone 9 mag star that is
+    "missing" from frames whose other bright stars saturate and drop out,
+    or a 17 mag star near a limit the header overstates, is judged by its
+    peers or not at all."""
+    rows = witness.get(obs_id)
+    if not rows:
+        return None
+    for w in (window, 2.0 * window):
+        peers = [d for m, d in rows if abs(m - mag) <= w]
+        if len(peers) >= min_sources:
+            return sum(peers) / len(peers) >= WITNESS_MIN_EFFICIENCY
+    if len(rows) >= WITNESS_MIN_SOURCES:      # no peers of similar magnitude: the observation as a whole
+        return sum(d for _, d in rows) / len(rows) >= WITNESS_MIN_EFFICIENCY
+    return None
+
+
+def obs_band(facts):
+    """The band of the observation's first frame, as the lightcurves name it."""
+    return normalise_band(facts.get("filter") or band_of_frame(facts.get("first_frame", "")))
 
 
 def non_detections(group_dets, ra, dec, observations, detected_obs, data_dir, cells_cache):
@@ -670,7 +867,8 @@ def non_detections(group_dets, ra, dec, observations, detected_obs, data_dir, ce
             cells_cache[name] = cells if cells is not None else set()
         dec0 = f["center"][1] if f.get("center") and f["center"][1] is not None else dec
         rec = {"obs_id": f["obs_id"], "night": f["nights"][0] if f["nights"] else "",
-               "object": f["object"], "maglim": f.get("maglim"), "first": f["first"]}
+               "object": f["object"], "maglim": f.get("maglim"), "first": f["first"],
+               "n_det": f.get("n_det", 0), "band": obs_band(f)}
         (present if cells and detected_in(cells, ra, dec, dec0) else missed).append(rec)
     return sorted(missed, key=lambda d: d["night"]), sorted(present, key=lambda d: d["night"])
 
@@ -696,14 +894,37 @@ def build_groups(observations, args, log, data_dir=None):
         for p in dets:
             p["points"] = detection_points(p, data_dir)
         clusters.append((dominant_field(dets), dets))
+    calibrated_frames = {}
+    if not args.no_ensemble:
+        bad = frame_offsets(clusters)
+        for (field, band, key), off in bad.items():
+            if abs(off) <= FRAME_OFFSET_MAX:
+                calibrated_frames.setdefault(field, set()).add((band, key))
+        n_bad_frames = sum(1 for v in bad.values() if abs(v) > FRAME_OFFSET_MAX)
+        n_dropped = sum(drop_bad_frames(d, f, bad) for f, d in clusters)
+        log(f"{len(bad)} frames corrected for their field's common-mode offset"
+            + (f", {n_bad_frames} of them more than {FRAME_OFFSET_MAX:g} mag off and dropped ({n_dropped} points)"
+               if n_bad_frames else ""))
     offsets = ensemble_offsets([(f, d) for f, d in clusters]) if not args.no_ensemble else {}
     if offsets:
         big = sorted(offsets.items(), key=lambda kv: -abs(kv[1]))[:3]
         log(f"{len(offsets)} field/night/band zero-point offsets removed, largest: "
             + ", ".join(f"{k[0]} {k[1]} {k[2]} {v:+.2f}" for k, v in big))
-    groups = []
+    # Which observations can testify to an absence: an observation that
+    # failed to detect most of the page's own sources it covers (a bad
+    # pointing, a stale WCS, clouds) proves nothing about any one of them.
+    # On the full history, 40 stars of one field "disappeared" on the same
+    # two observations and 20 "appeared" after one.
     for field, dets in clusters:
         apply_offsets(dets, field, offsets)
+    witness = witness_efficiency(clusters, observations, data_dir, cells_cache)
+    n_unfit = sum(1 for rows in witness.values()
+                  if len(rows) >= WITNESS_MIN_SOURCES and sum(d for _, d in rows) / len(rows) < WITNESS_MIN_EFFICIENCY)
+    if n_unfit:
+        log(f"{n_unfit} observations detect fewer than {WITNESS_MIN_EFFICIENCY:.0%} of the sources they cover; "
+            "a miss is judged against sources of similar magnitude")
+    groups = []
+    for field, dets in clusters:
         nights = sorted({p["night"] for p in dets if p["night"]})
         obs_ids = sorted({p["obs"]["obs_id"] for p in dets})
         # One detection per observation is the norm; the pipeline may split a
@@ -712,22 +933,33 @@ def build_groups(observations, args, log, data_dir=None):
         ra = sum(p["ra"] * wi for p, wi in zip(dets, w)) / sum(w)
         dec = sum(p["dec"] * wi for p, wi in zip(dets, w)) / sum(w)
         scatter = max(angular_sep_arcsec(p["ra"], p["dec"], ra, dec) for p in dets)
-        mags = [p["mag"] for p in dets if math.isfinite(p["mag"]) and p["mag"] < 90]
+        mags = [p["mag"] for p in dets if math.isfinite(p["mag"]) and MAG_SANE_MIN < p["mag"] < MAG_SANE_MAX]
         # Night-to-night comparisons in one band at a time; the band with
         # the most epochs decides the trend and the tags, but the largest
         # significant change of any band counts.
         bands = bands_of(dets) or [None]
-        stats_all = nightly_stats(dets)           # every band together: only for the "seen at all" questions
-        per_band = {}
+        stats_all = nightly_stats(dets, min_epochs_off=True)   # every band, every night: "seen at all" only
+        per_band, saturated_bands = {}, set()
         for band in bands:
             st = nightly_stats(dets, band)
+            if st and min(v[0] for v in st.values()) < SATURATION_BRIGHT_MAG:
+                # Saturated in this band on at least one night: the nightly
+                # values are instrumental (a star at 8.7 one night and 11.3
+                # the next is the flat top, not a fading) and cannot testify
+                # to a change. The new matcher keeps such stars out of the
+                # candidates; older tables still have them.
+                saturated_bands.add(band)
+                per_band[band] = (st, (0.0, 0.0), None)
+                continue
             per_band[band] = (st, change_between_nights(st), night_trend(st))
         main_band = bands[0]
         stats = per_band[main_band][0] or stats_all
         night_order = sorted(stats)
         night_mags = [stats[n][0] for n in night_order]
         d_nights, s_nights = max((pb[1] for pb in per_band.values()), key=lambda t: t[1], default=(0.0, 0.0))
-        d_within, s_within = within_night_change(dets)
+        d_within, s_within = within_night_change(
+            [dict(p, points=[pt for pt in p["points"] if pt[3] not in saturated_bands]) for p in dets],
+            calibrated=None if args.no_ensemble else calibrated_frames.get(field, set()))
         trend_fit = max((pb[2] for pb in per_band.values() if pb[2]), key=lambda f: f["sigma"], default=None)
         # A slow, steady decline or rise (a supernova over weeks) shows as a
         # significant slope even when single steps are small.
@@ -772,20 +1004,33 @@ def build_groups(observations, args, log, data_dir=None):
         between = [m for m in missed if m["night"] and first_night <= m["night"] <= last_night
                    and m["night"] not in stats]
 
-        def constraining(missed_list, mag):
-            return [m for m in missed_list if m["maglim"] is not None and mag is not None
-                    and m["maglim"] - LIMIT_MARGIN_MAG >= mag]
-        # The limit test uses the brightest band the source was seen in on
-        # that night: a frame in another band is not directly comparable,
-        # but a star well above the limit in one band is not 1 mag fainter
-        # in the next.
-        def night_mag(night):
-            vals = [pb[0][night][0] for pb in per_band.values() if night in pb[0]]
-            return min(vals) if vals else (stats_all[night][0] if night in stats_all else None)
-        appeared = constraining(before, night_mag(first_night))
-        disappeared = constraining(after, night_mag(last_night))
+        band_meds = {b: pb[0] for b, pb in per_band.items()}
+
+        def constraining(missed_list, night):
+            # The frame has to be a real one (enough sources), in a band
+            # the source was measured in on that night, and deep enough
+            # for the source's magnitude IN THAT BAND: a red star of 16 in
+            # i is 18 in g, and a g frame with an 18.6 limit cannot miss
+            # it (one such frame "disappeared" forty stars of Cyg X-2).
+            # The observation must also have detected the source's peers
+            # (witness_ok); a sparse field gives no verdict and the limit
+            # test alone decides. Stars bright enough to saturate are
+            # never "missing": they are not extracted.
+            out = []
+            for m in missed_list:
+                st = band_meds.get(m.get("band"))
+                mag = st[night][0] if st and night in st else None
+                if (mag is not None and m["maglim"] is not None and mag > SATURATION_BRIGHT_MAG
+                        and m.get("n_det", 0) >= MIN_FRAME_DETECTIONS
+                        and m["maglim"] - LIMIT_MARGIN_MAG >= mag
+                        and witness_ok(witness, m["obs_id"], mag) is not False):
+                    out.append(m)
+            return out
+        appeared = constraining(before, first_night)
+        disappeared = constraining(after, last_night)
         score = transient_score(mag_bright, len(nights), n_points, max(p["q"] for p in dets),
-                                delta_mag if changed else 0.0, bool(appeared), bool(disappeared))
+                                delta_mag if changed else 0.0, bool(appeared), bool(disappeared),
+                                fading=(trend == "fading"))
         groups.append({
             "field": dominant_field(dets), "score": score["score"], "score_parts": score,
             "mag_bright": mag_bright, "n_points": n_points,
@@ -841,21 +1086,25 @@ def dominant_field(dets):
     return max(sorted(counts), key=counts.get) if counts else ""
 
 
-def transient_score(mag_bright, n_nights, n_points, max_q, delta_mag=0.0, appeared=False, disappeared=False):
+def transient_score(mag_bright, n_nights, n_points, max_q, delta_mag=0.0, appeared=False, disappeared=False,
+                    fading=False):
     """Brightest, best covered and changing first.
 
     brightness = 18 - brightest nightly mean magnitude, clipped to 0..10
     coverage   = 2 x (nights - 1) + log2(1 + measured epochs)
     quality    = log10(1 + best pipeline quality score), at most 2
-    change     = 3 x (largest significant night-to-night change, mag), at most 6,
+    change     = 3 x the largest significant change in mag when it is a
+                 brightening (at most 6), 1 x when it is a fading (at most 2),
                  + 4 if the source appeared (absent from earlier frames deep
-                 enough to have shown it), + 2 if it disappeared the same way
+                 enough to have shown it), + 1 if it disappeared the same way.
+                 New and brightening sources are what the page is for.
     score      = brightness + coverage + quality + change
     """
     brightness = min(10.0, max(0.0, 18.0 - mag_bright)) if mag_bright is not None else 0.0
     coverage = 2.0 * (n_nights - 1) + math.log2(1 + n_points)
     quality = min(2.0, math.log10(1 + max(max_q, 0.0)))
-    change = min(6.0, 3.0 * max(0.0, delta_mag)) + (4.0 if appeared else 0.0) + (2.0 if disappeared else 0.0)
+    d = max(0.0, delta_mag)
+    change = (min(2.0, d) if fading else min(6.0, 3.0 * d)) + (4.0 if appeared else 0.0) + (1.0 if disappeared else 0.0)
     return {"brightness": round(brightness, 2), "coverage": round(coverage, 2),
             "quality": round(quality, 2), "change": round(change, 2),
             "score": round(brightness + coverage + quality + change, 2)}
@@ -955,6 +1204,7 @@ def mjd_to_ut(mjd):
 
 
 MAX_POINTS_PER_NIGHT = 40
+MAX_CHART_NIGHTS = 12      # panels per chart: the most recent nights; the table lists them all
 
 
 def bin_points(pts, max_points):
@@ -990,6 +1240,10 @@ def lightcurve_svg(group, width=760, height=230, max_points=MAX_POINTS_PER_NIGHT
             nights.setdefault(d["night"], []).append((pt, d))
     if not nights:
         return ""
+    n_all = len(nights)
+    if n_all > MAX_CHART_NIGHTS:
+        keep = sorted(nights)[-MAX_CHART_NIGHTS:]
+        nights = {k: nights[k] for k in keep}
     nights = {night: bin_points(pts, max_points) for night, pts in nights.items()}
     mags = [pt[1] for pts in nights.values() for pt, _, _ in pts]
     lo, hi = min(mags), max(mags)
@@ -1008,6 +1262,7 @@ def lightcurve_svg(group, width=760, height=230, max_points=MAX_POINTS_PER_NIGHT
 
     out = [f"<svg class='lc' viewBox='0 0 {width} {height}' width='100%' role='img' "
            f"aria-label='Lightcurve over {n} nights'>"
+           + (f"<title>last {n} of {n_all} nights</title>" if n_all > n else "") +
            "<style>.lc text{font:11px system-ui,sans-serif;fill:#555}.lc .ax{stroke:#ccc}"
            ".lc .gr{stroke:#eee}.lc .eb{stroke-width:1}.lc circle{stroke:#fff;stroke-width:2}"
            "</style>"]
@@ -1067,6 +1322,11 @@ EXTERNAL_LINKS = (
 def _mag_span(g):
     lo, hi = g["mag_min"], g["mag_max"]
     return _mag(lo) + (f" – {_mag(hi)}" if hi is not None and hi != lo else "")
+
+
+def interesting(g):
+    """Changed, appeared or disappeared: what the reader wants first."""
+    return bool(g.get("changed") or g.get("appeared") or g.get("disappeared"))
 
 
 def render_card(g, public_dir):
@@ -1144,7 +1404,7 @@ def render_row(g):
     e = html.escape
     sites = " ".join(f"<a href='{e(d['site'])}'>{e(d['night'])}</a>" if d.get("site") else e(d["night"])
                      for d in g["detections"])
-    return (f"<tr><td>{g['rank']}</td><td class='num'>{g['score']:.1f}</td><td class='num'>{g['ra']:.5f}</td>"
+    return (f"<tr id='g{g['rank']}'><td>{g['rank']}</td><td class='num'>{g['score']:.1f}</td><td class='num'>{g['ra']:.5f}</td>"
             f"<td class='num'>{g['dec']:+.5f}</td><td class='num'>{g['n_nights']}</td><td class='num'>{g['n_obs']}</td>"
             f"<td class='num'>{g['n_points']}</td><td class='num'>{e(_mag_span(g))}</td>"
             f"<td class='num'>{g['delta_mag']:.2f}</td><td class='num'>{g['change_sigma']:.0f}</td>"
@@ -1172,17 +1432,27 @@ def render_page(groups, observations, args, public_dir, generated):
         (", forced target rows included" if args.include_forced else ", forced target rows (NUMBER 0) dropped") +
         ".<br>Score = brightness (18 − brightest nightly mean mag, 0..10) + coverage (2 per extra night "
         "+ log2 of measured epochs) + quality (log10 of the best pipeline score, at most 2) + change "
-        f"(3 × the largest change, between nightly means, along a fitted trend, or between the first and last third of one night, when "
-        f"it is at least {CHANGE_MIN_MAG:g} mag and {CHANGE_MIN_SIGMA:g}σ, at most 6; +4 when the source appeared, "
+        f"(3 × the largest brightening, or 1 × the largest fading, between nightly means, along a fitted trend, or between "
+        f"the first and last third of one night, when it is at least {CHANGE_MIN_MAG:g} mag and {CHANGE_MIN_SIGMA:g}σ, "
+        "at most 6 or 2; +4 when the source appeared, "
         "i.e. earlier frames of the field "
-        f"went {LIMIT_MARGIN_MAG:g} mag deeper than it without showing it; +2 when it disappeared the same way). "
-        "Night-to-night changes are compared within one band, after removing each field's nightly zero-point "
-        "offset (the median over its sources with three or more nights). 'Missed' counts observations of the "
+        f"went {LIMIT_MARGIN_MAG:g} mag deeper than its faintest band without showing it, in frames of at least "
+        f"{MIN_FRAME_DETECTIONS} sources with the position clear of the edges; +1 when it disappeared the same way). "
+        f"Night-to-night changes are compared within one band, between nightly medians of at least {MIN_EPOCHS_PER_NIGHT} "
+        "epochs, after removing each field's nightly zero-point offset (the median over its sources with three or "
+        f"more nights) and each frame's common-mode offset (differential photometry against the field; frames more than "
+        f"{FRAME_OFFSET_MAX:g} mag off are dropped, and a change within a night counts only in corrected frames); a band in "
+        f"which the source is brighter than {SATURATION_BRIGHT_MAG:g} mag on any night is saturated and cannot testify; a single "
+        "epoch never decides. 'Missed' counts observations of the "
         "field covering the position in which no frame detected anything there: before / between / after its "
-        "detections; a night where the frames saw the star but the pipeline did not flag it is not a miss. "
+        "detections, in a band the source was measured in and to a limit reaching its magnitude in that band; a night "
+        "where the frames saw the star but the pipeline did not flag it is not a miss, and an "
+        f"observation only witnesses one when it detected at least {WITNESS_MIN_EFFICIENCY:.0%} of the page's sources "
+        "within a magnitude of the source that it covers (at least five of them). "
         f"Sources are grouped by the field most of their observations were taken as; the best "
         f"{args.per_field} of each field get a card with the stitched lightcurve (at most {args.max_cards} "
-        f"cards in all), the rest of the field is a table of at most {args.max_rows} lines. "
+        f"cards in all; changed, appeared and disappeared sources take the cards before steady ones), "
+        f"the rest of the field is a table of at most {args.max_rows} lines. "
         "The JSON next to this page lists every source. Rows link to each observation's own page; "
         "thumbnails are that page's montage and lightcurve.</div>")
     if not groups:
@@ -1194,6 +1464,24 @@ def render_page(groups, observations, args, public_dir, generated):
         fields.setdefault(g["field"], []).append(g)
     order = sorted(fields, key=lambda f: -fields[f][0]["score"])
 
+    hot = [g for g in groups if interesting(g)]
+    parts.append(f"<div class='group' id='changed'><h2>Changed and new sources ({len(hot)})</h2>")
+    if hot:
+        parts.append("<table><tr><th>#</th><th>Field</th><th>RA</th><th>Dec</th><th>Tags</th><th>Score</th>"
+                     "<th>Mag</th><th>Δmag</th><th>σ</th><th>Nights</th><th>Missed</th></tr>")
+        for g in hot:
+            tags = " ".join(t for t in (g["trend"], "appeared" if g["appeared"] else "",
+                                        "disappeared" if g["disappeared"] else "") if t)
+            parts.append(f"<tr><td><a href='#g{g['rank']}'>{g['rank']}</a></td><td>{e(g['field'] or '-')}</td>"
+                         f"<td class='num'>{g['ra']:.5f}</td><td class='num'>{g['dec']:+.5f}</td><td>{e(tags)}</td>"
+                         f"<td class='num'>{g['score']:.1f}</td><td class='num'>{e(_mag_span(g))}</td>"
+                         f"<td class='num'>{g['delta_mag']:.2f}</td><td class='num'>{g['change_sigma']:.0f}</td>"
+                         f"<td class='num'>{g['n_nights']}</td>"
+                         f"<td class='num'>{g['n_missed_before']}/{g['n_missed_between']}/{g['n_missed_after']}</td></tr>")
+        parts.append("</table>")
+    else:
+        parts.append("<p class='empty'>None at the current thresholds.</p>")
+    parts.append("</div>")
     parts.append("<div class='group'><h2>Fields</h2><table><tr><th>Field</th><th>Sources</th><th>Changed</th>"
                  "<th>Appeared</th><th>Best score</th><th>Brightest</th><th>Most nights</th><th>Nights observed</th></tr>")
     for k, f in enumerate(order, 1):
@@ -1217,7 +1505,7 @@ def render_page(groups, observations, args, public_dir, generated):
                      f"<summary><b>{e(f or '(no field name)')}</b> — {len(gs)} sources, best score {gs[0]['score']:.1f}"
                      f", {n_cards} shown in full" +
                      (f", {len(rest)} more in the table" if rest else "") + "</summary>")
-        for g in gs:
+        for g in sorted(gs, key=lambda g: (not interesting(g), g["rank"])):
             if g.get("card"):
                 parts.append(render_card(g, public_dir))
         if rest:
@@ -1242,15 +1530,18 @@ def main(argv=None):
     ap.add_argument("--min-nights", type=int, default=2)
     ap.add_argument("--min-quality", type=float, default=0.02)
     ap.add_argument("--per-field", type=int, default=10, help="sources shown in full per field")
-    ap.add_argument("--max-cards", type=int, default=300, help="sources shown in full on the whole page (0 = no cap)")
+    ap.add_argument("--max-cards", type=int, default=150, help="sources shown in full on the whole page (0 = no cap)")
     ap.add_argument("--max-rows", type=int, default=100, help="table lines per field for the other sources (0 = all)")
     ap.add_argument("--open-fields", type=int, default=5, help="field sections open when the page loads")
     ap.add_argument("--include-forced", action="store_true", help="keep the NUMBER 0 forced target rows")
+    ap.add_argument("--min-change", type=float, default=1.0,
+                    help="smallest change in mag that counts (default %(default)s)")
     ap.add_argument("--no-ensemble", action="store_true",
                     help="do not remove per-field nightly zero-point offsets before looking for change")
     ap.add_argument("--title", default="Transients seen on more than one night")
     ap.add_argument("-q", "--quiet", action="store_true")
     args = ap.parse_args(argv)
+    globals()["CHANGE_MIN_MAG"] = args.min_change
 
     data_dir = Path(args.data_dir).expanduser()
     public_dir = Path(args.public_dir).expanduser()
@@ -1271,7 +1562,10 @@ def main(argv=None):
     carded = set()
     budget = args.max_cards if args.max_cards > 0 else len(groups)
     per_field = {}
-    for g in groups:  # the same allocation render_page makes
+    # Cards go to the sources the page is for first: those that changed,
+    # appeared or disappeared, in score order; the steady ones fill what is
+    # left of each field's allowance.
+    for g in sorted(groups, key=lambda g: (not interesting(g), g["rank"])):
         n = per_field.get(g["field"], 0)
         if n < args.per_field and budget > 0:
             per_field[g["field"]] = n + 1

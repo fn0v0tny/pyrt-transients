@@ -370,6 +370,13 @@ def _previous_best_score(obs_dir: Path) -> float:
         return 0.0
     if len(candidates) == 0 or "quality_score" not in candidates.colnames:
         return 0.0
+    # A catalogued galaxy (galaxy_flag.py) is a constant source, not a
+    # find: a bright one outside the error circle must not stop the stack
+    # from being built. 'host' (brighter than its galaxy) still counts.
+    if "galaxy_flag" in candidates.colnames:
+        candidates = candidates[np.array([str(f) != "galaxy" for f in candidates["galaxy_flag"]], dtype=bool)]
+        if len(candidates) == 0:
+            return 0.0
     return float(max(candidates["quality_score"]))
 
 
@@ -400,7 +407,8 @@ def maybe_build_stack_table(
 
     Rebuilding (an actual fresh pyrt-combine run) is throttled by
     should_rebuild_stack's cadence, and skipped entirely once an existing
-    candidate already scores at or above stacking_score_threshold -- but
+    candidate that isn't a catalogued galaxy already scores at or above
+    stacking_score_threshold -- but
     once a stack exists on disk, it keeps being returned (and thus stays
     included) on every subsequent call regardless of score, so a
     previously stack-anchored candidate doesn't disappear from future runs

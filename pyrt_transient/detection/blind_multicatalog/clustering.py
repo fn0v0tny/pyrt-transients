@@ -29,6 +29,9 @@ from pyrt_transient.config_trans import DetectionConfig
 from pyrt_transient.core.union_find import UnionFind
 from pyrt_transient.core.matching import match_radius
 from pyrt_transient.core.scoring import add_score_probability, apply_lightcurve_score_factor
+from pyrt_transient.detection.blind_multicatalog.galaxy_flag import (
+    band_for_filter, flag_known_galaxies,
+)
 from pyrt_transient.detection.blind_multicatalog.stdpipe_filters import (
     apply_skybot_filter,
     apply_vsx_filter,
@@ -161,12 +164,16 @@ def combine_results(
     if not transients:
         return Table()
 
-    # Stack all candidates
+    # Stack all candidates. The quality gate is applied later, to the best
+    # row of each cluster, NOT here: a per-row gate before the catalogue
+    # count silently vetoed real transients. SN 2026zji (16 mag, on its
+    # host galaxy) was "new" in ATLAS, Gaia and USNO-B in every epoch, but
+    # its USNO-B row scored 0.001 because the galaxy's USNO-B entry sits
+    # on top of it (nearest_source_dist 0.5 px); that row was dropped,
+    # USNO-B no longer "agreed", and unanimity failed. Whether every
+    # catalogue calls the source new is one question, how good the best
+    # detection is another.
     all_candidates = vstack(list(transients.values()))
-
-    # Filter by quality
-    quality_mask = all_candidates["quality_score"] >= min_quality
-    all_candidates = all_candidates[quality_mask]
 
     if len(all_candidates) == 0:
         return Table()
@@ -308,6 +315,8 @@ def combine_results(
                 if subcluster_cat_count >= min_catalogs:
                     # Take the one with highest quality score from the subcluster
                     subcluster_qualities = subcluster_data["quality_score"]
+                    if not np.any(np.asarray(subcluster_qualities, dtype=float) >= min_quality):
+                        continue      # the quality gate, on the cluster's best row
                     best_local_idx = np.argmax(subcluster_qualities)
                     best_global_idx = subcluster_indices[best_local_idx]
                     best_indices.append(best_global_idx)
@@ -928,6 +937,21 @@ def combine_with_lightcurves(
                 result_table = result_table[quality_keep]
                 surviving_ids = set(str(t) for t in result_table['transient_id'])
                 lightcurves = {k: v for k, v in lightcurves.items() if k in surviving_ids}
+
+        # Known-galaxy label: annotates, never removes (a transient on its
+        # host must survive) -- see galaxy_flag.py. After the quality gate
+        # so only the candidates that are kept cost a catalogue query.
+        if config and config.detection.galaxy_flag_enabled and len(result_table) > 0:
+            phfilter = next((t.meta.get("PHFILTER") for t in detection_tables
+                             if t.meta.get("PHFILTER")), None)
+            result_table = flag_known_galaxies(
+                result_table,
+                band=band_for_filter(phfilter),
+                catalogs=config.detection.galaxy_flag_catalogs,
+                match_radius_arcsec=config.detection.galaxy_match_radius_arcsec,
+                host_margin_mag=config.detection.galaxy_host_margin_mag,
+                cache_dir=data_dir,
+            )
 
         # Trail detection summary logging
         if 'candidate_type' in result_table.colnames:

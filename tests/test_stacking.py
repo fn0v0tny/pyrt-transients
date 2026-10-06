@@ -107,8 +107,10 @@ def _make_detection_table(index: int, obs_dir: Path, phfilter: str = "Sloan_r", 
     return t
 
 
-def _write_candidates_tbl(obs_dir: Path, quality_score) -> None:
+def _write_candidates_tbl(obs_dir: Path, quality_score, galaxy_flag=None) -> None:
     t = Table({"quality_score": [float(quality_score)]})
+    if galaxy_flag is not None:
+        t["galaxy_flag"] = [galaxy_flag]
     t.write(str(obs_dir / "candidates.tbl"), format="ascii.ipac", overwrite=True)
 
 
@@ -721,6 +723,47 @@ def test_maybe_build_stack_table_skips_when_existing_candidate_scores_well():
     print("test_maybe_build_stack_table_skips_when_existing_candidate_scores_well: PASS")
 
 
+def test_previous_best_score_ignores_catalogued_galaxies():
+    with tempfile.TemporaryDirectory() as d:
+        obs_dir = Path(d)
+        t = Table({"quality_score": [1.42, 0.6, 0.3],
+                   "galaxy_flag": ["galaxy", "none", "host"]})
+        t.write(str(obs_dir / "candidates.tbl"), format="ascii.ipac")
+        _assert_close(stacking._previous_best_score(obs_dir), 0.6, "best non-galaxy score")
+
+        _write_candidates_tbl(obs_dir, quality_score=5.0, galaxy_flag="galaxy")
+        _assert_close(stacking._previous_best_score(obs_dir), 0.0, "only a galaxy")
+
+        # 'host' is brighter than its galaxy -- a possible transient, still counts.
+        _write_candidates_tbl(obs_dir, quality_score=5.0, galaxy_flag="host")
+        _assert_close(stacking._previous_best_score(obs_dir), 5.0, "host")
+    print("test_previous_best_score_ignores_catalogued_galaxies: PASS")
+
+
+def test_maybe_build_stack_table_builds_when_only_a_galaxy_scores_well():
+    calls = {"n": 0}
+
+    def counting_combine(*a, **k):
+        calls["n"] += 1
+        return _fake_combine(*a, **k)
+
+    restore = _patch_build_fns(fake_combine=counting_combine, fake_build_ecsv=_fake_build_stack_ecsv)
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            obs_dir = Path(d)
+            cfg = _make_config(stacking_enabled=True, stacking_min_epochs=10,
+                                stacking_score_threshold=1.0)
+            tables = [_make_detection_table(i, obs_dir) for i in range(10)]
+            _write_candidates_tbl(obs_dir, quality_score=1.42, galaxy_flag="galaxy")
+
+            result = stacking.maybe_build_stack_table(obs_dir, tables, cfg, _LOG)
+            assert result is not None, "a bright catalogued galaxy must not block the stack"
+            assert calls["n"] == 1
+    finally:
+        restore()
+    print("test_maybe_build_stack_table_builds_when_only_a_galaxy_scores_well: PASS")
+
+
 def test_maybe_build_stack_table_keeps_existing_stack_even_once_score_is_good():
     restore = _patch_build_fns(fake_combine=_fake_combine, fake_build_ecsv=_fake_build_stack_ecsv)
     try:
@@ -810,6 +853,8 @@ if __name__ == "__main__":
     test_maybe_build_stack_table_builds_when_triggered()
     test_maybe_build_stack_table_excludes_mismatched_filter_and_exptime()
     test_maybe_build_stack_table_skips_when_existing_candidate_scores_well()
+    test_previous_best_score_ignores_catalogued_galaxies()
+    test_maybe_build_stack_table_builds_when_only_a_galaxy_scores_well()
     test_maybe_build_stack_table_keeps_existing_stack_even_once_score_is_good()
     test_maybe_build_stack_table_respects_rebuild_interval()
     print("All detection/stacking.py tests passed.")

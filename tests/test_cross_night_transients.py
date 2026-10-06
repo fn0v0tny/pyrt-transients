@@ -119,7 +119,7 @@ def test_page_groups_same_source_on_two_nights(tmp_path):
     # The 210619B afterglow fades by 1.2 mag (first third vs last third) inside the night.
     assert g["trend"] == "fading" and g["grb_field"] is True
     assert g["changed"] is True and g["change_kind"] == "within a night"
-    assert g["delta_mag"] == pytest.approx(1.2, abs=0.2) and g["score_parts"]["change"] == pytest.approx(3 * g["delta_mag"], abs=0.01)
+    assert g["delta_mag"] == pytest.approx(1.2, abs=0.2) and g["score_parts"]["change"] == pytest.approx(min(2.0, g["delta_mag"]), abs=0.01)
     assert g["n_missed_before"] == 0 and g["appeared"] is False
     assert all(h["changed"] is False and h["trend"] == "steady" for h in out["groups"][1:])
     # The forced NUMBER 0 row at the pointing is dropped, so it forms no group.
@@ -177,7 +177,7 @@ def test_max_cards_puts_the_rest_in_a_table(tmp_path):
     out = json.loads((public / "new_transients" / "new_transients.json").read_text())
     assert len(out["groups"]) == 3
     assert page.count("<svg class='lc'") == 1 and "2 more in the table" in page
-    assert page.count("<tr><td>2</td>") == 1 and page.count("<tr><td>3</td>") == 1  # ranks in the table
+    assert page.count("<tr id='g2'><td>2</td>") == 1 and page.count("<tr id='g3'><td>3</td>") == 1  # ranks in the table
 
     # The page-wide cap wins over the per-field one, and the table can be cut too.
     assert xn.main(["--data-dir", str(data), "--public-dir", str(public), "--days", "0",
@@ -191,8 +191,9 @@ def test_score_and_dominant_field():
     assert s == {"brightness": 6.0, "coverage": 8.0, "quality": 2.0, "change": 0.0, "score": 16.0}
     assert xn.transient_score(None, 2, 1, 0.0)["score"] == 3.0
     s = xn.transient_score(12.0, 3, 15, 99.0, delta_mag=1.0, appeared=True, disappeared=True)
-    assert s["change"] == 9.0 and s["score"] == 25.0
+    assert s["change"] == 8.0 and s["score"] == 24.0
     assert xn.transient_score(12.0, 3, 15, 99.0, delta_mag=5.0)["change"] == 6.0
+    assert xn.transient_score(12.0, 3, 15, 99.0, delta_mag=5.0, fading=True)["change"] == 2.0
     assert xn.transient_score(5.0, 1, 0, 0.0)["brightness"] == 10.0
     dets = [{"obs": {"object": "A"}}, {"obs": {"object": "B"}}, {"obs": {"object": "B"}}, {"obs": {"object": ""}}]
     assert xn.dominant_field(dets) == "B"
@@ -222,10 +223,15 @@ def test_recent_window_excludes_old_nights(tmp_path):
 
 def test_covers_uses_the_frame_wcs():
     facts = {"center": [100.0, 20.0], "cd": [-0.0003, 0.0, 0.0, 0.0003], "size": [1024, 1024]}
-    assert xn.covers(facts, 100.0, 20.0)
+    assert xn.covers(facts, 100.0, 20.0)                                          # no CRPIX: centre assumed
     assert xn.covers(facts, 100.0 + 0.1 / math.cos(math.radians(20.0)), 20.1)     # 333 px off centre
-    assert not xn.covers(facts, 100.0, 20.2)                                      # 667 px: beyond 0.45 x 1024
+    assert not xn.covers(facts, 100.0, 20.2)                                      # 667 px: beyond the edge
     assert not xn.covers({"center": [None, None], "cd": None, "size": None}, 100.0, 20.0)
+    # CRVAL sits at CRPIX, which need not be the centre: with the reference
+    # point in a corner the same sky position is outside the frame.
+    corner = dict(facts, crpix=[1.0, 1.0])
+    assert not xn.covers(corner, 100.0, 20.2) and not xn.covers(corner, 100.0, 19.9)
+    assert xn.covers(corner, 100.0 - 0.1 / math.cos(math.radians(20.0)), 20.1)   # +333 px in x and y
 
 
 @needs_fixture
@@ -234,7 +240,7 @@ def test_change_and_appearance_from_field_history(tmp_path):
     _make_obs(data, "1", 5, empty=True)            # field observed, nothing found (limit 17.1)
     _make_obs(data, "2", 7, empty=True)
     _make_obs(data, "3", 10)                       # source at 11.4
-    _make_obs(data, "4", 12, dmag=1.0)             # a magnitude fainter
+    _make_obs(data, "4", 12, dmag=1.5)             # a magnitude and a half fainter
     _make_obs(data, "5", 14, empty=True)           # gone again
     _make_obs(data, "6", 16, empty=True, keep_frame=True)   # in the frame, not flagged: not a miss
     assert xn.main(["--data-dir", str(data), "--public-dir", str(public), "--days", "0", "-q"]) == 0
@@ -250,12 +256,13 @@ def test_change_and_appearance_from_field_history(tmp_path):
     assert g["appeared"] is True and g["disappeared"] is True
     assert g["limit_before"] == pytest.approx(17.1, abs=0.05)
     assert g["changed"] is True and g["change_sigma"] > 5
-    assert g["nightly"]["2026-09-11"][0] - g["nightly"]["2026-09-09"][0] == pytest.approx(1.0, abs=0.01)
+    assert g["nightly"]["2026-09-11"][0] - g["nightly"]["2026-09-09"][0] == pytest.approx(1.5, abs=0.01)
     assert g["trend"] == "fading"
-    assert g["score_parts"]["change"] == pytest.approx(min(6.0, 3 * g["delta_mag"]) + 4.0 + 2.0, abs=0.01)
+    assert g["score_parts"]["change"] == pytest.approx(min(2.0, g["delta_mag"]) + 4.0 + 1.0, abs=0.01)
     assert [m["night"] for m in g["missed"]] == ["2026-09-04", "2026-09-06", "2026-09-13"]
     page = (public / "new_transients" / "index.html").read_text()
     assert "tag appeared" in page and "tag disappeared" in page and "tag fading" in page
+    assert "Changed and new sources (3)" in page and "<a href='#g1'>1</a>" in page  # dmag shifted every source
     assert "not in 2 earlier frame(s)" in page and "../obs_1/index.html" in page
     # The faint sources (17.5 mag) are below the 1 mag margin of the 17.1 limit: not "appeared".
     assert all(not h["appeared"] for h in out["groups"][1:])
@@ -346,3 +353,149 @@ def test_band_names_are_normalised(tmp_path):
                   "NUMBER MAG_CALIB MAGERR_CALIB mjd source_file\n"
                   "1 15.5 0.1 61000.5 20260909011221-634-i-020-df.ecsv\n")
     assert xn.read_lightcurve(lc, "N")[0][3] == "Sloan_i"
+
+
+@needs_fixture
+def test_interesting_sources_take_the_cards_first(tmp_path):
+    data, public = tmp_path / "work", tmp_path / "html"
+    _make_obs(data, "1", 5, empty=True)
+    _make_obs(data, "2", 10)
+    _make_obs(data, "3", 12, dmag=1.5)
+    # One card per field: it must go to the changed/appeared afterglow (rank 1 anyway),
+    # so use a page cap of 1 with a steadier field ordering check on the JSON.
+    assert xn.main(["--data-dir", str(data), "--public-dir", str(public), "--days", "0",
+                    "--per-field", "1", "-q"]) == 0
+    out = json.loads((public / "new_transients" / "new_transients.json").read_text())
+    carded = [g for g in out["groups"] if g["card"]]
+    assert len(carded) == 1 and carded[0]["appeared"] and carded[0]["changed"]
+
+
+def test_a_single_epoch_or_one_outlier_does_not_make_a_change():
+    def det(night, mags, day):
+        return {"night": night, "mag": 15.0, "magerr": 0.05,
+                "points": [[61000 + day + k / 1440, m, 0.03, "N"] for k, m in enumerate(mags)]}
+    # Night with one epoch 1.5 mag off: not a night.
+    stats = xn.nightly_stats([det("2026-09-10", [15.0] * 6, 0), det("2026-09-12", [13.5], 2)], "N")
+    assert list(stats) == ["2026-09-10"]
+    # One wild epoch among six: the median and its error ignore it.
+    stats = xn.nightly_stats([det("2026-09-10", [15.0] * 6, 0), det("2026-09-12", [15.0, 15.02, 13.0, 14.98, 15.01, 15.0], 2)], "N")
+    d, sig = xn.change_between_nights(stats)
+    assert d < 0.05
+    # The band-blind summary still lists the single-epoch night.
+    assert len(xn.nightly_stats([det("2026-09-10", [15.0] * 6, 0), det("2026-09-12", [13.5], 2)], min_epochs_off=True)) == 2
+    # Within a night: five epochs are too few for the thirds test; one outlier in nine is ignored.
+    assert xn.within_night_change([det("2026-09-10", [15.0, 15.0, 15.0, 13.0, 15.0], 0)]) == (0.0, 0.0)
+    delta, sig = xn.within_night_change([det("2026-09-10", [15.0] * 8 + [13.0], 0)])
+    assert abs(delta) < 0.05
+
+
+def test_frame_positions_skip_nan_rows(tmp_path):
+    f = tmp_path / "x.ecsv"
+    f.write_text("# %ECSV 1.0\n# ---\nNUMBER ALPHA_J2000 DELTA_J2000\n1 100.0 20.0\n2 nan nan\n3 100.1 20.1\n")
+    assert xn.frame_positions(f) == [(100.0, 20.0), (100.1, 20.1)]
+    assert xn.cell_of(float("nan"), 20.0, 20.0) is None
+    assert len(xn.scan_cells(tmp_path, 20.0)) == 2
+
+
+def test_insane_magnitudes_and_bad_frames_are_dropped(tmp_path):
+    lc = tmp_path / "x_lightcurve.ecsv"
+    lc.write_text("# %ECSV 1.0\n# ---\nNUMBER MAG_CALIB MAGERR_CALIB mjd source_file\n"
+                  "1 15.5 0.1 61000.5 a-r-x.ecsv\n2 -28.0 0.1 61000.6 a-r-x.ecsv\n3 15.4 0.9 61000.7 a-r-x.ecsv\n")
+    assert [pt[1] for pt in xn.read_lightcurve(lc, "N")] == [15.5]
+    # Six stars of one field; the frame at mjd 61000.5 is 2 mag off for all of them.
+    clusters = []
+    for k in range(6):
+        pts = [[61000.0 + j / 1440, 15.0 + k, 0.03, "N"] for j in range(6)] + [[61000.5, 17.0 + k, 0.03, "N"]]
+        clusters.append(("F", [{"night": "2026-09-10", "mag": 15.0 + k, "magerr": 0.03, "points": pts}]))
+    bad = xn.frame_offsets(clusters)
+    assert bad[("F", "N", round(61000.5 / xn.FRAME_KEY_DAYS))] == pytest.approx(2.0, abs=0.01)
+    assert sum(xn.drop_bad_frames(d, f, bad) for f, d in clusters) == 6
+    assert all(len(d[0]["points"]) == 6 for _, d in clusters)
+
+
+def test_common_mode_extinction_trend_is_removed():
+    # Six stars fading together by 0.6 mag along the night (airmass): after the
+    # per-frame correction none of them changes within the night.
+    clusters = []
+    for k in range(6):
+        pts = [[61000.0 + j / 1440, 15.0 + k + 0.1 * j, 0.03, "N"] for j in range(7)]
+        clusters.append(("F", [{"night": "2026-09-10", "mag": 15.0 + k, "magerr": 0.03, "points": pts}]))
+    d, sig = xn.within_night_change(clusters[0][1])
+    assert d == pytest.approx(0.5, abs=0.05)      # medians of the first and last two epochs
+    off = xn.frame_offsets(clusters)
+    assert sum(xn.drop_bad_frames(dd, f, off) for f, dd in clusters) == 0
+    d, sig = xn.within_night_change(clusters[0][1])
+    assert abs(d) < 0.05
+
+
+def test_witness_efficiency_disqualifies_a_blind_observation(tmp_path):
+    # Twelve sources of one field; observation A detected all, observation B none.
+    facts = lambda oid: {"obs_id": oid, "center": [100.0, 20.0], "crpix": [512.0, 512.0],
+                         "cd": [-0.0003, 0.0, 0.0, 0.0003], "size": [1024, 1024], "maglim": 18.0, "n_det": 500,
+                         "nights": ["2026-09-01"], "object": "F", "first": "", "filter": "N", "first_frame": ""}
+    clusters, cells_a = [], set()
+    for k in range(12):
+        ra, dec = 100.0 + 0.01 * k, 20.0 + 0.005 * k
+        cells_a.add(xn.cell_of(ra, dec, 20.0))
+        clusters.append(("F", [{"night": "2026-09-05", "ra": ra, "dec": dec, "q": 1.0, "mag": 15.0, "magerr": 0.03,
+                                "points": [[61000.0 + j / 1440, 15.0, 0.03, "N"] for j in range(4)]}]))
+    xn.save_cells(tmp_path, "obs_A", cells_a)
+    xn.save_cells(tmp_path, "obs_B", set())
+    observations = [{"facts": facts("A")}, {"facts": facts("B")}]
+    w = xn.witness_efficiency(clusters, observations, tmp_path, {})
+    assert all(d for _, d in w["A"]) and not any(d for _, d in w["B"])
+    assert xn.witness_ok(w, "A", 15.0) is True and xn.witness_ok(w, "B", 15.0) is False
+    # No peers within two magnitudes: the observation as a whole decides (12 sources tested).
+    assert xn.witness_ok(w, "A", 9.0) is True and xn.witness_ok(w, "B", 9.0) is False
+    # Fewer than five peers and fewer than ten sources in all: no verdict.
+    assert xn.witness_ok(xn.witness_efficiency(clusters[:4], observations, tmp_path, {}), "A", 15.0) is None
+    assert xn.witness_ok(w, "C", 15.0) is None
+
+
+def test_a_frame_in_another_band_cannot_witness_a_miss(tmp_path):
+    # A g-band observation "misses" a source measured only in N: no verdict from it.
+    data, public = tmp_path / "work", tmp_path / "html"
+    _make_obs(data, "1", 5, empty=True)
+    _make_obs(data, "2", 10)
+    _make_obs(data, "3", 12, dmag=1.5)
+    for f in (data / "obs_1").glob("*.ecsv"):
+        f.write_text(f.read_text().replace("{FILTER: N}", "{FILTER: Sloan_g}"))
+    assert xn.main(["--data-dir", str(data), "--public-dir", str(public), "--days", "0", "-q"]) == 0
+    g = json.loads((public / "new_transients" / "new_transients.json").read_text())["groups"][0]
+    assert g["n_missed_before"] == 1 and g["appeared"] is False
+
+
+def test_within_night_change_needs_calibrated_frames():
+    det = {"night": "2026-09-09", "points": [[61000.0 + k / 1440, 15.0 + 0.2 * k, 0.02, "N"] for k in range(6)]}
+    assert xn.within_night_change([det])[0] == pytest.approx(0.8, abs=0.05)
+    assert xn.within_night_change([det], calibrated=set()) == (0.0, 0.0)
+    keys = {("N", round(pt[0] / xn.FRAME_KEY_DAYS)) for pt in det["points"]}
+    assert xn.within_night_change([det], calibrated=keys)[0] == pytest.approx(0.8, abs=0.05)
+
+
+def test_three_sources_suffice_to_drop_a_frame_that_is_magnitudes_off():
+    clusters = []
+    for k in range(3):
+        pts = [[61000.0 + j / 1440, 15.0 + k, 0.03, "N"] for j in range(5)] + [[61000.5, 21.0 + k, 0.03, "N"]]
+        clusters.append(("F", [{"night": "2026-09-10", "mag": 15.0 + k, "magerr": 0.03, "points": pts}]))
+    off = xn.frame_offsets(clusters)
+    assert off[("F", "N", round(61000.5 / xn.FRAME_KEY_DAYS))] == pytest.approx(6.0, abs=0.01)
+    assert len(off) == 1                                   # the good frames: three votes are too few to correct
+    assert sum(xn.drop_bad_frames(d, f, off) for f, d in clusters) == 3
+
+
+def test_half_a_night_of_failed_frames_is_dropped_not_the_good_half():
+    # Three good g frames at 12.5 and three failed ones at 18.4 in one night,
+    # plus a second night of good frames: the failed half goes, the rest stays.
+    clusters = []
+    for k in range(5):
+        n1 = [[61000.0 + j / 1440, 12.5 + k + 0.02 * j, 0.02, "Sloan_g"] for j in range(3)] + \
+             [[61000.003 + j / 1440, 18.4 + k, 0.02, "Sloan_g"] for j in range(3)]
+        n2 = [[61010.0 + j / 1440, 12.5 + k, 0.02, "Sloan_g"] for j in range(3)]
+        clusters.append(("F", [{"night": "2026-09-10", "mag": 12.5 + k, "magerr": 0.02, "points": n1},
+                               {"night": "2026-09-20", "mag": 12.5 + k, "magerr": 0.02, "points": n2}]))
+    off = xn.frame_offsets(clusters)
+    dropped = sum(xn.drop_bad_frames(d, f, off) for f, d in clusters)
+    assert dropped == 15
+    assert all(len(d[0]["points"]) == 3 and len(d[1]["points"]) == 3 for _, d in clusters)
+    assert all(abs(pt[1] - (12.5 + k)) < 0.1 for k, (_, d) in enumerate(clusters) for pt in d[0]["points"])
