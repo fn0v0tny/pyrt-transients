@@ -491,12 +491,19 @@ def save_epoch_results(
                                f"it will be recomputed on the next run")
 
 
-def epoch_is_cached(ecsv_path) -> bool:
+def epoch_is_cached(ecsv_path, degraded_retry_s: float = 0.0) -> bool:
     """Whether a per-epoch `<base>_transients.ecsv` counts as a finished
     result. A file stamped `DEGRADED` by save_epoch_results does not: it was
     produced while a catalogue or SkyBoT was unreachable, and re-running must
     get another chance at the full input rather than inheriting the outage
-    forever. Only the ECSV's YAML header is read, not the table."""
+    forever. Only the ECSV's YAML header is read, not the table.
+
+    `degraded_retry_s` > 0 keeps a degraded file for that long before it is
+    recomputed. Without it, an outage lasting days (SkyBoT's ephemeris
+    backend, 2026-10-05 onwards) makes every run redo every epoch of the
+    observation: 328 epochs of obs_104964 recomputed on each of its 654
+    runs, at ~5 MB of catalogue cache per epoch."""
+    import time
     from pathlib import Path
     path = Path(ecsv_path)
     if not path.exists():
@@ -507,6 +514,8 @@ def epoch_is_cached(ecsv_path) -> bool:
                 if not line.startswith("#"):
                     break
                 if "DEGRADED" in line:
+                    if degraded_retry_s > 0:
+                        return (time.time() - path.stat().st_mtime) < degraded_retry_s
                     return False
     except OSError:
         return False

@@ -71,6 +71,24 @@ class CatalogNoCoverageError(ValueError):
 # Per-instance optimisation cache (precomputed photometry + spatial indices)
 # ---------------------------------------------------------------------------
 
+# How many images' worth of pixel coordinates / KD-trees one catalogue keeps.
+# Each epoch of a run asks for its own (its WCS differs), and a run visits
+# every epoch once, so entries older than the last few are never read again.
+# Unbounded, they cost ~5 MB per epoch per run on a 20k-star field and
+# were the linear memory growth seen on lascaux50 (obs_104964: 328 epochs,
+# 1.7 GB per run under a 1 GB cgroup).
+PER_IMAGE_CACHE_LIMIT = 4
+
+
+def _remember(cache: Dict[str, Any], key: str, value: Any, limit: int = PER_IMAGE_CACHE_LIMIT) -> Any:
+    """Insert `key` and drop the oldest entries beyond `limit` (dicts keep
+    insertion order, so the oldest is the first)."""
+    cache[key] = value
+    while len(cache) > limit:
+        del cache[next(iter(cache))]
+    return value
+
+
 @dataclass
 class CatalogOptimizationCache:
     """Cache for precomputed catalog data to avoid repeated calculations."""
@@ -1350,9 +1368,9 @@ class CatTransients(_PyrtCatalog):
         try:
             coords = self._transform_catalog_to_pixel(detections)
             if self._photometric_cache is not None:
-                self._photometric_cache.pixel_coordinates[image_id] = coords
+                _remember(self._photometric_cache.pixel_coordinates, image_id, coords)
             else:
-                self._coordinate_cache[image_id] = coords
+                _remember(self._coordinate_cache, image_id, coords)
             return coords
         except Exception as exc:
             logging.debug(f"WCS transform failed: {exc}")
@@ -1376,7 +1394,7 @@ class CatTransients(_PyrtCatalog):
             else self._kdtree_cache
         )
         if index_id not in cache_dict:
-            cache_dict[index_id] = KDTree(coordinates)
+            _remember(cache_dict, index_id, KDTree(coordinates))
         return cache_dict[index_id]
 
     # --- local statistics ---

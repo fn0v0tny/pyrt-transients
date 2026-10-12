@@ -211,6 +211,12 @@ class DetectionConfig:
     # VSX variable star filter parameters
     vsx_filter_enabled: bool = True
     vsx_match_radius_arcsec: float = 2.5
+    # An epoch whose result was written while SkyBoT or a catalogue was
+    # unreachable is marked DEGRADED and recomputed later. This is how long
+    # the degraded result is kept before that retry (seconds; 0 = retry on
+    # every run, the old behaviour). A long outage otherwise turns every
+    # run into a full recompute of the observation (clustering.epoch_is_cached).
+    degraded_epoch_retry_s: float = 3600.0
     vsx_catalog_id: str = "B/vsx/vsx"
 
     # High proper-motion star veto on the final candidates: Gaia DR3 stars
@@ -344,6 +350,12 @@ class DetectionConfig:
     # pipeline's context, so uniform (equal-weight) combination is used
     # rather than photometric weighting.
     stacking_uniform_weighting: bool = True
+    # pyrt-combine --num-processes: its worker pool defaults to one process
+    # per CPU core, and every worker counts against the daemon's cgroup
+    # memory limit (lascaux50: 1 GB for the daemon and all its children).
+    # 2 matches the *_NUM_THREADS=2 throttle the production wrapper sets.
+    # 0 means pyrt-combine's own default.
+    stacking_num_processes: int = 2
     # Stack-only candidates and min_n_detections: the stack is one epoch, so
     # a source the stack reaches but single frames mostly do not can never
     # collect min_n_detections detections (GRB 190919B, tests/190919B: the

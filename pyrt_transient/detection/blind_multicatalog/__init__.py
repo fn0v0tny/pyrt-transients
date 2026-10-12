@@ -77,7 +77,8 @@ class BlindMulticatalogStrategy(DetectionStrategy):
             base_filename = get_base_filename(det_table, i)
             ecsv_path = self.data_dir / f"{base_filename}_transients.ecsv"
 
-            if clustering.epoch_is_cached(ecsv_path):
+            retry_s = float(getattr(config.detection, "degraded_epoch_retry_s", 0.0) or 0.0) if config else 0.0
+            if clustering.epoch_is_cached(ecsv_path, degraded_retry_s=retry_s):
                 self.logger.info(f"Epoch {i+1}/{len(detection_tables)} already processed ({base_filename}), skipping")
                 continue
             if ecsv_path.exists():

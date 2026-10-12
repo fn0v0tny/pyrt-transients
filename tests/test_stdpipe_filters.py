@@ -22,6 +22,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import numpy as np
 from astropy.table import Table
 from astropy.time import Time
 
@@ -117,3 +118,36 @@ def test_skybot_service_failure_degrades_to_no_rejection(monkeypatch):
     assert len(out) == 1 and n == 0
     assert not ok, ("an outage must be distinguishable from 'nothing to reject' -- "
                     "the epoch is cached on this flag")
+
+
+def test_skybot_backoff_after_consecutive_failures(monkeypatch):
+    """After SKYBOT_MAX_CONSECUTIVE_FAILURES failures in one process the
+    service is not asked again; a success in between resets the count."""
+    from astropy.time import Time
+    calls = {"n": 0}
+
+    def boom(*a, **k):
+        calls["n"] += 1
+        raise ValueError("No table found")
+
+    monkeypatch.setattr(stdpipe_filters.stdpipe_pipeline, "filter_transient_candidates", boom)
+    stdpipe_filters.reset_skybot_failure_count()
+    cands = Table({"ALPHA_J2000": [10.0], "DELTA_J2000": [20.0]})
+    t0 = Time("2021-06-20T00:00:00")
+    limit = stdpipe_filters.SKYBOT_MAX_CONSECUTIVE_FAILURES
+    for _ in range(limit + 5):
+        out, n, ok = stdpipe_filters.apply_skybot_filter(cands, time=t0)
+        assert ok is False and n == 0 and len(out) == 1
+    assert calls["n"] == limit, "the service must not be asked after the limit"
+
+    # A success resets the count.
+    stdpipe_filters.reset_skybot_failure_count()
+    monkeypatch.setattr(stdpipe_filters.stdpipe_pipeline, "filter_transient_candidates",
+                        lambda obj, **k: np.ones(len(obj), dtype=bool))
+    out, n, ok = stdpipe_filters.apply_skybot_filter(cands, time=t0)
+    assert ok is True
+    monkeypatch.setattr(stdpipe_filters.stdpipe_pipeline, "filter_transient_candidates", boom)
+    calls["n"] = 0
+    stdpipe_filters.apply_skybot_filter(cands, time=t0)
+    assert calls["n"] == 1
+    stdpipe_filters.reset_skybot_failure_count()

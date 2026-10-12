@@ -24,6 +24,19 @@ import stdpipe.pipeline as stdpipe_pipeline
 
 logger = logging.getLogger("detection.blind_multicatalog.stdpipe_filters")
 
+# SkyBoT is asked once per epoch. When its backend is down it fails the
+# same way for every epoch, and a run over a long observation then spends
+# one round trip per epoch learning nothing new. After this many
+# consecutive failures the rest of the run is marked degraded without
+# asking; the retry comes with a later run (clustering.epoch_is_cached).
+SKYBOT_MAX_CONSECUTIVE_FAILURES = 3
+_skybot_consecutive_failures = 0
+
+
+def reset_skybot_failure_count() -> None:
+    global _skybot_consecutive_failures
+    _skybot_consecutive_failures = 0
+
 
 def _to_stdpipe_columns(candidates):
     """Build the lowercase ra/dec/flags/magerr/fwhm table stdpipe.pipeline
@@ -99,6 +112,14 @@ def apply_skybot_filter(candidates, time, match_radius_arcsec=2.5):
     if time is None:
         return candidates, 0, False
 
+    global _skybot_consecutive_failures
+    if _skybot_consecutive_failures >= SKYBOT_MAX_CONSECUTIVE_FAILURES:
+        if _skybot_consecutive_failures == SKYBOT_MAX_CONSECUTIVE_FAILURES:
+            logger.warning(f"SkyBoT failed {SKYBOT_MAX_CONSECUTIVE_FAILURES} times in a row; "
+                           "not asked again this run, remaining epochs are marked degraded")
+            _skybot_consecutive_failures += 1
+        return candidates, 0, False
+
     obj = _to_stdpipe_columns(candidates)
     try:
         mask = stdpipe_pipeline.filter_transient_candidates(
@@ -116,13 +137,19 @@ def apply_skybot_filter(candidates, time, match_radius_arcsec=2.5):
         # the service answered, and the answer was "no solar-system objects
         # here". That is a real, complete cross-match.
         logger.debug(f"SkyBoT returned no solar-system objects ({e!r})")
+        _skybot_consecutive_failures = 0
         return candidates, 0, True
     except Exception as e:  # service down / error page / timeout: astroquery raises
         # ValueError("No table found"), requests exceptions, etc. An asteroid
         # cross-match that cannot run must not abort the epoch (it did, for
         # every burst of the 2026-09-04 archive replay while SkyBoT was down)
         # -- but it must not pass for a finished one either.
+        # SkyBoT itself answers QUERY_STATUS=ERROR with no table when its
+        # ephemeris backend fails (seen 2026-10-05 to 10-12), which astroquery
+        # surfaces as that ValueError.
+        _skybot_consecutive_failures += 1
         logger.warning(f"SkyBoT cross-match unavailable ({e!r}); asteroids not rejected this epoch")
         return candidates, 0, False
+    _skybot_consecutive_failures = 0
     n_removed = int(np.sum(~mask))
     return candidates[mask], n_removed, True
