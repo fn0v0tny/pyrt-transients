@@ -477,6 +477,39 @@ every deploy.
 lascaux50 two such edits sat uncommitted for weeks, and a plain pull would
 have erased them (see section 10).
 
+## 11. Reference deployment: lascaux
+
+Same unit and daemon as lascaux50 (`/etc/systemd/system/transient-daemon.service`
+running `~/bin/transient_daemon.py`, `MemoryLimit=1G`, the ignored `CPUQuota`
+line), but its daemon is a different, newer script: a 3-slot GRB executor plus
+one slot for everything else, a 900 s per-frame timeout, and the FITS file is
+handed over as `<stem>-dft.fits` next to `<stem>-df.ecsv`. The pipeline there
+was a flat copy of the old pre-package code in `~/bin/` until 2026-10-12.
+
+- **Since 2026-10-12** `~/bin/pipeline_magic.py` is the same wrapper as on
+  lascaux50 (runs `tools/pipeline_entry.py` from the checkout, status page
+  title "lascaux transient pipeline"); the flat pipeline it replaced is
+  `~/bin/pipeline_magic.py.bak-20261012`.
+- Venv `~/bin/pyrt_transient_venv` (Python 3.11.2, the same pinned versions
+  as lascaux50), editable checkout `~/src/pyrt_transient_src` at main
+  9d93bb2, `stdpipe` editable from `~/src/stdpipe` (karpov-sv/stdpipe
+  0ab6028), and `pyrt` from mates' checkout `/storage/home/mates/pyrt/main`
+  through `pyrt_shared.pth` (that is also what `/usr/local/bin/pyrt-combine`
+  uses). The package was installed with `--no-deps`, since `pyrt` is not on
+  PyPI.
+- **FITS retention** (the flat pipeline deleted the FITS copies of
+  observations idle for 7 days) is now `~/bin/fits_retention.sh`, meant for
+  the user's crontab:
+  `17 4 * * * /home/fnovotny/bin/fits_retention.sh >> /home/fnovotny/logs/fits_retention.log 2>&1`
+- Local ATLAS at `/home/mates/cat/atlas`; the `stars` database is reachable
+  for the GRB priority lookup.
+- Smoke test of the switch: `~/tmp/smoke_20261012/` (3 frames of obs_60614
+  under a scratch HOME, all rc=0, website generated).
+- This is the host whose OOM kill of a pipeline run on 2026-10-11 23:52 UTC
+  tripped the ZFS 2.1.11 usercopy BUG (section 10 has the limit story);
+  the root-level fixes for it are staged as `~/hostfix/apply_root_fixes.sh`
+  on both hosts.
+
 ## 10. Reference deployment: lascaux50
 
 - **Code:**
