@@ -255,6 +255,56 @@ def test_combine_epochs_success_with_stub_binary():
         print("test_combine_epochs_success_with_stub_binary: PASS")
 
 
+_FAKE_COMBINE_RECORDING_SCRIPT = """#!/bin/sh
+# Writes the output like _FAKE_COMBINE_SCRIPT and records its argv next to it.
+out=""
+prev=""
+for arg in "$@"; do
+    if [ "$prev" = "-o" ]; then
+        out="$arg"
+    fi
+    prev="$arg"
+done
+if [ -n "$out" ]; then
+    printf 'FAKEFITS' > "$out"
+    printf '%s\n' "$@" > "$out.args"
+fi
+exit 0
+"""
+
+
+def _combine_argv(d: Path, **kwargs) -> list:
+    """Run combine_epochs against the recording stub; return pyrt-combine's argv."""
+    _write_stub_binary(d, _FAKE_COMBINE_RECORDING_SCRIPT)
+    restore = _set_path([d])
+    try:
+        out_path = d / "stack.fits"
+        result = stacking.combine_epochs([Path("a.fits"), Path("b.fits")], out_path, **kwargs)
+    finally:
+        restore()
+    assert result == out_path
+    # The stub was handed the temp output path, so the record sits next to it.
+    args_files = list(d.glob("*.args"))
+    assert len(args_files) == 1, args_files
+    return args_files[0].read_text().splitlines()
+
+
+def test_combine_epochs_caps_pyrt_combine_workers():
+    """pyrt-combine forks one worker per CPU core by default, and the daemon's
+    cgroup memory limit covers every one of them: num_processes must reach
+    the CLI as --num-processes, and 0/None must leave the CLI's default."""
+    with tempfile.TemporaryDirectory() as d:
+        argv = _combine_argv(Path(d), num_processes=2)
+        assert argv[argv.index("--num-processes") + 1] == "2"
+        # The flag must come before the positional inputs.
+        assert argv.index("--num-processes") < argv.index("a.fits")
+    with tempfile.TemporaryDirectory() as d:
+        assert "--num-processes" not in _combine_argv(Path(d), num_processes=0)
+    with tempfile.TemporaryDirectory() as d:
+        assert "--num-processes" not in _combine_argv(Path(d))
+    print("test_combine_epochs_caps_pyrt_combine_workers: PASS")
+
+
 def test_combine_epochs_returns_none_on_nonzero_exit():
     with tempfile.TemporaryDirectory() as d:
         d = Path(d)
@@ -476,7 +526,7 @@ def test_build_stack_ecsv_uses_empirical_maglim_not_build_diff_ecsvs_fallback():
 # maybe_build_stack_table
 # ---------------------------------------------------------------------------
 
-def _fake_combine(fits_paths, output_path, uniform=True):
+def _fake_combine(fits_paths, output_path, uniform=True, num_processes=None):
     Path(output_path).write_bytes(b"FAKEFITS")
     return Path(output_path)
 
@@ -675,7 +725,7 @@ def test_maybe_build_stack_table_excludes_mismatched_filter_and_exptime():
     # time than the majority must not reach combine_epochs at all.
     calls = []
 
-    def capturing_combine(fits_paths, output_path, uniform=True):
+    def capturing_combine(fits_paths, output_path, uniform=True, num_processes=None):
         calls.append(list(fits_paths))
         return _fake_combine(fits_paths, output_path, uniform=uniform)
 

@@ -86,8 +86,14 @@ def combine_epochs(
     fits_paths: List[Path],
     output_path: Path,
     uniform: bool = True,
+    num_processes: Optional[int] = None,
 ) -> Optional[Path]:
     """Combine `fits_paths` into `output_path` via the `pyrt-combine` CLI.
+
+    `num_processes` caps the worker pool pyrt-combine forks (its default is
+    one worker per CPU core, each a full Python with astropy loaded). The
+    daemon's cgroup memory limit covers those workers too, so an uncapped
+    pool on a many-core host is what pushes a stacking run past it.
 
     Returns `output_path` on success, or None -- never raises -- if the
     binary isn't installed, the subprocess exits non-zero, or it exits 0
@@ -128,6 +134,8 @@ def combine_epochs(
     cmd = [binary, "-o", str(tmp_output_path)]
     if uniform:
         cmd.append("-u")
+    if num_processes is not None and num_processes > 0:
+        cmd.extend(["--num-processes", str(num_processes)])
     cmd.extend(str(p) for p in fits_paths)
 
     def _cleanup_tmp():
@@ -495,6 +503,7 @@ def _attempt_rebuild(obs_dir: Path, real_tables: List[Table], det_cfg, n_real_ep
     try:
         combined = combine_epochs(
             fits_paths, staged_fits_path, uniform=det_cfg.stacking_uniform_weighting,
+            num_processes=det_cfg.stacking_num_processes,
         )
         if combined is None:
             return

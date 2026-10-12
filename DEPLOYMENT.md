@@ -180,8 +180,16 @@ Environment=PYRT_STATUS_DAEMON_LOG=/srv/pyrt-transient/logs/transient_daemon.log
 # "# ..." and throws away the whole value (lascaux50's CPUQuota=200% has
 # been ignored for exactly this reason).
 CPUQuota=200%
-# lascaux50 runs with 1 GB. Raise it if jobs die with exit -9 while stacking.
-MemoryMax=2G
+# The limit covers the whole cgroup: the daemon, every pipeline run it has
+# going (PYRT_TRANSIENT_MAX_PARALLEL of them; one run peaks at ~450 MB on
+# 1k x 1k frames, measured 2026-10-12) and pyrt-combine's worker pool
+# while stacking (one process per core unless stacking_num_processes caps
+# it). Size it as ~0.5 GB per parallel run plus 1 GB of headroom; lascaux50
+# died with a 1 GB limit and 4 parallel runs. MemoryHigh throttles before
+# the kill, and OOMPolicy=continue loses the pipeline run, not the daemon.
+MemoryMax=3G
+MemoryHigh=2500M
+OOMPolicy=continue
 
 [Install]
 WantedBy=multi-user.target
@@ -487,7 +495,19 @@ have erased them (see section 10).
     `~/public_html/obs_<id>`, and the log to `~/logs/transient_daemon.log`.
 - **Throttle:**
   - The unit's `CPUQuota=200%  # ...` line is ignored by systemd
-    (`CPUQuotaPerSecUSec=infinity`). `MemoryLimit=1G` does apply.
+    (`CPUQuotaPerSecUSec=infinity`). `MemoryLimit=1G` does apply, and it
+    is too small: it covers the daemon plus all 4 parallel pipeline runs
+    plus pyrt-combine's workers. The cgroup sits at its ceiling (2026-10-12:
+    `memory.peak` 1.0 GB, `memory.events max` 32.6 million) and, since swap
+    is not limited, pages out instead of killing: 472 frames hit the 900 s
+    timeout in September and October. On lascaux, which runs the same unit
+    without that swap headroom, the OOM killer took a pipeline_magic run at
+    ~1 GB on 2026-10-11 23:52 UTC and tripped a ZFS 2.1.11 usercopy BUG on
+    the way; the daemon restarted 10 s later. One run on a 328-epoch
+    observation reached 1.7 GB before the per-image catalogue caches were
+    bounded (2026-10-12) and 0.64 GB after. Until root raises the limit
+    (see section 3), keep `stacking_num_processes` at 2 and consider
+    `MAX_PARALLEL_PROCESSES = 2` in `~/bin/transient_daemon.py`.
   - Changing the unit needs root, so the throttle lives in
     `~/bin/pipeline_magic.py`.
   - Since 2026-09-11 that wrapper runs `tools/pipeline_entry.py` from the
