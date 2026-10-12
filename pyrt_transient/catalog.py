@@ -11,11 +11,13 @@ Provides:
   Catalog                  — backward-compatible alias for CatTransients
 """
 
+import concurrent.futures
 import hashlib
 import json
 import logging
 import os
 import pickle
+import socket
 import time
 import warnings
 from dataclasses import dataclass
@@ -65,6 +67,31 @@ class CatalogNoCoverageError(ValueError):
     campaign every time.  Kept a ValueError so the plain
     ``No data retrieved from ...`` handlers this replaced still catch it.
     """
+
+
+# A Gaia TAP query gets this long (or QueryParams.timeout, whichever is
+# longer) before it is abandoned. Vizier gets the same floor in
+# _get_panstarrs_vizier_data; the daemon kills a frame at 900 s.
+GAIA_QUERY_DEADLINE_S = 300.0
+
+
+def _call_with_deadline(fn, seconds: float, what: str = "call"):
+    """Run `fn()` in a worker thread and give up after `seconds`, raising
+    TimeoutError. New sockets opened meanwhile get `seconds` as their
+    timeout, so a blocked read inside the worker ends too instead of
+    keeping the thread (and the connection) forever."""
+    previous = socket.getdefaulttimeout()
+    socket.setdefaulttimeout(seconds)
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1, thread_name_prefix="deadline")
+    try:
+        future = pool.submit(fn)
+        try:
+            return future.result(timeout=seconds)
+        except concurrent.futures.TimeoutError:
+            raise TimeoutError(f"{what} exceeded {seconds:.0f} s") from None
+    finally:
+        socket.setdefaulttimeout(previous)
+        pool.shutdown(wait=False)
 
 
 # ---------------------------------------------------------------------------
@@ -609,8 +636,20 @@ class CatTransients(_PyrtCatalog):
         return sloan_g, sloan_r
 
     def _get_gaia_data(self) -> Optional[astropy.table.Table]:
-        """Fetch Gaia data and append Sloan_g/Sloan_r synthetic columns."""
-        result = super()._get_gaia_data()
+        """Fetch Gaia data and append Sloan_g/Sloan_r synthetic columns.
+
+        The parent's query goes through astroquery's TAP client, which opens
+        its HTTP connections without a timeout and polls the asynchronous
+        job with no deadline: on 2026-10-12 one query sat for more than ten
+        minutes on an open socket to the Gaia archive, locally and on
+        lascaux50, and in production that is the whole 900 s daemon budget
+        of a frame. The call is therefore run under a deadline, and the
+        sockets it opens get a timeout, so a dead archive turns into a
+        failure that the cache fallback and the shared failure marker
+        already know how to handle.
+        """
+        deadline = max(GAIA_QUERY_DEADLINE_S, float(self._query_params.timeout or 0))
+        result = _call_with_deadline(super()._get_gaia_data, deadline, what="Gaia query")
         if result is not None and "G" in result.colnames:
             for col in ("G", "BP", "RP"):
                 # Masked (missing BP/RP) -> NaN, never a fill value.
