@@ -165,17 +165,23 @@ const transientViewer = {
   },
 
   // galaxy_flag from galaxy_flag.py: 'galaxy' = a catalogued galaxy at its
-  // own brightness (constant source), 'host' = brighter than its galaxy.
+  // own brightness (the constant ones are removed before the page is
+  // built, so a 'galaxy' here varied within the run), 'host' = brighter
+  // than its galaxy, 'near_galaxy' = a fainter source projected on one.
   getGalaxyBadge(candidate) {
     const flag = candidate.galaxy_flag;
-    if (flag !== 'galaxy' && flag !== 'host') return '';
-    const mag = candidate.galaxy_mag, sep = candidate.galaxy_sep_arcsec;
+    const styles = {
+      galaxy: { color: '#7f8c8d', label: '🌌 Galaxy' },
+      host: { color: '#16a085', label: '🌌 On host' },
+      near_galaxy: { color: '#95a5a6', label: '🌌 Near galaxy' },
+    };
+    const style = styles[flag];
+    if (!style) return '';
+    const mag = candidate.galaxy_mag, sep = candidate.galaxy_sep_arcsec, dmag = candidate.galaxy_dmag;
     const title = `${candidate.galaxy_catalog || ''} galaxy` +
       (mag != null ? `, ${Number(mag).toFixed(2)} mag` : '') +
+      (dmag != null && isFinite(dmag) ? ` (measured ${Number(dmag) >= 0 ? '+' : ''}${Number(dmag).toFixed(2)})` : '') +
       (sep != null ? `, ${Number(sep).toFixed(1)}" away` : '');
-    const style = flag === 'galaxy'
-      ? { color: '#7f8c8d', label: '🌌 Galaxy' }
-      : { color: '#16a085', label: '🌌 On host' };
     return `<span class="galaxy-badge" title="${title}" style="background-color: ${style.color}; color: white; padding: 2px 6px; border-radius: 3px; font-size: 0.7em; font-weight: bold; margin-left: 5px;">${style.label}</span>`;
   },
 

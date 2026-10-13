@@ -30,7 +30,7 @@ from pyrt_transient.core.union_find import UnionFind
 from pyrt_transient.core.matching import match_radius
 from pyrt_transient.core.scoring import add_score_probability, apply_lightcurve_score_factor
 from pyrt_transient.detection.blind_multicatalog.galaxy_flag import (
-    band_for_filter, flag_known_galaxies,
+    band_for_filter, flag_known_galaxies, remove_constant_galaxies,
 )
 from pyrt_transient.detection.blind_multicatalog.stdpipe_filters import (
     apply_skybot_filter,
@@ -947,20 +947,56 @@ def combine_with_lightcurves(
                 surviving_ids = set(str(t) for t in result_table['transient_id'])
                 lightcurves = {k: v for k, v in lightcurves.items() if k in surviving_ids}
 
-        # Known-galaxy label: annotates, never removes (a transient on its
-        # host must survive) -- see galaxy_flag.py. After the quality gate
-        # so only the candidates that are kept cost a catalogue query.
+        # Known-galaxy label, then the removal of the catalogued galaxies
+        # that are also constant within the run -- see galaxy_flag.py. A
+        # transient on its host ('host': brighter than the galaxy) or one
+        # that varies survives. After the quality gate so only the
+        # candidates that are kept cost a catalogue query.
         if config and config.detection.galaxy_flag_enabled and len(result_table) > 0:
+            det_cfg = config.detection
             phfilter = next((t.meta.get("PHFILTER") for t in detection_tables
                              if t.meta.get("PHFILTER")), None)
+            # The frames' seeing in arcsec (FWHM px x PIXEL "/px), for the
+            # resolved-galaxy decision; None lets galaxy_flag use its default.
+            seeing = []
+            for t in detection_tables:
+                try:
+                    v = float(t.meta["FWHM"]) * float(t.meta["PIXEL"])
+                except (KeyError, TypeError, ValueError):
+                    continue
+                if np.isfinite(v) and v > 0:
+                    seeing.append(v)
             result_table = flag_known_galaxies(
                 result_table,
                 band=band_for_filter(phfilter),
-                catalogs=config.detection.galaxy_flag_catalogs,
-                match_radius_arcsec=config.detection.galaxy_match_radius_arcsec,
-                host_margin_mag=config.detection.galaxy_host_margin_mag,
+                catalogs=det_cfg.galaxy_flag_catalogs,
+                match_radius_arcsec=det_cfg.galaxy_match_radius_arcsec,
+                host_margin_mag=det_cfg.galaxy_host_margin_mag,
+                faint_margin_mag=getattr(det_cfg, "galaxy_faint_margin_mag", 1.0),
+                radius_scale=getattr(det_cfg, "galaxy_radius_scale", 1.0),
+                query_radius_arcsec=getattr(det_cfg, "galaxy_query_radius_arcsec", None),
+                seeing_arcsec=float(np.median(seeing)) if seeing else None,
                 cache_dir=data_dir,
             )
+            if getattr(det_cfg, "galaxy_remove_constant", False):
+                # Galaxies inside the trigger's error circle (GRB_RA/GRB_DEC,
+                # GRB_ERR deg in the frame meta) are host candidates: kept.
+                keep_within = None
+                if getattr(det_cfg, "galaxy_keep_in_error_circle", True):
+                    for t in detection_tables:
+                        try:
+                            keep_within = (float(t.meta["GRB_RA"]), float(t.meta["GRB_DEC"]),
+                                           float(t.meta["GRB_ERR"]) * 3600.0)
+                            break
+                        except (KeyError, TypeError, ValueError):
+                            continue
+                result_table, n_removed = remove_constant_galaxies(
+                    result_table, max_chi2=getattr(det_cfg, "galaxy_remove_max_chi2", 2.0),
+                    keep_within=keep_within)
+                if n_removed > 0:
+                    logging.info(f"Constant-galaxy removal dropped {n_removed} final candidates")
+                    surviving_ids = set(str(t) for t in result_table['transient_id'])
+                    lightcurves = {k: v for k, v in lightcurves.items() if k in surviving_ids}
 
         # Trail detection summary logging
         if 'candidate_type' in result_table.colnames:

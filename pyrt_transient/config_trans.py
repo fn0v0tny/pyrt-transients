@@ -233,15 +233,34 @@ class DetectionConfig:
     high_pm_match_radius_arcsec: float = 3.0
 
     # Known-galaxy label (detection/blind_multicatalog/galaxy_flag.py) on the
-    # final candidates: 'galaxy' when a Legacy Survey DR10 / Pan-STARRS
-    # extended source sits under the candidate at a total magnitude the
-    # detection doesn't exceed by more than galaxy_host_margin_mag; 'host'
-    # when it does (a transient on its galaxy). Labels only, never removes;
-    # 'galaxy' candidates don't count toward stacking_score_threshold.
+    # final candidates, against Legacy Survey DR10 / Pan-STARRS extended
+    # sources within galaxy_match_radius_arcsec of the candidate, widened to
+    # galaxy_radius_scale x the galaxy's half-light radius where known (and
+    # never beyond galaxy_query_radius_arcsec, the cone each candidate is
+    # queried with). Measured minus total galaxy magnitude decides the label:
+    # 'host' below -galaxy_host_margin_mag (a transient on its galaxy),
+    # 'galaxy' up to +galaxy_faint_margin_mag (the galaxy's own light),
+    # 'near_galaxy' beyond that (a fainter source projected on it).
+    # 'galaxy' candidates don't count toward stacking_score_threshold, and
+    # with galaxy_remove_constant the ones whose lightcurve is also
+    # consistent with a constant source (mag_chi2_reduced <=
+    # galaxy_remove_max_chi2) are dropped from the final table: a galaxy is
+    # constant, a transient on one brightens or fades. 'host' and
+    # 'near_galaxy' are never removed, nor (galaxy_keep_in_error_circle)
+    # is a galaxy inside the trigger's error circle (GRB_RA/GRB_DEC/GRB_ERR
+    # in the frame meta): that is a host candidate, and a nuclear
+    # transient fainter than its host looks constant on one night
+    # (EP261006a on D50).
     galaxy_flag_enabled: bool = True
     galaxy_flag_catalogs: List[str] = field(default_factory=lambda: ["legacysurvey", "panstarrs"])
     galaxy_match_radius_arcsec: float = 2.0
     galaxy_host_margin_mag: float = 0.75
+    galaxy_faint_margin_mag: float = 1.0
+    galaxy_radius_scale: float = 1.0
+    galaxy_query_radius_arcsec: float = 10.0
+    galaxy_remove_constant: bool = True
+    galaxy_remove_max_chi2: float = 2.0
+    galaxy_keep_in_error_circle: bool = True
 
     # Detection strategy: "blind_multicatalog" (cross-match against reference
     # catalogs, the only strategy today) or "subtraction" (differencing
