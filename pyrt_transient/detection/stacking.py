@@ -284,10 +284,20 @@ def _empirical_maglim(table: Table, stack_fits_path: Path,
 
 
 def _fits_path_for_table(table: Table) -> Optional[Path]:
+    """The frame behind an ECSV: `<stem>.fits`, or D50's `<stem>t.fits`
+    (the astrometry step appends the "t", so `...-df.ecsv` sits next to
+    `...-dft.fits`). None when neither exists: swapping the extension
+    alone handed pyrt-combine a nonexistent `...-df.fits` for every D50
+    epoch, and it failed with "No valid images found" on each rebuild.
+    """
     filename = table.meta.get("filename")
     if not filename:
         return None
-    return Path(filename).with_suffix(".fits")
+    p = Path(filename)
+    for cand in (p.with_suffix(".fits"), p.with_name(p.stem + "t.fits")):
+        if cand.exists():
+            return cand
+    return None
 
 
 def _band_exptime_key(table: Table) -> Optional[Tuple[str, float]]:

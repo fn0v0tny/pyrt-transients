@@ -98,7 +98,12 @@ def _make_config(**overrides):
 
 def _make_detection_table(index: int, obs_dir: Path, phfilter: str = "Sloan_r", exptime: float = 10.0) -> Table:
     t = Table({"X_IMAGE": [1.0], "MAG_CALIB": [18.0]})
-    ecsv_path = obs_dir / f"epoch{index}.ecsv"
+    # Frames live beside their ECSV and must exist to be stacked; kept out
+    # of obs_dir itself, where tests count the *.fits the frontend would read.
+    frames_dir = obs_dir / "frames"
+    frames_dir.mkdir(exist_ok=True)
+    ecsv_path = frames_dir / f"epoch{index}.ecsv"
+    ecsv_path.with_suffix(".fits").touch()
     t.meta["filename"] = str(ecsv_path)
     t.meta["CTRRA"] = 180.0
     t.meta["CTRDEC"] = 30.0
@@ -116,6 +121,61 @@ def _write_candidates_tbl(obs_dir: Path, quality_score, galaxy_flag=None) -> Non
 
 def _assert_close(actual, expected, label, tol=1e-6):
     assert abs(actual - expected) < tol, f"{label}: expected {expected}, got {actual}"
+
+
+# ---------------------------------------------------------------------------
+# _fits_path_for_table
+# ---------------------------------------------------------------------------
+
+def test_fits_path_for_table_finds_d50_dft_frames_and_drops_missing_ones():
+    # D50: "...-df.ecsv" sits next to "...-dft.fits". Swapping the extension
+    # gave a nonexistent "...-df.fits" and pyrt-combine failed with "No valid
+    # images found" on every rebuild (EP 261006, obs_105040).
+    with tempfile.TemporaryDirectory() as d:
+        t = Table({"a": [1]})
+        dft = Path(d) / "20261006182618-394-r-300-dft.fits"
+        dft.touch()
+        t.meta["filename"] = str(Path(d) / "20261006182618-394-r-300-df.ecsv")
+        assert stacking._fits_path_for_table(t) == dft
+
+        plain = Path(d) / "epoch1.fits"
+        plain.touch()
+        t.meta["filename"] = str(Path(d) / "epoch1.ecsv")
+        assert stacking._fits_path_for_table(t) == plain
+
+        t.meta["filename"] = str(Path(d) / "gone-df.ecsv")
+        assert stacking._fits_path_for_table(t) is None
+        assert stacking._fits_path_for_table(Table({"a": [1]})) is None
+    print("test_fits_path_for_table_finds_d50_dft_frames_and_drops_missing_ones: PASS")
+
+
+def test_attempt_rebuild_hands_pyrt_combine_the_dft_frames():
+    calls = []
+
+    def capturing_combine(fits_paths, output_path, uniform=True, num_processes=None):
+        calls.append(list(fits_paths))
+        return _fake_combine(fits_paths, output_path, uniform=uniform)
+
+    restore = _patch_build_fns(fake_combine=capturing_combine, fake_build_ecsv=_fake_build_stack_ecsv)
+    try:
+        with tempfile.TemporaryDirectory() as d:
+            obs_dir = Path(d)
+            frames = obs_dir / "frames"
+            frames.mkdir()
+            tables = []
+            for i in range(4):
+                t = _make_detection_table(i, obs_dir)
+                Path(t.meta["filename"]).with_suffix(".fits").unlink()
+                t.meta["filename"] = str(frames / f"f{i}-df.ecsv")
+                if i < 3:  # the fourth frame's FITS is missing
+                    (frames / f"f{i}-dft.fits").touch()
+                tables.append(t)
+            cfg = _make_config(stacking_enabled=True, stacking_min_epochs=1, stacking_rebuild_interval=1)
+            stacking._attempt_rebuild(obs_dir, tables, cfg.detection, len(tables), _LOG)
+            assert calls == [[frames / f"f{i}-dft.fits" for i in range(3)]]
+    finally:
+        restore()
+    print("test_attempt_rebuild_hands_pyrt_combine_the_dft_frames: PASS")
 
 
 # ---------------------------------------------------------------------------
@@ -875,6 +935,8 @@ def test_maybe_build_stack_table_respects_rebuild_interval():
 
 
 if __name__ == "__main__":
+    test_fits_path_for_table_finds_d50_dft_frames_and_drops_missing_ones()
+    test_attempt_rebuild_hands_pyrt_combine_the_dft_frames()
     test_select_stack_inputs_returns_all_when_fewer_than_max()
     test_select_stack_inputs_keeps_most_recent()
     test_band_exptime_key_rounds_exptime_and_stringifies_filter()
