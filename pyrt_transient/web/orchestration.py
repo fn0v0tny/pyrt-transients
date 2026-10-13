@@ -27,6 +27,10 @@ def generate_frontend(obs_dir, observation_id, config):
         up_to_date, current_hash = is_up_to_date(website_dir, candidates_file)
         if up_to_date:
             logging.info(f"Website up-to-date for observation {observation_id}, skipping generation")
+            # The host search (detection/host_search/) reruns as frames
+            # accumulate without touching candidates.tbl; its table still
+            # has to reach the page.
+            _refresh_host_candidates(Path(obs_dir), website_dir)
             return True
 
         logging.info(f"Generating website for observation {observation_id}...")
@@ -47,3 +51,13 @@ def generate_frontend(obs_dir, observation_id, config):
     except Exception as e:
         logging.error(f"Frontend generation failed: {e}", exc_info=True)
         return False
+
+
+def _refresh_host_candidates(obs_dir, website_dir):
+    import shutil
+    src, dst = obs_dir / "host_candidates.json", Path(website_dir) / "host_candidates.json"
+    try:
+        if src.exists() and website_dir.is_dir() and (not dst.exists() or src.stat().st_mtime > dst.stat().st_mtime):
+            shutil.copy2(src, dst)
+    except OSError as e:
+        logging.warning(f"Could not refresh host_candidates.json: {e}")

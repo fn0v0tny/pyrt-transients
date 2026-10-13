@@ -1602,8 +1602,23 @@ class FrontendGenerator:
         
         return lightcurve_info if lightcurve_info else None
     
+    def copy_host_candidates(self):
+        """The host search's table for the page (detection/host_search/),
+        when the observation has one. Rewritten every time: the search
+        reruns as frames accumulate."""
+        source_path = self.data_dir / "host_candidates.json"
+        dest_path = self.output_dir / "host_candidates.json"
+        try:
+            if source_path.exists():
+                shutil.copy2(source_path, dest_path)
+            elif dest_path.exists():
+                dest_path.unlink()
+        except OSError as e:
+            logging.warning(f"Could not copy host_candidates.json: {e}")
+
     def copy_summary_files(self):
         """Copy essential summary files only if they exist."""
+        self.copy_host_candidates()
         # Only copy the enhanced summary which is most useful
         essential_files = [
             "lightcurves_summary_enhanced.png"

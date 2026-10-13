@@ -56,12 +56,20 @@ dev = [
 ps1 = [
     "fitsio",
 ]
+# Host-galaxy search in a trigger's error circle (detection/host_search/):
+# stacks the night's frames on one grid. Without it the search is skipped
+# with a warning; `hotpants` must be on PATH as well.
+hostsearch = [
+    "reproject>=0.10",
+]
 
 [project.scripts]
 # Run the detection pipeline directly from the command line
 pyrt-transient-pipeline    = "pyrt_transient.pipeline_magic:main"
 pyrt-transient-daemon      = "pyrt_transient.transient_daemon:main"
 pyrt-transient-sn-pipeline = "pyrt_transient.pipeline_magic_sn:main"
+# Template prefetch for the host search (one position, or --watch RTS2 targets)
+pyrt-transient-prefetch    = "pyrt_transient.detection.host_search.prefetch:main"
 
 [project.urls]
 Repository = "https://github.com/fn0v0tny/pyrt-transients"

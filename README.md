@@ -263,6 +263,59 @@ seconds-since-`t0` at which it was reported, final score and rank),
 real target, vs. epoch count), `completeness.pdf`, `latency.pdf`,
 `spurious.pdf`, `summary.json`.
 
+## Host-galaxy search for trigger observations
+
+The catalogue cross-match finds a transient that is *new* or *brighter* than
+its catalogue entry. A transient fainter than the galaxy it sits on is
+neither: EP261006a (AT 2026aetp, a nuclear tidal disruption event at
+r = 20.2 host-subtracted on a 17.7 mag galaxy) was a constant, catalogued
+'galaxy' candidate on every D50 night. For observations whose frames carry
+a trigger circle (`GRB_RA`, `GRB_DEC`, `GRB_ERR`), `detection/host_search/`
+answers the other question, *which galaxy in the circle is the host*, with
+two independent pieces of evidence:
+
+- a prior: every catalogued galaxy in the circle (Legacy Survey DR10 with
+  photometric redshifts, Pan-STARRS where DR10 has no coverage), ranked by
+  how many galaxies at least that bright a random circle of that size
+  contains (`n_exp`, Bloom et al. 2002 counts);
+- a measurement: one PSF-matched `hotpants` subtraction of the error-circle
+  region of the night's stack against an archival survey image, the
+  kernel fitted on the field's stars, and the residual at each galaxy's
+  nucleus (0.5 FWHM aperture) compared with the other galaxies' residuals,
+  which set the systematic floor (`excess_sigma`).
+
+The result is `host_candidates.ecsv` / `.json` in the observation directory
+and a table above the candidate detail on the page, ordered by the
+residual and then by the prior. On EP261006a's first night (40 × 300 s,
+0.6 to 4 h after the trigger) the host is rank 1 of 35 at S/N 11 and
++2.3 σ; five nights later it is a 28 σ outlier. The run costs about a
+minute per rebuild, almost all of it the stack; it is throttled like
+stacking (`host_search.min_frames`, `rebuild_interval`) and never raises.
+
+The survey template is the slow external step (10-120 s per field) and the
+same file serves every night, so it is fetched ahead of time: the first
+frame of a trigger observation (on D50 the 0.1 s pointing frames, some
+15 min before the first science frame) starts a detached
+`pyrt-transient-prefetch` for the trigger position, and
+`pyrt-transient-prefetch --watch` (or `PYRT_TRANSIENT_PREFETCH_WATCH=1` on
+the daemon) polls RTS2's targets table for new GRB-type targets and
+fetches at GCN time, before the slew. The cache
+(`~/catalog_cache/host_templates`) matches by position, so a template
+fetched for the trigger serves the pointing the telescope settled on.
+
+Requirements: `pip install pyrt-transient[hostsearch]` (the `reproject`
+package) and the `hotpants` binary on `PATH`; without either the search
+logs a warning and is skipped. Everything is under `host_search:` in the
+YAML config (`HostSearchConfig` in `config_trans.py`).
+
+The pipeline only runs the search when a frame arrives, and only rebuilds
+a page when its candidate list changes, so observations finished before
+the search was deployed get neither on their own.
+`tools/host_search_backfill.py <obs_dir>... --public-dir <public_html>`
+runs the search on existing observation directories (the frames must
+still be there) and refreshes their pages in place; `--regenerate-site`
+rebuilds the whole page, `--force` reruns a search that already exists.
+
 ### Constant sources and the vetting configuration
 
 With the default configuration a *constant* new source — however bright — is

@@ -457,6 +457,60 @@ class FollowupConfig:
 
 
 @dataclass
+class HostSearchConfig:
+    """Host-galaxy search in a trigger's error circle
+    (detection/host_search/): every catalogued galaxy in the circle,
+    ranked by a chance-coincidence prior and by its residual on a
+    PSF-matched subtraction of the night's stack against an archival
+    survey image. Finds the galaxy under a transient fainter than its
+    host, which the catalogue match never can (EP261006a: a nuclear TDE
+    on a 17.7 mag galaxy, rank 1 of 35 from the first 300 s frame).
+    Runs only for observations whose frames carry GRB_RA/GRB_DEC/GRB_ERR.
+    """
+    enabled: bool = True
+    # not before this many usable (long-exposure) frames, then again every
+    # rebuild_interval new ones; a stack of 40 D50 frames costs ~50 s
+    min_frames: int = 1
+    rebuild_interval: int = 3
+    max_frames: int = 40
+    # frames shorter than this fraction of the longest exposure are not
+    # stacked (D50 opens a GRB sequence with 0.1 s pointing frames)
+    min_exptime_fraction: float = 0.5
+    # circles larger than this are not searched (the region would exceed
+    # the frame; the prior is near-useless over a square degree anyway)
+    max_error_radius_arcmin: float = 15.0
+    # the subtracted region: the circle times region_margin, but at least
+    # region_min_px on a side (the kernel is fitted on the region's stars;
+    # a 480 px D50 region holds ~30 usable ones, a 3' circle alone too few)
+    region_margin: float = 1.2
+    region_min_px: int = 480
+    band: str = "r"
+    galaxy_catalogs: List[str] = field(default_factory=lambda: ["legacysurvey", "panstarrs"])
+    max_galaxy_mag: float = 21.0
+    query_timeout_s: float = 120.0
+    # survey image: sources tried in order ("legacysurvey", "panstarrs",
+    # "hips:<id>"); one template per pointing, cached in template_cache_dir
+    # (default ~/catalog_cache/host_templates); template_size_arcmin 0
+    # means the frame's own FIELD, so the prefetch for the trigger position
+    # and the run for the pointing share one file
+    template_sources: List[str] = field(default_factory=lambda: ["legacysurvey", "panstarrs"])
+    template_cache_dir: Optional[str] = None
+    template_size_arcmin: float = 0.0
+    template_pixscale_arcsec: float = 0.5
+    template_fwhm_arcsec: float = 2.4
+    template_timeout_s: float = 300.0
+    # start the template download as a detached process the first time a
+    # trigger observation is seen (its pointing frames arrive long before
+    # the first science frame); see host_search/prefetch.py --watch for the
+    # even earlier RTS2-target-based variant
+    prefetch: bool = True
+    hotpants_executable: str = "hotpants"
+    # nuclear aperture radius in units of the stack FWHM; 0.5 separates a
+    # point-like excess from the galaxy's own residual best
+    aperture_fwhm: float = 0.5
+
+
+@dataclass
 class CachingConfig:
     """Configuration for caching behavior."""
     cache_dir: str = "./catalog_cache"
@@ -494,6 +548,7 @@ class PipelineConfig:
     detection: DetectionConfig = field(default_factory=DetectionConfig)
     frontend: FrontendConfig = field(default_factory=FrontendConfig)
     followup: FollowupConfig = field(default_factory=FollowupConfig)
+    host_search: HostSearchConfig = field(default_factory=HostSearchConfig)
     caching: CachingConfig = field(default_factory=CachingConfig)
     logging: LoggingConfig = field(default_factory=LoggingConfig)
     

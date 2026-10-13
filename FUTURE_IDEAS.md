@@ -1566,3 +1566,204 @@ above.
   afterglow never gets its stack. With the vetting catalogues the rule
   is reasonable; alternatively key the skip on a candidate inside the
   GRB error box rather than on the field's best score.
+
+## Catalogued galaxies dominated the candidate list (EP 261006.743 on D50, 2026-10-12)
+
+The galaxy flag (414a188) labelled but never removed, and on a field with
+Legacy Survey coverage the label applied to almost everything: lascaux50's
+obs_105067 / obs_105068 (34 and 39 epochs, 2026-10-11) ended with 67 and 92
+final candidates, of which 63 and 86 were `galaxy_flag == 'galaxy'`. ATLAS,
+Gaia and USNO-B are point-source catalogues, so every galaxy brighter than
+the frame limit is "new" in all of them. Subtracting the whole frame to get
+rid of them is too slow for the real-time path; three cheaper things were
+done instead (galaxy_flag.py, config `galaxy_*`):
+
+1. **Constant galaxies are removed.** A row labelled 'galaxy' whose
+   lightcurve is consistent with a constant source (`mag_chi2_reduced <=
+   galaxy_remove_max_chi2`, default 2.0, the same threshold as
+   `is_variable`) is dropped from the final table
+   (`remove_constant_galaxies`, called from clustering right after the
+   flag). A galaxy is constant; a transient on one brightens or fades
+   within the run. On the two D50 observations the rule removes 58/63 and
+   82/86 of the flagged rows (chi2 quantiles of the galaxy rows: 0.7 / 1.1
+   / 1.7 at 10/50/90 %). Run end to end locally on obs_105068 (gaia+usno):
+   111 final candidates -> 98 flagged -> 95 removed -> 16 shown.
+2. **The match radius follows the galaxy's size.** Legacy Survey's
+   `shape_r` (half-light radius) is queried too; a detection within
+   `galaxy_radius_scale` x shape_r (default 1.0, never beyond
+   `galaxy_query_radius_arcsec` = 10") of the Tractor centre is that
+   galaxy. SExtractor's barycentre of a lumpy resolved galaxy lands
+   arcseconds from the catalogue centre, which is exactly how the big
+   galaxies escaped a 2" cone. The per-observation cache records the
+   cone radius and is rebuilt when it changes.
+3. **A third label, 'near_galaxy'.** Measured fainter than the galaxy's
+   total by more than `galaxy_faint_margin_mag` (1.0): an unresolved
+   galaxy's own light would have been measured at its total, so this is
+   a separate source projected on it -- kept, never removed. Not applied
+   to galaxies larger than the seeing disc (the frames' FWHM x PIXEL,
+   median over epochs): the 13.8 mag, 8.9"-half-light galaxy in this
+   field is measured at 15.1 by the Kron aperture plus background mesh.
+
+What is left on the page is honest: 'host' rows (brighter than the
+galaxy by more than 0.75 mag, e.g. an afterglow in a 24 mag host),
+'near_galaxy' rows, unmatched rows, and the few 'galaxy' rows that varied
+within the run. The last group is where the remaining junk sits: a bright
+resolved galaxy's Kron photometry scatters with the seeing (that 13.8 mag
+galaxy has chi2 = 61 over 39 epochs) and no catalogue magnitude can tell
+that from a nuclear transient. The right discriminator for *those* is the
+pipeline's own history -- the same galaxy measured on earlier nights at
+the same magnitude (tools/cross_night_transients.py already has the data)
+-- or a stamp-sized model subtraction (Legacy Survey serves Tractor model
+cutouts), not a whole-frame subtraction. Neither is wired in yet.
+
+The stated trade-off: a transient on the nucleus of a galaxy that adds
+less than ~faint-margin light and does not vary within the run is the
+galaxy as far as this test can tell. That is the subtraction case and was
+never recoverable by the catalogue match either.
+
+Fixtures (gitignored, local only): `tests/EP261006_d50/obs_1050{67,68}/`
+(lascaux50 frames, candidates.tbl and galaxy cache as produced on the
+host) and `tests/EP261006/data/` (lascaux's 130 frames of the same
+trigger, 3.1"/px; that host's runs died on the old flat pipeline with
+"The 'candidate_type' columns have incompatible types: ['float64',
+'str96', 'str96']" before writing anything -- the packaged pipeline it
+runs since 2026-10-12 should be checked against the same frames).
+
+### First-night host identification: ranking + region subtraction (EP261006a test, 2026-10-12)
+
+EP261006a (AT 2026aetp, nuclear TDE at z = 0.185 in Gaia DR3
+2587044864659595392, GCN 45826/45831/45868) is the case the catalogue
+match cannot do: a 20.2 mag transient on a 17.7 mag galaxy, 1.3" from
+the FXT position, constant within a night. Catalogue-relative photometry
+is blind to it (measured minus Legacy Survey total scatters by 0.26 mag
+across the field's galaxies; the host sits at +0.1 sigma on night 1).
+Two things were tried on the real D50 frames (scratch scripts
+stamp_subtract.py / region_subtract.py, results in
+local_test_output/EP261006/{stampsub,regionsub}_1050{40,68}):
+
+1. **Prior ranking of the galaxies in the WXT circle.** All 35 Legacy
+   Survey galaxies with r < 21 inside the 3.1' circle, ranked by the
+   number of galaxies at least that bright a random circle of that size
+   contains (Bloom et al. 2002 counts, N_exp = pi R^2 sigma(<r)). The
+   host is rank 1 (r = 17.72, N_exp = 4.4; next two at 17.87). With a 3'
+   circle N_exp is 4 even for the brightest, so this is an ordering, not
+   an identification; the LS photo-z (0.195, spectroscopic 0.1853) is
+   available from the same TAP query (ls_dr10.photo_z) for free.
+2. **One hotpants subtraction of the error-circle region** (480 px =
+   9.5' square around the WXT centre) of a median stack of the night's
+   long exposures against the LS DR10 r image (fits-cutout at 0.5"/px,
+   smoothed to 2.4" FWHM, reprojected), kernel fitted on 31-33 star
+   stamps (6x6 sub-stamps, -ko 2 -bgo 1), then aperture photometry of
+   every galaxy in the circle on the difference image, with the other
+   galaxies' residual fraction as the systematic floor (they are
+   over-subtracted by 4-8 % of their flux, MAD 2-4 %). Subtracting each
+   galaxy in its own 120-px stamp does NOT work: hotpants then fits the
+   kernel on the galaxy and absorbs the excess (first attempt, host came
+   out at -7 %).
+
+   | night | host residual | host excess of galaxy flux | vs other galaxies (0.5 FWHM aperture) | best other galaxy |
+   |---|---|---|---|---|
+   | Oct 6, 0.6-4 h, 40 x 300 s | 21.8 mag, S/N 8 (photon) | +5.4 % | +3.1 sigma, rank 1 of 35 | S/N 1.1 |
+   | Oct 11, 39 x 120 s | 18.9 mag, S/N 100 | +42 % | +28 sigma, rank 1 of 35 | S/N -0.7 |
+
+   A nuclear aperture (0.5-0.75 FWHM radius) beats 1-1.5 FWHM because
+   the galaxy residual systematics scale with the extended light and the
+   transient is a point source. The +5 % first-night excess corresponds
+   to about 20.9 mag after removing the -5 % population offset, against
+   LT's 20.22 at 5.6 h: consistent with a rising TDE measured 2-5 h
+   earlier. On night 1 the prior and the subtraction both put the host
+   first; neither alone is decisive, together they are.
+
+   **Cost, measured here (single core, no tuning):** median stack of 40
+   frames with reproject_interp 47 s (dominant; an incremental running
+   stack would make it seconds per new frame); LS template 8 s once per
+   field (cached); hotpants on the 480-px region 0.23 s; photometry of
+   35 galaxies 0.1 s. Per observation rerun: about a minute, i.e. well
+   inside the lascaux50 900 s job budget and the 2-5 min frame cadence.
+   Memory: the frame cube for the stack (40 x 1k x 1k float32 = 160 MB)
+   is the only large object; a running mean avoids it.
+
+   Open before wiring in: the -5 % over-subtraction of galaxies (template
+   PSF choice / kernel order), saturation handling from the raw frames
+   rather than a threshold on the stack, the D50 `-dft.fits` naming in
+   stacking._fits_path_for_table, and feeding the galaxy list from the
+   same LS query the flag already makes. Natural home: a per-observation
+   "host candidates" table (galaxy, prior rank, residual S/N, excess)
+   next to the candidate list, produced after each epoch.
+
+   **Stamps vs region vs whole frame (asked: bigger error boxes, would
+   per-galaxy stamps be faster?)** Measured on the same night-1 stack with
+   all 311 LS galaxies (r < 21) of the whole 20' D50 field
+   (scratchpad stamps_global_kernel.py, local_test_output/EP261006/stampkern_*):
+   galaxy stamps with one 15x15 direct kernel fitted on 36 stars take
+   0.15 s for 311 galaxies; hotpants on the full 1024^2 frame (10x10
+   sub-stamps, -ko 2 -bgo 1) takes 1.2 s; the 480-px region 0.23 s. None
+   of it matters next to the stack (47 s) and the template fetch (26 s
+   for one 2500-px field cutout, cached per field; fetching per-galaxy
+   stamps from the LS viewer is ~20 s EACH, so never fetch per galaxy).
+   Quality is what differs: the quick global direct kernel is worse than
+   hotpants' spatially varying one (night 1: host rank 262/311, bright
+   galaxies -10 % +- 11 %; night 5: rank 2, +4.9 sigma), while
+   whole-frame hotpants gives host rank 2/312 (+2.6 sigma) on night 1 and
+   3/302 (+8.3 sigma) on night 5 with 13-20 other galaxies above S/N 3
+   over the full field. A bigger box means more galaxies and a weaker
+   prior (N_exp scales with area), so the identification degrades with
+   box size whatever the subtraction geometry. Recommendation: one field
+   template per pointing, hotpants over the box (region or frame), the
+   per-galaxy fraction normalised by the galaxy population, prior x
+   residual as the ranking.
+
+   **Latency and templates (scratchpad first_night_latency.py,
+   local_test_output/EP261006/latency_105040/latency.json).** D50's first
+   300 s frame of EP261006a started 36 min after the trigger (the nine
+   0.1 s pointing frames before it are useless). Region subtraction on
+   the stack of the first N long frames, LS template, 0.5 FWHM aperture:
+
+   | N frames | min after trigger | host rank | excess vs galaxy population |
+   |---|---|---|---|
+   | 1 | 41 | 1/35 | +0.3 sigma (3 other galaxies above S/N 3) |
+   | 3 | 51 | 1/35 | +1.8 sigma |
+   | 10 | 87 | 1/35 | +1.7 sigma |
+   | 20 | 142 | 1/35 | +2.5 sigma |
+   | 40 | 248 | 1/35 | +3.5 sigma |
+
+   (N = 2 and 5 rank the host 26th and 21st: a median of 2-5 frames with
+   the 4.1-4.4 px seeing of the first frames is worse than the single
+   best frame; a weighted mean with per-frame PSF matching, or dropping
+   bad-seeing frames, is the fix.) Compute per new frame: reproject
+   1.0 s, re-stack 0.2-3 s from the in-memory cube, hotpants 0.3 s --
+   the identification waits for photons, not for the CPU. The template
+   should be requested at trigger time, during the slew.
+
+   Without Legacy Survey, through CDS hips2fits on a 2x finer grid of the
+   region (stdpipe.templates.get_hips_image, 4-6 s): Pan-STARRS DR1 r
+   gives host rank 1/35 at +2.0 sigma (one other galaxy above S/N 3);
+   DSS2 red ranks the host first by S/N but with another galaxy at S/N
+   19 and +1.7 sigma -- photographic plates are not a template for a
+   5 % nuclear excess. Fallback order: LS DR10 (dec < +32 roughly, plus
+   DR9 north) -> PS1 (dec > -30) -> SkyMapper (south, shallower) -> the
+   field's own earlier D50 epochs (templates.get_template_own_epoch)
+   -> none (ranking only).
+
+   **Implemented (2026-10-12, uncommitted): `detection/host_search/`.**
+   galaxies.py (LS DR10 + photo-z cone query, PS1 fallback, Bloom 2002
+   prior), templates.py (LS fits-cutout / hips2fits with a per-field cache
+   whose header records centre and size so a prefetch at the trigger
+   position serves the pointing), stack.py (median stack on the
+   best-seeing frame's grid, per-frame zeropoints from the frame's own
+   stars, one exposure class), subtract.py (direct hotpants call with
+   explicit limits, 0.5 FWHM nuclear photometry, population-normalised
+   excess with photon noise in quadrature), search.py (gate on
+   GRB_RA/DEC/ERR, throttle like stacking, never raises, writes
+   host_candidates.ecsv/.json, spawns the detached prefetch on the first
+   frame), prefetch.py (`pyrt-transient-prefetch --ra --dec`, and
+   `--watch`: polls RTS2 targets of type 'G' through psql and prefetches
+   for each new one, i.e. at GCN time, before the slew). Wired into
+   pipeline_magic after save_results; the page shows the table above the
+   candidate detail (app.js loadHostCandidates, orchestration refreshes
+   the JSON even when candidates.tbl is unchanged); HostSearchConfig in
+   config_trans. End to end on obs_105040 (40 frames): 45 s with a cached
+   template (118 s when the LS server was slow -- the prefetch's job),
+   host rank 1 of 35, S/N 10.7, +2.3 sigma. Tests: tests/test_host_search.py.
+   Needs `pip install reproject` (extra `hostsearch`) and `hotpants` on
+   PATH on the hosts; without them the search logs a warning and skips.

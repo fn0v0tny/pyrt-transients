@@ -369,6 +369,19 @@ class TransientDaemon:
         status_thread = threading.Thread(target=self.print_status, daemon=True)
         status_thread.start()
 
+        # Host-search template prefetch at trigger time (PYRT_TRANSIENT_PREFETCH_WATCH=1):
+        # polls RTS2's targets table for new GRB-type targets and fetches the
+        # survey image for each before any frame exists. Runs as a separate
+        # process so a hung download can never block this loop.
+        if os.environ.get("PYRT_TRANSIENT_PREFETCH_WATCH", "") not in ("", "0", "false", "no"):
+            try:
+                self._prefetch_proc = subprocess.Popen(
+                    [sys.executable, "-m", "pyrt_transient.detection.host_search.prefetch", "--watch"],
+                    stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                logger.info("Template prefetch watcher started")
+            except OSError as e:
+                logger.warning(f"Template prefetch watcher could not start: {e}")
+
         try:
             while self.running:
                 try:
@@ -386,6 +399,9 @@ class TransientDaemon:
                         time.sleep(1)
         finally:
             sock.close()
+            proc = getattr(self, "_prefetch_proc", None)
+            if proc is not None and proc.poll() is None:
+                proc.terminate()
             logger.info("Daemon stopped")
 
 

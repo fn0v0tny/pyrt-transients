@@ -285,6 +285,43 @@ with `tools/status_page.py`. There is no cron job:
   logs a status line every minute.
 - Each pipeline run writes to `<base_data_dir>/logs/pipeline_<obs>.log`.
 
+### Host-galaxy search (optional)
+
+The host search (README, "Host-galaxy search for trigger observations")
+needs two things the base install does not bring:
+
+```bash
+/home/pyrt/venv/bin/pip install reproject        # or pyrt-transient[hostsearch]
+which hotpants                                    # the HOTPANTS binary on PATH
+```
+
+Without them every trigger run logs `Host search: skipped` and nothing
+else changes. To fetch survey templates at GCN time rather than at the
+first frame, add to the unit:
+
+```ini
+Environment=PYRT_TRANSIENT_PREFETCH_WATCH=1
+Environment=PYRT_TARGETS_DB=stars
+```
+
+which makes the daemon run `pyrt-transient-prefetch --watch` (a read-only
+`psql` poll of RTS2's `targets` table every 30 s, type `G` targets). The
+cache lives in `~/catalog_cache/host_templates` of the service user; one
+20' Legacy Survey field is 25 MB.
+
+Pages of observations that finished before this was deployed do not
+update by themselves (nothing reruns the pipeline for them). For the ones
+worth it:
+
+```bash
+/home/pyrt/venv/bin/python tools/host_search_backfill.py \
+    /srv/pyrt-transient/data/obs_105068 --public-dir /srv/pyrt-transient/public
+```
+
+runs the search (needs the observation's FITS frames still on disk) and
+refreshes the page in place; add `--regenerate-site` to rebuild cutouts
+as well.
+
 ## 6. Hook the telescope side
 
 Make this the last step of the per-frame pyrt script, once the final ECSV

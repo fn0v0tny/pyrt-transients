@@ -72,11 +72,65 @@ const transientViewer = {
       
       this.renderFilterControls();
       this.renderCandidateList();
+      this.loadHostCandidates();
     } catch (error) {
       console.error('Failed to load candidates:', error);
       document.getElementById('candidate-list').innerHTML = 
         '<div style="padding: 20px; color: red;">Failed to load candidate data: ' + error.message + '</div>';
     }
+  },
+
+  // Host-galaxy search (detection/host_search/): for a trigger observation,
+  // every catalogued galaxy in the error circle with its chance-coincidence
+  // prior and its residual on the subtraction of the night's stack against
+  // a survey image. Shown above the candidate detail when the file exists.
+  async loadHostCandidates() {
+    let data;
+    try {
+      const response = await fetch('host_candidates.json');
+      if (!response.ok) return;
+      data = await response.json();
+    } catch (e) {
+      return;
+    }
+    if (!data || !Array.isArray(data.galaxies) || data.galaxies.length === 0) return;
+    const main = document.getElementById('main-content');
+    if (!main) return;
+    let panel = document.getElementById('host-panel');
+    if (!panel) {
+      panel = document.createElement('div');
+      panel.id = 'host-panel';
+      panel.style.cssText = 'margin: 15px; padding: 12px 15px; background: #fff; border: 1px solid #ddd; border-radius: 6px; font-size: 0.85em;';
+      main.insertBefore(panel, main.firstChild);
+    }
+    const t = data.trigger || {};
+    const fmt = (v, d = 1) => (v === null || v === undefined || Number.isNaN(Number(v))) ? '–' : Number(v).toFixed(d);
+    const measured = data.galaxies.filter(g => g.residual_snr !== null && g.residual_snr !== undefined);
+    const rows = data.galaxies.slice(0, 12).map(g => {
+      const strong = g.excess_sigma !== null && g.excess_sigma !== undefined && g.excess_sigma >= 3;
+      const ls = `https://www.legacysurvey.org/viewer?ra=${Number(g.ra).toFixed(5)}&dec=${Number(g.dec).toFixed(5)}&layer=ls-dr10&zoom=15&mark=${Number(g.ra).toFixed(5)},${Number(g.dec).toFixed(5)}`;
+      return `<tr style="${strong ? 'font-weight: bold; color: #b86a12;' : ''}">
+        <td>${g.rank}</td>
+        <td><a href="${ls}" target="_blank" rel="noopener">${Number(g.ra).toFixed(5)} ${Number(g.dec).toFixed(5)}</a></td>
+        <td>${fmt(g.mag, 2)}</td><td>${fmt(g.zphot, 2)}</td><td>${fmt(g.n_exp, 1)}</td>
+        <td>${fmt(g.residual_snr, 1)}</td><td>${g.excess_frac === null || g.excess_frac === undefined ? '–' : (100 * g.excess_frac).toFixed(1) + ' %'}</td>
+        <td>${fmt(g.excess_sigma, 1)}</td><td>${fmt(g.sep_center_arcsec / 60, 1)}′</td></tr>`;
+    }).join('');
+    panel.innerHTML = `
+      <div style="display: flex; flex-wrap: wrap; align-items: baseline; gap: 6px 16px;">
+        <strong style="font-size: 1.1em;">Host galaxies in the error circle</strong>
+        <span style="color: #666;">${data.galaxies.length} galaxies within ${fmt(t.radius_arcsec / 60, 1)}′ of ${fmt(t.ra, 4)} ${fmt(t.dec, 4)}
+          · ${measured.length ? `${measured.length} measured on the ${data.template_source || ''} subtraction of ${data.n_frames} frames` : 'no subtraction yet (prior only)'}</span>
+      </div>
+      <div style="overflow-x: auto; margin-top: 8px;">
+      <table style="border-collapse: collapse; width: 100%; white-space: nowrap;">
+        <thead><tr style="text-align: left; color: #666;">
+          <th>#</th><th>Position</th><th>r</th><th>z<sub>phot</sub></th><th title="galaxies at least this bright expected by chance in the circle">N<sub>exp</sub></th>
+          <th title="residual at the nucleus on the difference image, against photon noise">S/N</th><th title="residual over the galaxy's own light in the same aperture">excess</th>
+          <th title="excess relative to the other galaxies' residuals (median, MAD)">σ</th><th>from trigger</th></tr></thead>
+        <tbody>${rows}</tbody>
+      </table></div>
+      <div style="color: #666; margin-top: 6px;">Ordered by the residual on the subtraction, then by prior. A galaxy at 3 σ or more is bold. N<sub>exp</sub> near or above 1 means the prior alone cannot pick it.</div>`;
   },
 
   renderFilterControls() {

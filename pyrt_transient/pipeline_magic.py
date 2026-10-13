@@ -16,6 +16,7 @@ from pyrt_transient.io.observation_store import ObservationStore, resolve_observ
 from pyrt_transient.web.orchestration import generate_frontend
 from pyrt_transient.detection.blind_multicatalog import BlindMulticatalogStrategy
 from pyrt_transient.detection import stacking
+from pyrt_transient.detection import host_search
 from pyrt_transient.followup import enrichment
 import os
 import warnings
@@ -280,6 +281,14 @@ def main():
 
                 store.save_results(reliable_candidates, lightcurves)
                 store.mark_analyzed(ecsv_basename)
+
+                # Host-galaxy search for trigger observations (detection/
+                # host_search/): which galaxy in the error circle carries a
+                # residual after subtracting the survey image. Independent
+                # of the candidate list (results are already saved above),
+                # throttled like stacking, never raises; writes
+                # host_candidates.ecsv/.json into obs_dir.
+                host_search.maybe_run_host_search(obs_dir, detection_tables, config, logger)
                 logger.info(f"Analysis completed successfully")
 
             except Exception as e:
